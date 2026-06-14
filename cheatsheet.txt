@@ -1,0 +1,31 @@
+Change branch:
+git checkout dev
+
+Swiss army knife to make changes:
+git switch
+
+close dev app:
+Ctrl + c
+
+quick save:
+Ctrl + s
+
+AUTO PUSH FROM LOCAL TO CLOUD (Change Message):
+python deploy.py "commit message"
+
+Push a small fix to dev staging:
+git add auth.py
+git commit --amend --no-edit
+git push --force origin dev
+
+Create virtual env:
+python -m venv venv
+
+ENTER VIRTUAL ENV:
+.\venv\Scripts\activate
+
+Install packages:
+pip install -r requirements.txt
+
+Run dev app:
+python -m streamlit run home_sync.py

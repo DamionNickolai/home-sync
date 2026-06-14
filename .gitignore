@@ -1,0 +1,14 @@
+# Streamlit Secrets (NEVER PUSH THIS)
+.streamlit/secrets.toml
+
+.env
+
+# Python Virtual Environments
+.venv/
+venv/
+env/
+
+# Python Cache (Keeps your repo clean)
+__pycache__/
+*.pyc
+*.pyo
