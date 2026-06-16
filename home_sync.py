@@ -4,7 +4,7 @@ import time
 import json
 from auth import check_password
 from home_assist_api import fetch_ha_state
-from database import get_active_tasks, get_completed_tasks, add_new_task, batch_update_tasks, update_task
+from database import get_active_tasks, get_completed_tasks, add_new_task, batch_update_tasks, update_task, get_all_backlog_items, add_backlog_item, update_backlog_item
 from supabase import create_client, Client
 
 @st.cache_resource
@@ -14,11 +14,12 @@ def get_supabase_client() -> Client:
     return create_client(url, key)
 
 @st.cache_data(ttl=3600)
-def get_available_users():
-    """Fetch list of available users from the database."""
+def get_available_users(household_id):
+    """Fetch list of available users from the database for a specific household."""
     try:
         supabase = get_supabase_client()
-        response = supabase.table("users").select("username").execute()
+        # 🟢 NEW: Filter the users table by the provided household_id
+        response = supabase.table("users").select("username").eq("household_id", household_id).execute()
         return [user["username"] for user in response.data] if response.data else []
     except Exception as e:
         st.warning(f"Could not fetch users: {e}")
@@ -42,35 +43,16 @@ st.markdown("""
 # ==========================================
 # 🔒 SECURE LOGIN
 # ==========================================
-# This barrier stops the app from running until the user logs in
 if not check_password():
     st.stop()
 
-role = st.session_state.get("role", "user")
+# 🟢 FIX: Make sure this matches the key from auth.py!
+user_role = st.session_state.get("user_role", "member")
 
-# ==========================================
-#  SIDEBAR COMMAND CENTER
-# ==========================================
-st.sidebar.header("⚡ Quick Controls")
-st.sidebar.info("Garage door local controls coming soon...")
-
-st.sidebar.markdown("---")
-
-# The Developer Lock
-if role == "developer":
-    with st.sidebar.expander("🛠️ Developer Tools"):
-        st.caption("Home Assistant API Status: Standby")
-        # We can put API raw payloads and cache clear buttons here later
-
-if st.sidebar.button("🚪 Log Out", width='stretch'):
-    for key in list(st.session_state.keys()):
-        del st.session_state[key]
-    st.query_params.clear() 
-    st.rerun()
-    
 # ==========================================
 # 🚧 ENVIRONMENT DETECTION & BANNER
 # ==========================================
+# 🟢 Moved to the very top so it renders instantly!
 env = st.secrets.get("app_config", {}).get("environment", "production")
 is_local_env = (env == "local")
 
@@ -89,15 +71,89 @@ if is_local_env:
 st.title("🏠 Home Sync Dashboard")
 
 # ==========================================
+#  SIDEBAR COMMAND CENTER
+# ==========================================
+st.sidebar.header("⚡ Quick Controls")
+st.sidebar.info("Garage door local controls coming soon...")
+st.sidebar.markdown("---")
+
+# ==========================================
+# ⚙️ SIDEBAR UTILITY FOOTER 
+# ==========================================
+st.sidebar.divider()
+
+# 🟢 1. THE PANIC BUTTON (Available to everyone)
+with st.sidebar.expander("🐛 Report an Issue"):
+    with st.form(key="home_sync_bug_report", clear_on_submit=True):
+        st.caption("Did something break or do you have an idea? Tell the developer!")
+        
+        if user_role in ["developer", "admin"]:
+            issue_categories = ["Bug", "UI", "Core", "Ops"]
+        else:
+            issue_categories = ["Bug", "UI"]
+            
+        selected_category = st.selectbox("Type of Issue", options=issue_categories)
+        bug_text = st.text_area("What happened?", placeholder="e.g., I cannot check off the trash task.")
+        submit_bug = st.form_submit_button("📤 Send to Developer", type="secondary", use_container_width=True)
+        
+        if submit_bug:
+            if not bug_text.strip():
+                st.warning("Please type a message first.")
+            else:
+                with st.spinner("Sending..."):
+                    active_user = st.session_state.get("username", "Unknown User")
+                    feature_title = f"User Reported: {active_user}"
+                    
+                    success = add_backlog_item(
+                        feature=feature_title, 
+                        notes=bug_text.strip(), 
+                        status="Backlog", 
+                        app_name="home_sync", 
+                        category=selected_category, 
+                        priority="High"
+                    )
+                    
+                    if success:
+                        st.success("✅ Sent! Thanks for the feedback.")
+                    else:
+                        st.error("Failed to send the bug report.")
+
+# 🛠️ 2. DEVELOPER TOOLS (Restricted to Devs Only)
+if user_role == "developer":
+    with st.sidebar.expander("🛠️ Developer Tools"):
+        st.caption("Home Assistant API Status: Standby")
+        # We can put API raw payloads and cache clear buttons here later
+
+# 🚪 3. LOGOUT BUTTON (Anchored to the very bottom)
+if st.sidebar.button("🚪 Switch User / Log Out", use_container_width=True):
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+    st.query_params.clear() 
+    st.rerun()
+
+# 🏷️ APPLICATION TAG
+st.sidebar.caption("<div style='text-align: center; color: gray; padding-top: 10px;'>Home Sync Hub</div>", unsafe_allow_html=True)
+    
+# ==========================================
 # 📋 MAIN DASHBOARD TABS
 # ==========================================
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "🏠 Household Hub",
-    "☀️ Solar Production",
-    "🛡️ Security",
-    "🚗 Garage",        
-    "⚙️ System Logs"
-])
+if user_role == "developer":
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        "🏠 Household Hub",
+        "☀️ Solar Production",
+        "🛡️ Security",
+        "🚗 Garage",        
+        "⚙️ System Logs",
+        "📝 Backlog"
+    ])
+else:
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "🏠 Household Hub",
+        "☀️ Solar Production",
+        "🛡️ Security",
+        "🚗 Garage",        
+        "⚙️ System Logs"
+    ])
 
 with tab1:
     # 1. Initialize the session state for this tab
@@ -160,28 +216,36 @@ with tab1:
         
         if current_view == "todo":
             st.subheader("📋 Active To-Do List")
-            current_user = st.session_state.get("logged_in_user", "Unknown")
-                              
-            # --- 1. Form to Add a New Task ---
+            current_user = st.session_state.get("logged_in_user", "Unknown")            
+            user_role = st.session_state.get("user_role", "member") 
+            # 🟢 NEW: Grab the household ID for this session
+            current_household = st.session_state.get("household_id", "unassigned")
+            
+            # --- 1. Form to Add a New Task (EVERYONE CAN ADD) ---
             with st.expander("➕ Add New Task", expanded=False):
                 with st.form("new_task_form", clear_on_submit=True):
                     col1, col2 = st.columns([3, 1])
-                    new_task = col1.text_input("Task Description", placeholder="e.g., Clean the gutters")
+                    new_task = col1.text_input("Task Description", placeholder="e.g., Clean my room")
                     priority = col2.selectbox("Priority", ["Normal", "High", "Low"])
                     
                     col3, col4, col5 = st.columns(3)
                     category = col3.selectbox("Category", ["House", "Yard", "Admin", "Errand"])
                     
-                    # Multi-select for Assign To
-                    available_users = get_available_users()
-                    default_users = [current_user] if current_user in available_users else (available_users[:1] if available_users else [])
-                    assigned_to = col4.multiselect("Assign To", options=available_users, default=default_users)
+                    # ROLE CHECK: How to handle the "Assign To" field
+                    if user_role in ["developer", "admin"]:
+                        # Admins/Devs can assign to anyone
+                        available_users = get_available_users(current_household)
+                        default_users = [current_user] if current_user in available_users else (available_users[:1] if available_users else [])
+                        assigned_to = col4.multiselect("Assign To", options=available_users, default=default_users)
+                    else:
+                        # Members can only assign to themselves (we lock it in behind the scenes)
+                        col4.text_input("Assign To", value=current_user, disabled=True)
+                        assigned_to = [current_user]
                     
                     target_date = col5.date_input("Target Date", value=None)
                     
                     submit = st.form_submit_button("Save Task", type="primary", use_container_width=True)
                     if submit and new_task and assigned_to:
-                        # Call the updated function with the list of assignees as JSON
                         success = add_new_task(new_task, category, priority, json.dumps(assigned_to), target_date)
                         if success:
                             st.success("Task added!")
@@ -191,11 +255,11 @@ with tab1:
 
             st.write("")
             
-            # --- 1.5 Edit Task Form (shown when editing) ---
+            # --- 1.5 Edit Task Form (ADMINS & DEVS ONLY) ---
             if "editing_task_id" not in st.session_state:
                 st.session_state["editing_task_id"] = None
             
-            if st.session_state["editing_task_id"] is not None:
+            if st.session_state["editing_task_id"] is not None and user_role in ["developer", "admin"]:
                 # Find the task being edited
                 all_tasks = get_active_tasks()
                 editing_task = next((t for t in all_tasks if t["id"] == st.session_state["editing_task_id"]), None)
@@ -205,7 +269,7 @@ with tab1:
                         st.markdown("### ✏️ Edit Task")
                         
                         with st.form("edit_task_form"):
-                            # Parse current assignees
+                            # Parse current assignees securely
                             assigned_to_raw = editing_task.get("assigned_to", "Unassigned")
                             try:
                                 current_assignees = json.loads(assigned_to_raw) if isinstance(assigned_to_raw, str) and assigned_to_raw.startswith('[') else [assigned_to_raw]
@@ -214,13 +278,23 @@ with tab1:
                             
                             col1, col2 = st.columns([3, 1])
                             edit_task_name = col1.text_input("Task Description", value=editing_task.get("task_name", ""))
-                            edit_priority = col2.selectbox("Priority", ["Normal", "High", "Low"], index=["Normal", "High", "Low"].index(editing_task.get("priority", "Normal")))
+                            
+                            # Safely set priority index
+                            safe_priority = editing_task.get("priority", "Normal")
+                            p_index = ["Normal", "High", "Low"].index(safe_priority) if safe_priority in ["Normal", "High", "Low"] else 0
+                            edit_priority = col2.selectbox("Priority", ["Normal", "High", "Low"], index=p_index)
                             
                             col3, col4, col5 = st.columns(3)
-                            edit_category = col3.selectbox("Category", ["House", "Yard", "Admin", "Errand"], index=["House", "Yard", "Admin", "Errand"].index(editing_task.get("category", "House")))
                             
-                            available_users = get_available_users()
-                            edit_assigned_to = col4.multiselect("Assign To", options=available_users, default=current_assignees)
+                            # Safely set category index
+                            safe_cat = editing_task.get("category", "House")
+                            c_index = ["House", "Yard", "Admin", "Errand"].index(safe_cat) if safe_cat in ["House", "Yard", "Admin", "Errand"] else 0
+                            edit_category = col3.selectbox("Category", ["House", "Yard", "Admin", "Errand"], index=c_index)
+                            
+                            # 🟢 NEW: Pull household-specific users for the dropdown!
+                            available_users = get_available_users(current_household)
+                            safe_defaults = [u for u in current_assignees if u in available_users]
+                            edit_assigned_to = col4.multiselect("Assign To", options=available_users, default=safe_defaults)
                             
                             edit_target_date = col5.date_input("Target Date", value=pd.to_datetime(editing_task.get("target_date")) if editing_task.get("target_date") else None)
                             
@@ -250,87 +324,121 @@ with tab1:
                                 st.session_state["editing_task_id"] = None
                                 st.rerun()
             
-            # --- 2. Display Active Tasks and Batch Processing ---
-            active_tasks = get_active_tasks()
+            # --- 2. Display Active Tasks ---
+            all_active_tasks = get_active_tasks()
+            
+            # ROLE CHECK: Filter tasks for members so they only see their own
+            active_tasks = []
+            for task in all_active_tasks:
+                assigned_to_raw = task.get("assigned_to", "Unassigned")
+                try:
+                    assignees = json.loads(assigned_to_raw) if isinstance(assigned_to_raw, str) and assigned_to_raw.startswith('[') else [assigned_to_raw]
+                except:
+                    assignees = [assigned_to_raw]
+                
+                if user_role in ["developer", "admin"] or current_user in assignees:
+                    active_tasks.append(task)
+            
+            selected_task_ids = [] 
             
             if not active_tasks:
                 st.info("🎉 You are all caught up! No active tasks.")
             else:
-                # Define sort key function that handles multi-user tasks and dates
-                def get_task_sort_key(task):
-                    # Parse assignees
-                    assigned_to_raw = task.get("assigned_to", "Unassigned")
-                    try:
-                        assignees = json.loads(assigned_to_raw) if isinstance(assigned_to_raw, str) and assigned_to_raw.startswith('[') else [assigned_to_raw]
-                    except:
-                        assignees = [assigned_to_raw]
-                    
-                    # Check if current user is assigned (False sorts before True, so NOT in list comes after)
-                    is_not_assigned_to_current = current_user not in assignees
-                    
-                    # Parse date for calendar ordering
-                    due_date_str = task.get("target_date")
-                    has_no_date = not due_date_str
-                    
-                    try:
-                        if due_date_str:
-                            due_date = pd.to_datetime(due_date_str).date()
-                        else:
-                            due_date = pd.Timestamp.max.date()  # Push no-date tasks to end
-                    except:
-                        due_date = pd.Timestamp.max.date()
-                    
-                    # Return tuple: (current_user not assigned, no date, date value)
-                    # This prioritizes: current user's tasks -> tasks with dates in order -> others
-                    return (is_not_assigned_to_current, has_no_date, due_date)
-                
-                active_tasks.sort(key=get_task_sort_key)
-
+                # Group the tasks dynamically by who they are assigned to
+                grouped_tasks = {}
                 for task in active_tasks:
-                    col_check, col_text, col_meta, col_actions = st.columns([0.5, 4, 1.5, 0.8])
-                    
-                    # The Checkbox
-                    if col_check.checkbox(" ", key=f"task_{task['id']}"):
-                        st.session_state[f"to_complete_{task['id']}"] = True
-                    
-                    # Render Text with Defensive .get()
-                    # Using .get() prevents KeyError if the field is missing
-                    task_name = task.get("task_name", "Unnamed Task")
-                    priority = task.get("priority", "Normal")
-                    
-                    display_name = f"**🔴 {task_name}**" if priority == "High" else f"**{task_name}**"
-                    
-                    # Check if current user is in the assignees list
                     assigned_to_raw = task.get("assigned_to", "Unassigned")
                     try:
                         assignees = json.loads(assigned_to_raw) if isinstance(assigned_to_raw, str) and assigned_to_raw.startswith('[') else [assigned_to_raw]
                     except:
                         assignees = [assigned_to_raw]
                     
-                    if current_user in assignees:
-                        display_name += " *(👉 Yours)*"
-                    col_text.markdown(display_name)
+                    # Sort the names alphabetically
+                    assignee_str = ", ".join(sorted(assignees))
                     
-                    # Render Metadata with Defensive .get()
-                    category = task.get("category", "Uncategorized")
-                    
-                    # Parse assigned_to for display - handle both JSON array and legacy string format
-                    try:
-                        assignees_display = json.loads(assigned_to_raw) if isinstance(assigned_to_raw, str) and assigned_to_raw.startswith('[') else [assigned_to_raw]
-                        assignee = ", ".join(assignees_display)
-                    except:
-                        assignee = assigned_to_raw
-                    
-                    due = task.get("target_date", "No date")
-                    
-                    col_meta.caption(f"_{category}_ • 👤 {assignee} • 📅 {due}")
-                    
-                    # Edit Button
-                    if col_actions.button("✏️", key=f"edit_{task['id']}", help="Edit task"):
-                        st.session_state["editing_task_id"] = task['id']
-                        st.rerun()
+                    if assignee_str not in grouped_tasks:
+                        grouped_tasks[assignee_str] = []
+                    grouped_tasks[assignee_str].append(task)
 
-                # Collect selected task IDs (not full task objects)
+                # Sort the groups
+                sorted_groups = sorted(grouped_tasks.keys(), key=lambda x: (-len(x.split(", ")), x))
+
+                # Render each group
+                for group_name in sorted_groups:
+                    header_icon = "👥" if "," in group_name else "👤"
+                    st.markdown(f"##### {header_icon} {group_name}")
+                    
+                    tasks_in_group = grouped_tasks[group_name]
+                    tasks_in_group.sort(key=lambda t: pd.to_datetime(t.get("target_date")).date() if t.get("target_date") else pd.Timestamp.max.date())
+                    
+                    for task in tasks_in_group:
+                        col_check, col_text, col_meta, col_actions = st.columns([0.5, 4, 1.5, 0.8])
+                        
+                        if col_check.checkbox(" ", key=f"task_{task['id']}"):
+                            st.session_state[f"to_complete_{task['id']}"] = True
+                        
+                        # ==========================================
+                        # 🧠 THE SMART URGENCY ENGINE
+                        # ==========================================
+                        task_name = task.get("task_name", "Unnamed Task")
+                        priority = task.get("priority", "Normal")
+                        target_date_str = task.get("target_date")
+
+                        days_remaining = None
+                        if target_date_str:
+                            try:
+                                t_date = pd.to_datetime(target_date_str).tz_localize(None).date()
+                                today = pd.Timestamp.now(tz='UTC').tz_localize(None).date()
+                                days_remaining = (t_date - today).days
+                            except:
+                                pass
+
+                        # Default Colors
+                        border_color = "#475569" # Slate
+                        status_msg = ""
+
+                        if days_remaining is not None:
+                            if days_remaining < 0:
+                                border_color = "#EF4444" # Red
+                                status_msg = f"🔴 Overdue by {abs(days_remaining)}d"
+                            elif days_remaining == 0:
+                                border_color = "#F97316" # Orange
+                                status_msg = "🟠 Due TODAY"
+                            elif days_remaining == 1:
+                                border_color = "#EAB308" # Yellow
+                                status_msg = "🟡 Due Tomorrow"
+                            else:
+                                border_color = "#22C55E" # Green
+                                status_msg = f"🟢 Due in {days_remaining}d"
+                        else:
+                            # Priority Fallback
+                            if priority == "High":
+                                border_color = "#3B82F6" # Blue
+                                status_msg = "🔵 High Priority"
+                            elif priority == "Low":
+                                border_color = "#64748B" # Gray
+                                status_msg = "⚪ Low Priority"
+                            else:
+                                status_msg = "⚪ No Date"
+
+                        # 🎨 THE UI INJECTION (Replaces old markdown)
+                        col_text.markdown(f"""
+                            <div style="border-left: 4px solid {border_color}; padding-left: 10px; margin-top: 4px;">
+                                <div style="font-weight: 600; font-size: 1.05em; line-height: 1.2;">{task_name}</div>
+                                <div style="font-size: 0.85em; color: gray; margin-top: 2px;">{status_msg}</div>
+                            </div>
+                        """, unsafe_allow_html=True)
+                        
+                        category = task.get("category", "Uncategorized")
+                        due = task.get("target_date", "No date")
+                        col_meta.caption(f"_{category}_ • 📅 {due}") 
+                        
+                        if user_role in ["developer", "admin"]:
+                            if col_actions.button("✏️", key=f"edit_{task['id']}", help="Edit task"):
+                                st.session_state["editing_task_id"] = task['id']
+                                st.rerun()
+
+                # Collect selected task IDs for the batch button
                 selected_task_ids = [task['id'] for task in active_tasks if st.session_state.get(f"to_complete_{task['id']}")]
 
             # Batch Action Button
@@ -343,19 +451,63 @@ with tab1:
             st.divider()
             
             # --- 3. Recently Completed (with Recall) ---
-            with st.expander("✅ Recently Completed"):
-                completed = get_completed_tasks()
-                if completed:
-                    for task in completed:
-                        col_text, col_recall = st.columns([4, 1])
+            with st.expander("✅ Recently Completed (Last 14 Days)"):
+                all_completed = get_completed_tasks()
+                
+                completed_tasks = []
+                # 🟢 NEW: Set our cutoff for "Recent" (Currently 14 days ago)
+                cutoff_date = pd.Timestamp.now(tz='UTC') - pd.Timedelta(days=14)
+
+                for task in all_completed:
+                    # 1. TIME FILTER: Find the best date to use
+                    date_str = task.get("target_date") or task.get("created_at")
+                    try:
+                        # Convert to standard Pandas datetime to do math
+                        task_date = pd.to_datetime(date_str, utc=True)
+                        is_recent = task_date >= cutoff_date
+                    except:
+                        is_recent = True 
+                        task_date = None
+
+                    # If the task is older than 14 days, skip it entirely!
+                    if not is_recent:
+                        continue
+                        
+                    # 2. ROLE FILTER:
+                    assigned_to_raw = task.get("assigned_to", "Unassigned")
+                    try:
+                        assignees = json.loads(assigned_to_raw) if isinstance(assigned_to_raw, str) and assigned_to_raw.startswith('[') else [assigned_to_raw]
+                    except:
+                        assignees = [assigned_to_raw]
+                        
+                    if user_role in ["developer", "admin"] or current_user in assignees:
+                        # 🟢 NEW: Save a beautifully formatted version of the date to display
+                        task['_display_date'] = task_date.strftime('%b %d, %Y') if task_date else "No Date"
+                        completed_tasks.append(task)
+
+                if completed_tasks:
+                    for task in completed_tasks:
+                        assigned_to_raw = task.get("assigned_to", "Unassigned")
+                        try:
+                            assignees = json.loads(assigned_to_raw) if isinstance(assigned_to_raw, str) and assigned_to_raw.startswith('[') else [assigned_to_raw]
+                        except:
+                            assignees = [assigned_to_raw]
+
+                        # 🟢 NEW: We break this into 3 columns now so the date has a dedicated home
+                        col_text, col_date, col_recall = st.columns([2.5, 1.5, 1])
+                        
                         col_text.caption(f"~~{task['task_name']}~~")
                         
+                        # Display the Date!
+                        col_date.caption(f"📅 {task.get('_display_date')}")
+                        
                         # Recall Button
-                        if col_recall.button("🔄 Recall", key=f"recall_{task['id']}"):
-                            batch_update_tasks([task['id']], False) # Flip back to False
-                            st.rerun()
+                        if user_role in ["developer", "admin"] or current_user in assignees:
+                            if col_recall.button("🔄 Recall", key=f"recall_{task['id']}"):
+                                batch_update_tasks([task['id']], False) 
+                                st.rerun()
                 else:
-                    st.caption("No recently completed tasks.")
+                    st.caption("No recently completed tasks in the last 14 days.")
                     
         elif current_view == "groceries":
             st.subheader("🛒 Grocery Manager")
@@ -479,3 +631,145 @@ with tab4:
 with tab5:
     st.subheader("Event History")
     st.write("Supabase database logs will render here...")
+
+# ==========================================
+# 📝 MASTER BACKLOG TAB (Developer Only)
+# ==========================================
+if user_role == "developer":
+    with tab6:
+        st.subheader("📝 Master Ecosystem Backlog")
+        
+        # --- 1. The New Add Form (Wrapped in an Expander) ---
+        with st.expander("➕ Add New Backlog Ticket", expanded=False):
+            with st.form("add_master_backlog_form", clear_on_submit=True):
+                c1, c2, c3, c4 = st.columns(4)
+                new_status = c1.selectbox("Status", ["Backlog", "In Progress", "Blocked", "Staged", "Done"])
+                new_category = c2.selectbox("Category", ["Core", "UI", "Bug", "Ops"])
+                new_priority = c3.selectbox("Priority", ["High", "Medium", "Low"], index=1)
+                target_app = c4.selectbox("Target App", ["home_sync", "get_fit"])
+                
+                new_feature = st.text_input("Feature or Bug Name")
+                new_notes = st.text_area("Notes / Description")
+                
+                if st.form_submit_button("Save Ticket", type="primary"):
+                    if new_feature:
+                        add_backlog_item(new_feature, new_notes, new_status, target_app, new_category, new_priority)
+                        st.success(f"Added to {target_app}!")
+                        st.rerun()
+                        
+        st.divider()
+        
+        # --- 2. Edit Backlog Form ---
+        if "editing_backlog_id" not in st.session_state:
+            st.session_state["editing_backlog_id"] = None
+            
+        raw_items = get_all_backlog_items()
+        
+        # 🟢 MULTI-LEVEL SORTING (Status -> Category -> Priority)
+        if raw_items:
+            # Convert to Pandas DataFrame for sorting
+            df = pd.DataFrame(raw_items)
+            
+            # Clean and setup Priority
+            df["priority"] = df["priority"].replace("", "Low").fillna("Low")
+            df["priority"] = df["priority"].astype(str).str.title()
+            
+            # Clean and setup Category (Prevents Pandas4Warning)
+            valid_cats = ["Core", "UI", "Bug", "Ops"]
+            if "category" in df.columns:
+                df["category"] = df["category"].apply(lambda x: x if x in valid_cats else "Core")
+            
+            # Apply Categorical Ordering
+            status_order = ["In Progress", "Backlog", "Blocked", "Staged", "Done"]
+            if "status" in df.columns:
+                df["status"] = pd.Categorical(df["status"], categories=status_order, ordered=True)
+
+            category_order = ["Core", "UI", "Bug", "Ops"]
+            if "category" in df.columns:
+                df["category"] = pd.Categorical(df["category"], categories=category_order, ordered=True)
+            
+            priority_order = ["High", "Medium", "Low"]
+            if "priority" in df.columns:
+                df["priority"] = pd.Categorical(df["priority"], categories=priority_order, ordered=True)
+
+            # Sort by the ordered categorical columns
+            sort_cols = [col for col in ["status", "category", "priority"] if col in df.columns]
+            if sort_cols:
+                df = df.sort_values(sort_cols)
+            
+            # Convert back to list of dictionaries for Streamlit rendering
+            items = df.fillna("").to_dict("records")
+        else:
+            items = []
+
+        # --- 3. Render Edit View ---
+        if st.session_state["editing_backlog_id"] is not None:
+            editing_item = next((i for i in items if i["id"] == st.session_state["editing_backlog_id"]), None)
+            
+            if editing_item:
+                with st.container(border=True):
+                    st.markdown("### ✏️ Edit Ticket")
+                    with st.form("edit_backlog_form"):
+                        c1, c2, c3, c4 = st.columns(4)
+                        
+                        s_idx = ["Backlog", "In Progress", "Blocked", "Staged", "Done"].index(editing_item.get("status", "Backlog")) if editing_item.get("status") in ["Backlog", "In Progress", "Blocked", "Staged", "Done"] else 0
+                        e_status = c1.selectbox("Status", ["Backlog", "In Progress", "Blocked", "Staged", "Done"], index=s_idx)
+                        
+                        cat_idx = ["Core", "UI", "Bug", "Ops"].index(editing_item.get("category", "Core")) if editing_item.get("category") in ["Core", "UI", "Bug", "Ops"] else 0
+                        e_category = c2.selectbox("Category", ["Core", "UI", "Bug", "Ops"], index=cat_idx)
+                        
+                        p_idx = ["High", "Medium", "Low"].index(editing_item.get("priority", "Medium")) if editing_item.get("priority") in ["High", "Medium", "Low"] else 1
+                        e_priority = c3.selectbox("Priority", ["High", "Medium", "Low"], index=p_idx)
+                        
+                        app_idx = ["home_sync", "get_fit"].index(editing_item.get("app_name", "home_sync")) if editing_item.get("app_name") in ["home_sync", "get_fit"] else 0
+                        e_app = c4.selectbox("Target App", ["home_sync", "get_fit"], index=app_idx)
+
+                        e_feature = st.text_input("Feature or Bug Name", value=editing_item.get("feature", ""))
+                        e_notes = st.text_area("Notes / Description", value=editing_item.get("notes", ""))
+                        e_public_msg = st.text_area("Public Release Message", value=editing_item.get("public_message", ""))
+
+                        col_save, col_cancel = st.columns(2)
+                        if col_save.form_submit_button("💾 Save Changes", type="primary", use_container_width=True):
+                            update_backlog_item(editing_item["id"], e_feature, e_notes, e_status, e_app, e_category, e_priority, e_public_msg)
+                            st.session_state["editing_backlog_id"] = None
+                            st.rerun()
+                        if col_cancel.form_submit_button("❌ Cancel", use_container_width=True):
+                            st.session_state["editing_backlog_id"] = None
+                            st.rerun()
+                            
+        # --- 4. Display Items (Expanders) ---
+        if items:
+            apps = set([item.get("app_name") if item.get("app_name") else "unassigned" for item in items])
+            
+            # Sorts so "home_sync" is always index 0, followed by the rest alphabetically
+            sorted_apps = sorted(apps, key=lambda x: (0 if x == "home_sync" else 1, x))
+            
+            for app in sorted_apps:
+                clean_name = str(app).replace("_", " ").title()
+                
+                with st.expander(f"📱 {clean_name}", expanded=(app == "home_sync")):
+                    app_items = [i for i in items if i.get("app_name") == app or (not i.get("app_name") and app == "unassigned")]
+                    
+                    for item in app_items:
+                        col_text, col_act = st.columns([5, 1])
+                        col_text.markdown(f"**{item.get('feature', 'Unnamed Feature')}**")
+                        # Emphasize the Status visually to show the sorting order
+                        col_text.caption(f"Status: **{item.get('status', 'N/A')}** | Category: {item.get('category', 'N/A')} | Priority: {item.get('priority', 'N/A')}")
+                        
+                        # 🟢 NEW: Explicit tags for Notes and Public Message
+                        notes_text = item.get("notes", "").strip()
+                        public_msg = item.get("public_message", "").strip()
+                        
+                        if notes_text:
+                            col_text.markdown(f"**Notes / Description:** {notes_text}")
+                            
+                        if public_msg:
+                            # Added a slight color tint to the public message so it stands out from internal notes!
+                            col_text.markdown(f"**Public Message:** <span style='color: #10B981;'>{public_msg}</span>", unsafe_allow_html=True)
+                        
+                        if col_act.button("✏️ Edit", key=f"edit_bl_{item['id']}"):
+                            st.session_state["editing_backlog_id"] = item["id"]
+                            st.rerun()
+                        st.divider()
+        else:
+            st.info("Your master backlog is currently empty.")
