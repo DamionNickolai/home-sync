@@ -20,8 +20,11 @@ supabase = init_connection()
 
 def get_active_tasks():
     try:
-        # Notice we use the TASK_TABLE variable instead of a hardcoded string
-        response = supabase.table(TASK_TABLE).select("*").eq("is_completed", False).execute()
+        # Grab the ID from the active session
+        house_id = st.session_state.get("household_id", "unassigned")
+        
+        # 🟢 NEW: Added the .eq("household_id", house_id) filter!
+        response = supabase.table(TASK_TABLE).select("*").eq("is_completed", False).eq("household_id", house_id).execute()
         return response.data
     except Exception as e:
         print(f"Error fetching tasks: {e}")
@@ -29,7 +32,10 @@ def get_active_tasks():
 
 def get_completed_tasks():
     try:
-        response = supabase.table(TASK_TABLE).select("*").eq("is_completed", True).order("created_at", desc=True).limit(10).execute()
+        house_id = st.session_state.get("household_id", "unassigned")
+        
+        # 🟢 NEW: Added the .eq("household_id", house_id) filter!
+        response = supabase.table(TASK_TABLE).select("*").eq("is_completed", True).eq("household_id", house_id).order("created_at", desc=True).limit(50).execute()
         return response.data
     except Exception as e:
         print(f"Error fetching completed tasks: {e}")
@@ -37,14 +43,16 @@ def get_completed_tasks():
 
 def add_new_task(task_name, category, priority, assigned_to, target_date):
     try:
+        house_id = st.session_state.get("household_id", "unassigned")
+        
         data = {
             "task_name": task_name,
             "category": category,
             "priority": priority,
             "assigned_to": assigned_to,
-            # Ensure date is converted to a string format Supabase understands, or None if left blank
             "target_date": str(target_date) if target_date else None, 
-            "is_completed": False
+            "is_completed": False,
+            "household_id": house_id  # 🟢 NEW: Stamp the task with the family's ID!
         }
         supabase.table(TASK_TABLE).insert(data).execute()
         return True
@@ -84,4 +92,53 @@ def update_task(task_id, task_name=None, category=None, priority=None, assigned_
         return False
     except Exception as e:
         print(f"Error updating task: {e}")
+        return False
+    
+# ==========================================
+# 📝 BACKLOG FUNCTIONS (Shared Table)
+# ==========================================
+
+def get_all_backlog_items():
+    """Fetches active backlog items (Hides 'Done')."""
+    try:
+        # 🟢 Hides any ticket marked "Done"
+        response = supabase.table("backlog").select("*").neq("status", "Done").order("created_at", desc=True).execute()
+        return response.data
+    except Exception as e:
+        print(f"Error fetching backlog: {e}")
+        return []
+
+def add_backlog_item(feature, notes, status="Backlog", app_name="home_sync", category="Core", priority="Medium"):
+    """Adds a new backlog item using the correct database columns."""
+    try:
+        data = {
+            "feature": feature,  
+            "notes": notes,      
+            "status": status,
+            "app_name": app_name,
+            "category": category,
+            "priority": priority
+        }
+        supabase.table("backlog").insert(data).execute()
+        return True
+    except Exception as e:
+        print(f"Error inserting backlog item: {e}")
+        return False
+
+def update_backlog_item(item_id, feature, notes, status, app_name, category, priority, public_message=""):
+    """Updates an existing backlog ticket."""
+    try:
+        data = {
+            "feature": feature,
+            "notes": notes,
+            "status": status,
+            "app_name": app_name,
+            "category": category,
+            "priority": priority,
+            "public_message": public_message  # 🟢 NEW: Added to the payload
+        }
+        supabase.table("backlog").update(data).eq("id", item_id).execute()
+        return True
+    except Exception as e:
+        print(f"Error updating backlog item: {e}")
         return False
