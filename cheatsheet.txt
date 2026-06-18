@@ -24,6 +24,9 @@ python maintenance/backfill_auth_user_ids.py --apply
 VALIDATE LOCAL MATCHES CLOUD:
 git fetch origin dev
 git status
+VALIDATE ALL CLOUD:
+git fetch --all
+git branch -vv
 STORE AND MERGE LOCAL UPDATES (Do this if you have made changes locally but origin is ahead):
 git stash
 git fetch origin dev
