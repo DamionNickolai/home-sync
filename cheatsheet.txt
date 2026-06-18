@@ -30,14 +30,14 @@ git fetch origin dev
 git status
 git stash pop
 
-AUTO PUSH FROM LOCAL TO CLOUD:
-python push_to_dev.py
-python push_to_prod.py
-
 PUSH A SMALL FIX TO DEV STAGING:
 git add auth.py
 git commit --amend --no-edit
 git push --force origin dev
+
+AUTO PUSH FROM LOCAL TO CLOUD:
+python push_to_dev.py
+python push_to_prod.py
 
 INSTALL PACKAGES:
 pip install -r requirements.txt
