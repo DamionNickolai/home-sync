@@ -2,9 +2,9 @@ import subprocess
 import sys
 
 def run_cmd(cmd):
-    result = subprocess.run(cmd, shell=True, text=True)
+    result = subprocess.run(cmd, text=True)
     if result.returncode != 0:
-        print(f"\n❌ ERROR: Command failed -> {cmd}")
+        print(f"\n❌ ERROR: Command failed -> {' '.join(cmd)}")
         sys.exit(1)
 
 print("\n🚨 ========================================== 🚨")
@@ -18,16 +18,16 @@ if confirm.lower() != 'yes':
 
 print("\n🚀 Initiating Production Merge...")
 
-run_cmd("git checkout main")
-run_cmd("git pull origin main")
+run_cmd(["git", "checkout", "main"])
+run_cmd(["git", "pull", "origin", "main"])
 print("\n🔀 Merging 'dev' into 'main'...")
-run_cmd("git merge dev")
+run_cmd(["git", "merge", "dev"])
 
 print("\n☁️  Pushing to GitHub (main branch)...")
-run_cmd("git push origin main")
+run_cmd(["git", "push", "origin", "main"])
 
 print("\n🔄 Switching back to 'dev' branch for safety...")
-run_cmd("git checkout dev")
+run_cmd(["git", "checkout", "dev"])
 
 print("\n✅ LIVE DEPLOYMENT COMPLETE!")
 print("💪 Your PROD app is now updated. You are safely back in your DEV sandbox.")

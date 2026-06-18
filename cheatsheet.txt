@@ -13,9 +13,22 @@ Ctrl + s
 CREATE VIRTUAL ENV:
 python -m venv venv
 
+CREATE LOCAL .ENV FROM TEMPLATE:
+Copy-Item maintenance/.env.example .env
+
+BACKFILL AUTH IDS:
+Run locally after setting SUPABASE_URL and SUPABASE_SERVICE_KEY:
+python maintenance/backfill_auth_user_ids.py
+python maintenance/backfill_auth_user_ids.py --apply
+
 VALIDATE LOCAL MATCHES CLOUD:
 git fetch origin dev
 git status
+STORE AND MERGE LOCAL UPDATES (Do this if you have made changes locally but origin is ahead):
+git stash
+git fetch origin dev
+git status
+git stash pop
 
 AUTO PUSH FROM LOCAL TO CLOUD:
 python push_to_dev.py

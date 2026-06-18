@@ -4,4 +4,4 @@ plotly
 supabase
 requests
 matplotlib
-streamlit-cookies-controller
+python-dotenv

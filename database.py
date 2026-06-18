@@ -14,6 +14,18 @@ def init_connection() -> Client:
 
 supabase = init_connection()
 
+
+def get_current_household_id():
+    house_id = st.session_state.get("household_id")
+    if not house_id or house_id == "unassigned":
+        raise ValueError("No household is associated with the current session.")
+    return house_id
+
+
+def require_privileged_user():
+    if st.session_state.get("user_role") != "developer":
+        raise PermissionError("This action requires developer access.")
+
 # ==========================================
 # 📋 TO-DO LIST FUNCTIONS
 # ==========================================
@@ -21,7 +33,7 @@ supabase = init_connection()
 def get_active_tasks():
     try:
         # Grab the ID from the active session
-        house_id = st.session_state.get("household_id", "unassigned")
+        house_id = get_current_household_id()
         
         # 🟢 NEW: Added the .eq("household_id", house_id) filter!
         response = supabase.table(TASK_TABLE).select("*").eq("is_completed", False).eq("household_id", house_id).execute()
@@ -32,7 +44,7 @@ def get_active_tasks():
 
 def get_completed_tasks():
     try:
-        house_id = st.session_state.get("household_id", "unassigned")
+        house_id = get_current_household_id()
         
         # 🟢 NEW: Added the .eq("household_id", house_id) filter!
         response = supabase.table(TASK_TABLE).select("*").eq("is_completed", True).eq("household_id", house_id).order("created_at", desc=True).limit(50).execute()
@@ -43,7 +55,7 @@ def get_completed_tasks():
 
 def add_new_task(task_name, category, priority, assigned_to, target_date):
     try:
-        house_id = st.session_state.get("household_id", "unassigned")
+        house_id = get_current_household_id()
         
         data = {
             "task_name": task_name,
@@ -63,9 +75,10 @@ def add_new_task(task_name, category, priority, assigned_to, target_date):
 def batch_update_tasks(task_ids, new_status):
     """Updates a list of task IDs to a specific status (True or False)."""
     try:
+        house_id = get_current_household_id()
         # Loop through IDs and update each in the database
         for tid in task_ids:
-            supabase.table(TASK_TABLE).update({"is_completed": new_status}).eq("id", tid).execute()
+            supabase.table(TASK_TABLE).update({"is_completed": new_status}).eq("id", tid).eq("household_id", house_id).execute()
         return True
     except Exception as e:
         print(f"Error in batch update: {e}")
@@ -74,6 +87,7 @@ def batch_update_tasks(task_ids, new_status):
 def update_task(task_id, task_name=None, category=None, priority=None, assigned_to=None, target_date=None):
     """Updates specific fields of a task."""
     try:
+        house_id = get_current_household_id()
         update_data = {}
         if task_name is not None:
             update_data["task_name"] = task_name
@@ -87,7 +101,7 @@ def update_task(task_id, task_name=None, category=None, priority=None, assigned_
             update_data["target_date"] = str(target_date) if target_date else None
         
         if update_data:
-            supabase.table(TASK_TABLE).update(update_data).eq("id", task_id).execute()
+            supabase.table(TASK_TABLE).update(update_data).eq("id", task_id).eq("household_id", house_id).execute()
             return True
         return False
     except Exception as e:
@@ -101,6 +115,7 @@ def update_task(task_id, task_name=None, category=None, priority=None, assigned_
 def get_all_backlog_items():
     """Fetches active backlog items (Hides 'Done')."""
     try:
+        require_privileged_user()
         # 🟢 Hides any ticket marked "Done"
         response = supabase.table("backlog").select("*").neq("status", "Done").order("created_at", desc=True).execute()
         return response.data
@@ -128,6 +143,7 @@ def add_backlog_item(feature, notes, status="Backlog", app_name="home_sync", cat
 def update_backlog_item(item_id, feature, notes, status, app_name, category, priority, public_message=""):
     """Updates an existing backlog ticket."""
     try:
+        require_privileged_user()
         data = {
             "feature": feature,
             "notes": notes,
@@ -146,6 +162,7 @@ def update_backlog_item(item_id, feature, notes, status, app_name, category, pri
 def delete_backlog_item(item_id):
     """Deletes a backlog ticket entirely."""
     try:
+        require_privileged_user()
         supabase.table("backlog").delete().eq("id", item_id).execute()
         return True
     except Exception as e:
@@ -155,7 +172,8 @@ def delete_backlog_item(item_id):
 def delete_task(task_id):
     """Deletes a to-do list task entirely."""
     try:
-        supabase.table("tasks").delete().eq("id", task_id).execute()
+        house_id = get_current_household_id()
+        supabase.table(TASK_TABLE).delete().eq("id", task_id).eq("household_id", house_id).execute()
         return True
     except Exception as e:
         print(f"Error deleting task: {e}")

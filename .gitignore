@@ -1,7 +1,11 @@
 # Streamlit Secrets (NEVER PUSH THIS)
 .streamlit/secrets.toml
+.streamlit/secrets.*
 
 .env
+.env.*
+!.env.example
+!maintenance/.env.example
 
 # Python Virtual Environments
 .venv/

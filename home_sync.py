@@ -128,21 +128,14 @@ if user_role == "developer":
 
 # 🔄 Public Log Out Button
 if st.sidebar.button("🚪 Log Out", use_container_width=True):
+    from auth import clear_auth_session
+    clear_auth_session()
     
-    # Import our secure isolation function
-    from auth import get_cookie_controller
-    controller = get_cookie_controller()
-    
-    # 1. Safely nuke the browser cookie 
-    # ⚠️ CHANGE THIS NAME FOR THE OTHER APP! ("get_fit_session")
-    if controller.get("home_sync_session") is not None:
-        controller.remove("home_sync_session")
-    
-    # 2. Nuke the temporary session state
+    # Nuke the temporary session state
     for key in list(st.session_state.keys()):
         del st.session_state[key]
         
-    # 3. Leave the ghost flag to prevent auto-login
+    # Leave the ghost flag to prevent immediate session recreation on rerun
     st.session_state["logout_in_progress"] = True
         
     st.query_params.clear() 

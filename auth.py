@@ -1,12 +1,62 @@
 import streamlit as st
 from supabase import create_client
-from streamlit_cookies_controller import CookieController
 
-def get_cookie_controller():
-    """Ensures every user gets their own isolated cookie reader."""
-    if "cookie_controller" not in st.session_state:
-        st.session_state["cookie_controller"] = CookieController()
-    return st.session_state["cookie_controller"]
+
+def get_auth_client():
+    return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
+
+
+def get_user_data_client():
+    return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_SERVICE_KEY"])
+
+
+def clear_auth_session():
+    for key in [
+        "password_correct",
+        "auth_access_token",
+        "auth_refresh_token",
+        "auth_user_id",
+        "logged_in_user",
+        "username",
+        "household_id",
+        "user_role",
+        "primary_color",
+        "sidebar_color",
+        "line_color",
+        "garmin_prefix",
+    ]:
+        st.session_state.pop(key, None)
+
+
+def get_app_user_record(supabase, auth_user_id):
+    if not auth_user_id:
+        return None
+
+    try:
+        user_record = supabase.table("users").select("*").eq("auth_user_id", auth_user_id).limit(1).execute()
+        if user_record.data:
+            return user_record.data[0]
+    except Exception:
+        pass
+
+    return None
+
+
+def hydrate_user_session(db_user, auth_user_id=None):
+    username = db_user["username"]
+
+    st.session_state.pop("logout_in_progress", None)
+    st.session_state["password_correct"] = True
+    st.session_state["auth_user_id"] = auth_user_id or db_user.get("auth_user_id")
+    st.session_state["logged_in_user"] = db_user["username"]
+    st.session_state["username"] = db_user["username"]
+    st.session_state["household_id"] = db_user.get("household_id", "unassigned")
+    st.session_state["user_role"] = db_user.get("role", "member")
+    st.session_state["primary_color"] = db_user.get("primary_color", "#1E3A8A")
+    st.session_state["sidebar_color"] = db_user.get("sidebar_color", "#162A61")
+    st.session_state["line_color"] = db_user.get("line_color", "#60A5FA")
+    st.session_state["garmin_prefix"] = db_user.get("garmin_prefix", username.lower())
+    return True
 
 # ==========================================
 # 🎨 LOGIN SCREEN STYLING
@@ -32,10 +82,9 @@ def set_login_background(image_url):
     )
 
 def check_password():
-    """Returns `True` if the user has a valid Supabase Auth session or cookie."""
-    
-    # Grab the private controller for this specific user tab
-    controller = get_cookie_controller()
+    """Returns `True` if the user has a valid Supabase Auth session."""
+    auth_client = get_auth_client()
+    user_data_client = get_user_data_client()
     
     # 1. THE INTERCEPTOR: Only check for auto-logins if we aren't currently logging out!
     if not st.session_state.get("logout_in_progress", False):
@@ -44,65 +93,47 @@ def check_password():
         if st.session_state.get("password_correct", False):
             return True
 
-        # 2. THE BRIDGE: If memory was wiped, check the 30-day browser cookie!
-        cookie_session = controller.get("home_sync_session")
-        if cookie_session:
-            # Rebuild the entire session state instantly from the cookie backup
-            for key, value in cookie_session.items():
-                st.session_state[key] = value
-            st.session_state["password_correct"] = True
-            return True
+        access_token = st.session_state.get("auth_access_token")
+        refresh_token = st.session_state.get("auth_refresh_token")
+
+        if access_token and refresh_token:
+            try:
+                auth_client.auth.set_session(access_token, refresh_token)
+                verified_user = auth_client.auth.get_user()
+                auth_user = getattr(verified_user, "user", None)
+                auth_user_id = getattr(auth_user, "id", None)
+                db_user = get_app_user_record(user_data_client, auth_user_id)
+
+                if db_user and hydrate_user_session(db_user, auth_user_id=auth_user_id):
+                    return True
+            except Exception:
+                pass
+
+            clear_auth_session()
 
     def perform_login(email, password):
         try:
-            supabase = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
-            auth_response = supabase.auth.sign_in_with_password({
+            auth_response = auth_client.auth.sign_in_with_password({
                 "email": email,
                 "password": password
             })
             
             if auth_response.user:
-                metadata = auth_response.user.user_metadata
-                username = metadata.get("username")
-                
-                user_record = supabase.table("users").select("*").ilike("username", username).execute()
-                
-                if user_record.data:
-                    db_user = user_record.data[0]
-                    # 🟢 Clear the logout flag so the cookie works normally again
-                    st.session_state.pop("logout_in_progress", None)
-                    st.session_state["password_correct"] = True
-                    st.session_state["logged_in_user"] = db_user["username"]
-                    st.session_state["username"] = db_user["username"]
-                    st.session_state["household_id"] = db_user.get("household_id", "unassigned")
-                    st.session_state["user_role"] = db_user.get("role", "member")
-                    st.session_state["primary_color"] = db_user.get("primary_color", "#1E3A8A")
-                    st.session_state["sidebar_color"] = db_user.get("sidebar_color", "#162A61")
-                    st.session_state["line_color"] = db_user.get("line_color", "#60A5FA")
-                    st.session_state["garmin_prefix"] = db_user.get("garmin_prefix", username.lower())
-                    
-                    # 🟢 NEW: Save a backup dictionary to a 30-day browser cookie!
-                    session_data = {
-                        "logged_in_user": db_user["username"],
-                        "username": db_user["username"],
-                        "household_id": db_user.get("household_id", "unassigned"),
-                        "user_role": db_user.get("role", "member"),
-                        "primary_color": db_user.get("primary_color", "#1E3A8A"),
-                        "sidebar_color": db_user.get("sidebar_color", "#162A61"),
-                        "line_color": db_user.get("line_color", "#60A5FA"),
-                        "garmin_prefix": db_user.get("garmin_prefix", username.lower())
-                    }
-                    
-                    # 2592000 seconds = exactly 30 days
-                    controller.set("home_sync_session", session_data, max_age=2592000)
-                    
+                auth_user_id = getattr(auth_response.user, "id", None)
+                db_user = get_app_user_record(user_data_client, auth_user_id)
+
+                if db_user and hydrate_user_session(db_user, auth_user_id=auth_user_id):
+                    session = getattr(auth_response, "session", None)
+                    st.session_state["auth_access_token"] = getattr(session, "access_token", None)
+                    st.session_state["auth_refresh_token"] = getattr(session, "refresh_token", None)
+
                     st.query_params.clear()
                     return True
-                else:
-                    st.warning("⚠️ DEBUG: User authenticated, but missing from public 'users' table!")
-                    return False
-        except Exception as e:
-            st.error(f"⚠️ DEBUG: Supabase Auth Error: {e}")
+
+                st.warning("Authenticated user is not provisioned for this app. Missing auth_user_id mapping.")
+                return False
+        except Exception:
+            st.error("Unable to sign in with the provided credentials.")
             return False
 
     # --- THE UI ---

@@ -4,9 +4,9 @@ import re
 
 def run_cmd(cmd):
     """Runs a terminal command and stops the script if it fails."""
-    result = subprocess.run(cmd, shell=True, text=True)
+    result = subprocess.run(cmd, text=True)
     if result.returncode != 0:
-        print(f"\n❌ ERROR: Command failed -> {cmd}")
+        print(f"\n❌ ERROR: Command failed -> {' '.join(cmd)}")
         sys.exit(1)
 
 print("\n🚀 Preparing to push to DEV (Staging Environment)...")
@@ -40,14 +40,14 @@ if not commit_msg:
 
 # 3. GIT OPERATIONS
 print("\n🔄 Switching to 'dev' branch...")
-run_cmd("git checkout dev")
+run_cmd(["git", "checkout", "dev"])
 
 print("📦 Packaging code...")
-run_cmd("git add .")
-run_cmd(f'git commit -m "{commit_msg}"')
+run_cmd(["git", "add", "."])
+run_cmd(["git", "commit", "-m", commit_msg])
 
 print("☁️ Pushing to GitHub (dev branch)...")
-run_cmd("git push origin dev")
+run_cmd(["git", "push", "origin", "dev"])
 
 print("\n✅ PUSHED TO STAGING!")
 print("📱 Go test the HOME-SYNC-DEV app on your phone.")
