@@ -45,7 +45,11 @@ st.markdown("""
 # ==========================================
 # 🔒 SECURE LOGIN
 # ==========================================
-if not check_password():
+is_authenticated = check_password()
+if is_authenticated and st.session_state.pop("post_login_clean_rerun", False):
+    st.rerun()
+
+if not is_authenticated:
     st.stop()
 
 # 🟢 FIX: Make sure this matches the key from auth.py!

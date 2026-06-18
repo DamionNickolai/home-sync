@@ -5,3 +5,4 @@ supabase
 requests
 matplotlib
 python-dotenv
+streamlit-cookies-controller
