@@ -7,7 +7,7 @@ from home_assist_api import fetch_ha_state
 from database import get_active_tasks, get_completed_tasks, add_new_task, batch_update_tasks, update_task, get_all_backlog_items, add_backlog_item, update_backlog_item, delete_backlog_item, delete_task
 from supabase import create_client, Client
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "0.0.1-alpha"
 
 @st.cache_resource
 def get_supabase_client() -> Client:
@@ -26,8 +26,6 @@ def get_available_users(household_id):
     except Exception as e:
         st.warning(f"Could not fetch users: {e}")
         return []
-
-APP_VERSION = "0.0.1-alpha"
 
 # 1. Page Config must ALWAYS be the very first Streamlit command
 st.set_page_config(page_title="Home Sync Dashboard", page_icon="🏠", layout="wide")
@@ -151,8 +149,8 @@ if st.sidebar.button("🚪 Log Out", use_container_width=True):
     st.rerun()
 
 # 🏷️ APPLICATION TAG
-st.sidebar.caption("<div style='text-align: center; color: gray; padding-top: 10px;'>Home Sync Hub</div>", unsafe_allow_html=True)
-    
+st.sidebar.caption(f"<div style='text-align: center; color: gray; padding-top: 10px;'>Home Sync Hub v{APP_VERSION}</div>", unsafe_allow_html=True)
+
 # ==========================================
 # 📋 MAIN DASHBOARD TABS
 # ==========================================
