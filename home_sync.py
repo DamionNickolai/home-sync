@@ -126,19 +126,23 @@ if user_role == "developer":
         st.caption("Home Assistant API Status: Standby")
         # We can put API raw payloads and cache clear buttons here later
 
-# 🚪 3. LOGOUT BUTTON
-if st.sidebar.button("🚪 Switch User / Log Out", use_container_width=True):
-    from streamlit_cookies_controller import CookieController
-    controller = CookieController()
+# 🔄 Public Log Out Button
+if st.sidebar.button("🚪 Log Out", use_container_width=True):
     
+    # Import our secure isolation function
+    from auth import get_cookie_controller
+    controller = get_cookie_controller()
+    
+    # 1. Safely nuke the browser cookie 
+    # ⚠️ CHANGE THIS NAME FOR THE OTHER APP! ("get_fit_session")
     if controller.get("home_sync_session") is not None:
         controller.remove("home_sync_session")
     
-    # Nuke the temporary session state
+    # 2. Nuke the temporary session state
     for key in list(st.session_state.keys()):
         del st.session_state[key]
         
-    # 🟢 THE FIX: Leave a flag telling auth.py to ignore the cookie!
+    # 3. Leave the ghost flag to prevent auto-login
     st.session_state["logout_in_progress"] = True
         
     st.query_params.clear() 
