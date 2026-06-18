@@ -27,6 +27,8 @@ def get_available_users(household_id):
         st.warning(f"Could not fetch users: {e}")
         return []
 
+APP_VERSION = "0.0.1-alpha"
+
 # 1. Page Config must ALWAYS be the very first Streamlit command
 st.set_page_config(page_title="Home Sync Dashboard", page_icon="🏠", layout="wide")
 
