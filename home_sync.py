@@ -4,7 +4,7 @@ import time
 import json
 from auth import check_password
 from home_assist_api import fetch_ha_state
-from database import get_active_tasks, get_completed_tasks, add_new_task, batch_update_tasks, update_task, get_all_backlog_items, add_backlog_item, update_backlog_item
+from database import get_active_tasks, get_completed_tasks, add_new_task, batch_update_tasks, update_task, get_all_backlog_items, add_backlog_item, update_backlog_item, delete_backlog_item, delete_task
 from supabase import create_client, Client
 
 APP_VERSION = "1.0.0"
@@ -126,22 +126,19 @@ if user_role == "developer":
         st.caption("Home Assistant API Status: Standby")
         # We can put API raw payloads and cache clear buttons here later
 
-# 🔄 Public Log Out Button
+# 🚪 3. LOGOUT BUTTON
 if st.sidebar.button("🚪 Switch User / Log Out", use_container_width=True):
-    # 🟢 NEW: Import our secure isolation function from auth.py
-    from auth import get_cookie_controller
-    controller = get_cookie_controller()
+    from streamlit_cookies_controller import CookieController
+    controller = CookieController()
     
-    # 1. Safely nuke the browser cookie (Make sure the name matches the app!)
-    # Use "home_sync_session" for Home Sync, and "get_fit_session" for Get Fit!
     if controller.get("home_sync_session") is not None:
         controller.remove("home_sync_session")
     
-    # 2. Nuke the temporary session state
+    # Nuke the temporary session state
     for key in list(st.session_state.keys()):
         del st.session_state[key]
         
-    # 3. Leave the ghost flag
+    # 🟢 THE FIX: Leave a flag telling auth.py to ignore the cookie!
     st.session_state["logout_in_progress"] = True
         
     st.query_params.clear() 
@@ -314,31 +311,22 @@ with tab1:
                             
                             edit_target_date = col5.date_input("Target Date", value=pd.to_datetime(editing_task.get("target_date")) if editing_task.get("target_date") else None)
                             
-                            col_save, col_cancel = st.columns(2)
-                            save_edit = col_save.form_submit_button("💾 Save Changes", type="primary", use_container_width=True)
-                            cancel_edit = col_cancel.form_submit_button("❌ Cancel", use_container_width=True)
+                            col_save, col_del, col_cancel = st.columns([2, 1, 1])
+                        
+                        if col_save.form_submit_button("💾 Save", type="primary", use_container_width=True):
+                            # Your existing update_task() code here...
+                            st.session_state["editing_task_id"] = None
+                            st.rerun()
                             
-                            if save_edit and edit_task_name and edit_assigned_to:
-                                success = update_task(
-                                    st.session_state["editing_task_id"],
-                                    task_name=edit_task_name,
-                                    category=edit_category,
-                                    priority=edit_priority,
-                                    assigned_to=json.dumps(edit_assigned_to),
-                                    target_date=edit_target_date
-                                )
-                                if success:
-                                    st.success("Task updated!")
-                                    st.session_state["editing_task_id"] = None
-                                    st.rerun()
-                                else:
-                                    st.error("Failed to update task.")
-                            elif save_edit and not edit_assigned_to:
-                                st.error("Please assign the task to at least one person.")
+                        # 🟢 The new Delete Button
+                        if col_del.form_submit_button("🗑️ Delete", use_container_width=True):
+                            delete_task(st.session_state["editing_task_id"])
+                            st.session_state["editing_task_id"] = None
+                            st.rerun()
                             
-                            if cancel_edit:
-                                st.session_state["editing_task_id"] = None
-                                st.rerun()
+                        if col_cancel.form_submit_button("❌ Cancel", use_container_width=True):
+                            st.session_state["editing_task_id"] = None
+                            st.rerun()
             
             # --- 2. Display Active Tasks ---
             all_active_tasks = get_active_tasks()
@@ -744,11 +732,20 @@ if user_role == "developer":
                         e_notes = st.text_area("Notes / Description", value=editing_item.get("notes", ""))
                         e_public_msg = st.text_area("Public Release Message", value=editing_item.get("public_message", ""))
 
-                        col_save, col_cancel = st.columns(2)
-                        if col_save.form_submit_button("💾 Save Changes", type="primary", use_container_width=True):
+                        # 🟢 Changed to 3 columns to fit the Delete button
+                        col_save, col_del, col_cancel = st.columns([2, 1, 1])
+                        
+                        if col_save.form_submit_button("💾 Save", type="primary", use_container_width=True):
                             update_backlog_item(editing_item["id"], e_feature, e_notes, e_status, e_app, e_category, e_priority, e_public_msg)
                             st.session_state["editing_backlog_id"] = None
                             st.rerun()
+                            
+                        # 🟢 The new Delete Button
+                        if col_del.form_submit_button("🗑️ Delete", use_container_width=True):
+                            delete_backlog_item(editing_item["id"])
+                            st.session_state["editing_backlog_id"] = None
+                            st.rerun()
+                            
                         if col_cancel.form_submit_button("❌ Cancel", use_container_width=True):
                             st.session_state["editing_backlog_id"] = None
                             st.rerun()

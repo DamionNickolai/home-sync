@@ -142,3 +142,21 @@ def update_backlog_item(item_id, feature, notes, status, app_name, category, pri
     except Exception as e:
         print(f"Error updating backlog item: {e}")
         return False
+    
+def delete_backlog_item(item_id):
+    """Deletes a backlog ticket entirely."""
+    try:
+        supabase.table("backlog").delete().eq("id", item_id).execute()
+        return True
+    except Exception as e:
+        print(f"Error deleting backlog item: {e}")
+        return False
+
+def delete_task(task_id):
+    """Deletes a to-do list task entirely."""
+    try:
+        supabase.table("tasks").delete().eq("id", task_id).execute()
+        return True
+    except Exception as e:
+        print(f"Error deleting task: {e}")
+        return False
