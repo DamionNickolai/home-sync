@@ -1,5 +1,12 @@
 import streamlit as st
 from supabase import create_client
+from streamlit_cookies_controller import CookieController
+
+def get_cookie_controller():
+    """Ensures every user gets their own isolated cookie reader."""
+    if "cookie_controller" not in st.session_state:
+        st.session_state["cookie_controller"] = CookieController()
+    return st.session_state["cookie_controller"]
 
 # ==========================================
 # 🎨 LOGIN SCREEN STYLING
@@ -44,11 +51,26 @@ def set_login_background(image_url):
     )
 
 def check_password():
-    """Returns `True` if the user has a valid Supabase Auth session."""
+    """Returns `True` if the user has a valid Supabase Auth session or cookie."""
     
-    # 1. Simple, clean session check.
-    if st.session_state.get("password_correct", False):
-        return True
+    # 🟢 NEW: Grab the private controller for this specific user
+    controller = get_cookie_controller()
+    
+    # 1. THE INTERCEPTOR: Only check for auto-logins if we aren't currently logging out!
+    if not st.session_state.get("logout_in_progress", False):
+
+    # 1. Check if Streamlit's temporary memory still knows we are logged in.
+        if st.session_state.get("password_correct", False):
+            return True
+
+        # 2. THE BRIDGE: If memory was wiped, check the 30-day browser cookie!
+        cookie_session = controller.get("home_sync_session")
+        if cookie_session:
+            # Rebuild the entire session state instantly from the cookie backup
+            for key, value in cookie_session.items():
+                st.session_state[key] = value
+            st.session_state["password_correct"] = True
+            return True
 
     def perform_login(email, password):
         try:

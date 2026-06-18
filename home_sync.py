@@ -7,6 +7,8 @@ from home_assist_api import fetch_ha_state
 from database import get_active_tasks, get_completed_tasks, add_new_task, batch_update_tasks, update_task, get_all_backlog_items, add_backlog_item, update_backlog_item
 from supabase import create_client, Client
 
+APP_VERSION = "1.0.0"
+
 @st.cache_resource
 def get_supabase_client() -> Client:
     url = st.secrets["SUPABASE_URL"]
@@ -124,10 +126,24 @@ if user_role == "developer":
         st.caption("Home Assistant API Status: Standby")
         # We can put API raw payloads and cache clear buttons here later
 
-# 🚪 3. LOGOUT BUTTON (Anchored to the very bottom)
+# 🔄 Public Log Out Button
 if st.sidebar.button("🚪 Switch User / Log Out", use_container_width=True):
+    # 🟢 NEW: Import our secure isolation function from auth.py
+    from auth import get_cookie_controller
+    controller = get_cookie_controller()
+    
+    # 1. Safely nuke the browser cookie (Make sure the name matches the app!)
+    # Use "home_sync_session" for Home Sync, and "get_fit_session" for Get Fit!
+    if controller.get("home_sync_session") is not None:
+        controller.remove("home_sync_session")
+    
+    # 2. Nuke the temporary session state
     for key in list(st.session_state.keys()):
         del st.session_state[key]
+        
+    # 3. Leave the ghost flag
+    st.session_state["logout_in_progress"] = True
+        
     st.query_params.clear() 
     st.rerun()
 
