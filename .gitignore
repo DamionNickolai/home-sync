@@ -12,3 +12,6 @@ env/
 __pycache__/
 *.pyc
 *.pyo
+
+.vscode/
+*.code-workspace
