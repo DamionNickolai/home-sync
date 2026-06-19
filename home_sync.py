@@ -8,7 +8,7 @@ from database import get_active_tasks, get_completed_tasks, add_new_task, batch_
 from utils import calculate_next_version
 from supabase import create_client, Client
 
-APP_VERSION = "0.0.1-alpha"
+APP_VERSION = "0.0.2"
 GET_FIT_BASELINE_VERSION = "2.1.0"
 
 @st.cache_resource
