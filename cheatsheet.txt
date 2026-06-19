@@ -50,3 +50,12 @@ ENTER VIRTUAL ENV:
 
 RUN APP:
 python -m streamlit run home_sync.py
+
+JOINT WORKSPACE (HOME + GET FIT):
+code home-sync-get-fit.code-workspace
+
+SYNC BOTH APPS FAST:
+git -C . fetch origin dev
+git -C . status
+git -C ../get-fit-together fetch origin dev
+git -C ../get-fit-together status
