@@ -1,33 +1,75 @@
 import subprocess
 import sys
 
-def run_cmd(cmd):
-    result = subprocess.run(cmd, text=True)
+def run_cmd(cmd, capture_output=False):
+    result = subprocess.run(cmd, text=True, capture_output=capture_output)
     if result.returncode != 0:
-        print(f"\n❌ ERROR: Command failed -> {' '.join(cmd)}")
+        print(f"\nERROR: Command failed -> {' '.join(cmd)}")
+        if result.stdout:
+            print(result.stdout.strip())
+        if result.stderr:
+            print(result.stderr.strip())
+        sys.exit(1)
+    return result
+
+
+def git_output(args):
+    return run_cmd(["git", *args], capture_output=True).stdout.strip()
+
+
+def ensure_git_repo():
+    inside = git_output(["rev-parse", "--is-inside-work-tree"])
+    if inside.lower() != "true":
+        print("ERROR: This script must be run inside a git repository.")
         sys.exit(1)
 
-print("\n🚨 ========================================== 🚨")
-print("🚨 WARNING: YOU ARE ABOUT TO PUSH TO PRODUCTION 🚨")
-print("🚨 ========================================== 🚨\n")
 
-confirm = input("Are you 100% sure the DEV app works perfectly? (type 'yes' to continue): ")
-if confirm.lower() != 'yes':
-    print("\n🛑 Deployment cancelled. Safety first! Go test in DEV.")
+def ensure_clean_working_tree():
+    status = git_output(["status", "--porcelain"])
+    if status:
+        print("ERROR: Working tree is not clean. Commit or stash changes before production deploy.")
+        print("\nPending changes:")
+        print(status)
+        sys.exit(1)
+
+print("\n===========================================")
+print("WARNING: YOU ARE ABOUT TO PUSH TO PRODUCTION")
+print("===========================================\n")
+
+ensure_git_repo()
+ensure_clean_working_tree()
+
+run_cmd(["git", "fetch", "--prune", "origin"])
+
+confirm = input("Type exactly 'deploy prod' to continue: ").strip()
+if confirm != "deploy prod":
+    print("\nDeployment cancelled. Safety first.")
     sys.exit(0)
 
-print("\n🚀 Initiating Production Merge...")
+print("\nInitiating production fast-forward merge...")
 
-run_cmd(["git", "checkout", "main"])
-run_cmd(["git", "pull", "origin", "main"])
-print("\n🔀 Merging 'dev' into 'main'...")
-run_cmd(["git", "merge", "dev"])
+starting_branch = git_output(["branch", "--show-current"]) or "dev"
 
-print("\n☁️  Pushing to GitHub (main branch)...")
-run_cmd(["git", "push", "origin", "main"])
+try:
+    run_cmd(["git", "switch", "main"])
+    run_cmd(["git", "pull", "--ff-only", "origin", "main"])
 
-print("\n🔄 Switching back to 'dev' branch for safety...")
-run_cmd(["git", "checkout", "dev"])
+    ahead_count = int(git_output(["rev-list", "--count", "main..origin/dev"]) or "0")
+    if ahead_count == 0:
+        print("No new commits in origin/dev to deploy.")
+        sys.exit(0)
 
-print("\n✅ LIVE DEPLOYMENT COMPLETE!")
-print("💪 Your PROD app is now updated. You are safely back in your DEV sandbox.")
+    print("Merging origin/dev into main (ff-only)...")
+    run_cmd(["git", "merge", "--ff-only", "origin/dev"])
+
+    print("Pushing main to origin...")
+    run_cmd(["git", "push", "origin", "main"])
+
+    print("\nProduction deployment complete.")
+finally:
+    # Always restore the original branch for safer local workflow.
+    current_branch = git_output(["branch", "--show-current"])
+    if current_branch != starting_branch:
+        run_cmd(["git", "switch", starting_branch])
+
+print(f"Returned to branch: {starting_branch}")

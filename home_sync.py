@@ -4,10 +4,12 @@ import time
 import json
 from auth import check_password
 from home_assist_api import fetch_ha_state
-from database import get_active_tasks, get_completed_tasks, add_new_task, batch_update_tasks, update_task, get_all_backlog_items, add_backlog_item, update_backlog_item, delete_backlog_item, delete_task
+from database import get_active_tasks, get_completed_tasks, add_new_task, batch_update_tasks, update_task, get_all_backlog_items, get_current_app_version, add_backlog_item, update_backlog_item, delete_backlog_item, delete_task, cut_release
+from utils import calculate_next_version
 from supabase import create_client, Client
 
 APP_VERSION = "0.0.1-alpha"
+GET_FIT_BASELINE_VERSION = "2.1.0"
 
 @st.cache_resource
 def get_supabase_client() -> Client:
@@ -581,10 +583,14 @@ with tab2:
         if panels:
             df = pd.DataFrame(list(panels.items()), columns=["Panel ID", "Power (W)"])
             df.set_index("Panel ID", inplace=True)
-            st.dataframe(
-                df.style.background_gradient(cmap="Greens", vmin=50, vmax=350),
-                width='stretch'
-            )
+            try:
+                st.dataframe(
+                    df.style.background_gradient(cmap="Greens", vmin=50, vmax=350),
+                    width='stretch'
+                )
+            except ImportError:
+                st.dataframe(df, width='stretch')
+                st.caption("Install matplotlib to enable heatmap styling for panel power.")
         else:
             st.warning("Panel data currently unavailable.")
     
@@ -651,14 +657,15 @@ if user_role == "developer":
                 new_status = c1.selectbox("Status", ["Backlog", "In Progress", "Blocked", "Staged", "Done"])
                 new_category = c2.selectbox("Category", ["Core", "UI", "Bug", "Ops"])
                 new_priority = c3.selectbox("Priority", ["High", "Medium", "Low"], index=1)
-                target_app = c4.selectbox("Target App", ["home_sync", "get_fit"])
+                target_app = c4.selectbox("Target App", ["home_sync", "get_fit", "Global"])
                 
                 new_feature = st.text_input("Feature or Bug Name")
-                new_notes = st.text_area("Notes / Description")
+                new_notes = st.text_area("Description", help="External-facing description of the feature")
+                new_work_notes = st.text_area("Work Notes", help="Internal notes about implementation")
                 
                 if st.form_submit_button("Save Ticket", type="primary"):
                     if new_feature:
-                        add_backlog_item(new_feature, new_notes, new_status, target_app, new_category, new_priority)
+                        add_backlog_item(new_feature, new_notes, new_status, target_app, new_category, new_priority, new_work_notes)
                         st.success(f"Added to {target_app}!")
                         st.rerun()
                         
@@ -707,83 +714,298 @@ if user_role == "developer":
         else:
             items = []
 
-        # --- 3. Render Edit View ---
-        if st.session_state["editing_backlog_id"] is not None:
-            editing_item = next((i for i in items if i["id"] == st.session_state["editing_backlog_id"]), None)
-            
-            if editing_item:
-                with st.container(border=True):
-                    st.markdown("### ✏️ Edit Ticket")
-                    with st.form("edit_backlog_form"):
-                        c1, c2, c3, c4 = st.columns(4)
-                        
-                        s_idx = ["Backlog", "In Progress", "Blocked", "Staged", "Done"].index(editing_item.get("status", "Backlog")) if editing_item.get("status") in ["Backlog", "In Progress", "Blocked", "Staged", "Done"] else 0
-                        e_status = c1.selectbox("Status", ["Backlog", "In Progress", "Blocked", "Staged", "Done"], index=s_idx)
-                        
-                        cat_idx = ["Core", "UI", "Bug", "Ops"].index(editing_item.get("category", "Core")) if editing_item.get("category") in ["Core", "UI", "Bug", "Ops"] else 0
-                        e_category = c2.selectbox("Category", ["Core", "UI", "Bug", "Ops"], index=cat_idx)
-                        
-                        p_idx = ["High", "Medium", "Low"].index(editing_item.get("priority", "Medium")) if editing_item.get("priority") in ["High", "Medium", "Low"] else 1
-                        e_priority = c3.selectbox("Priority", ["High", "Medium", "Low"], index=p_idx)
-                        
-                        app_idx = ["home_sync", "get_fit"].index(editing_item.get("app_name", "home_sync")) if editing_item.get("app_name") in ["home_sync", "get_fit"] else 0
-                        e_app = c4.selectbox("Target App", ["home_sync", "get_fit"], index=app_idx)
+        # --- 3. Helper: Render inline edit form ---
+        def render_edit_form(item, form_key_suffix):
+            with st.container(border=True):
+                st.markdown("### ✏️ Edit Ticket")
+                with st.form(f"edit_backlog_form_{form_key_suffix}"):
+                    c1, c2, c3, c4 = st.columns(4)
+                    
+                    s_idx = ["Backlog", "In Progress", "Blocked", "Staged", "Done"].index(item.get("status", "Backlog")) if item.get("status") in ["Backlog", "In Progress", "Blocked", "Staged", "Done"] else 0
+                    e_status = c1.selectbox("Status", ["Backlog", "In Progress", "Blocked", "Staged", "Done"], index=s_idx, key=f"s_{form_key_suffix}")
+                    
+                    cat_idx = ["Core", "UI", "Bug", "Ops"].index(item.get("category", "Core")) if item.get("category") in ["Core", "UI", "Bug", "Ops"] else 0
+                    e_category = c2.selectbox("Category", ["Core", "UI", "Bug", "Ops"], index=cat_idx, key=f"c_{form_key_suffix}")
+                    
+                    p_idx = ["High", "Medium", "Low"].index(item.get("priority", "Medium")) if item.get("priority") in ["High", "Medium", "Low"] else 1
+                    e_priority = c3.selectbox("Priority", ["High", "Medium", "Low"], index=p_idx, key=f"p_{form_key_suffix}")
+                    
+                    app_opts = ["home_sync", "get_fit", "Global"]
+                    app_idx = app_opts.index(item.get("app_name", "home_sync")) if item.get("app_name") in app_opts else 0
+                    e_app = c4.selectbox("Target App", app_opts, index=app_idx, key=f"a_{form_key_suffix}")
 
-                        e_feature = st.text_input("Feature or Bug Name", value=editing_item.get("feature", ""))
-                        e_notes = st.text_area("Notes / Description", value=editing_item.get("notes", ""))
-                        e_public_msg = st.text_area("Public Release Message", value=editing_item.get("public_message", ""))
+                    e_feature = st.text_input("Feature or Bug Name", value=item.get("feature", ""), key=f"f_{form_key_suffix}")
+                    e_notes = st.text_area("Description", value=item.get("notes", ""), help="External-facing description", key=f"n_{form_key_suffix}")
+                    e_work_notes = st.text_area("Work Notes", value=item.get("work_notes", ""), help="Internal implementation notes", key=f"w_{form_key_suffix}")
+                    e_public_msg = st.text_area("Public Release Message", value=item.get("public_message", ""), key=f"pm_{form_key_suffix}")
 
-                        # 🟢 Changed to 3 columns to fit the Delete button
-                        col_save, col_del, col_cancel = st.columns([2, 1, 1])
+                    col_save, col_del, col_cancel = st.columns([2, 1, 1])
+                    
+                    if col_save.form_submit_button("💾 Save", type="primary", use_container_width=True):
+                        update_backlog_item(item["id"], e_feature, e_notes, e_status, e_app, e_category, e_priority, e_public_msg, e_work_notes)
+                        st.session_state["editing_backlog_id"] = None
+                        st.rerun()
                         
-                        if col_save.form_submit_button("💾 Save", type="primary", use_container_width=True):
-                            update_backlog_item(editing_item["id"], e_feature, e_notes, e_status, e_app, e_category, e_priority, e_public_msg)
-                            st.session_state["editing_backlog_id"] = None
-                            st.rerun()
-                            
-                        # 🟢 The new Delete Button
-                        if col_del.form_submit_button("🗑️ Delete", use_container_width=True):
-                            delete_backlog_item(editing_item["id"])
-                            st.session_state["editing_backlog_id"] = None
-                            st.rerun()
-                            
-                        if col_cancel.form_submit_button("❌ Cancel", use_container_width=True):
-                            st.session_state["editing_backlog_id"] = None
-                            st.rerun()
-                            
+                    if col_del.form_submit_button("🗑️ Delete", use_container_width=True):
+                        delete_backlog_item(item["id"])
+                        st.session_state["editing_backlog_id"] = None
+                        st.rerun()
+                        
+                    if col_cancel.form_submit_button("❌ Cancel", use_container_width=True):
+                        st.session_state["editing_backlog_id"] = None
+                        st.rerun()
+                
         # --- 4. Display Items (Expanders) ---
         if items:
+            # Shared ordering for app sections and staged subgroup headings.
+            def sort_key(app):
+                if app == "home_sync":
+                    return (0, app)
+                elif app == "get_fit":
+                    return (1, app)
+                elif app == "Global":
+                    return (2, app)
+                else:
+                    return (3, app)
+
             apps = set([item.get("app_name") if item.get("app_name") else "unassigned" for item in items])
             
-            # Sorts so "home_sync" is always index 0, followed by the rest alphabetically
-            sorted_apps = sorted(apps, key=lambda x: (0 if x == "home_sync" else 1, x))
+            sorted_apps = sorted(apps, key=sort_key)
             
             for app in sorted_apps:
                 clean_name = str(app).replace("_", " ").title()
                 
-                with st.expander(f"📱 {clean_name}", expanded=(app == "home_sync")):
-                    app_items = [i for i in items if i.get("app_name") == app or (not i.get("app_name") and app == "unassigned")]
+                with st.expander(f"📱 {clean_name}", expanded=False):
+                    app_items = [
+                        i for i in items
+                        if (i.get("app_name") == app or (not i.get("app_name") and app == "unassigned"))
+                        and i.get("status") != "Staged"
+                    ]
+
+                    if not app_items:
+                        st.caption("No non-staged items in this app section.")
                     
                     for item in app_items:
-                        col_text, col_act = st.columns([5, 1])
-                        col_text.markdown(f"**{item.get('feature', 'Unnamed Feature')}**")
-                        # Emphasize the Status visually to show the sorting order
-                        col_text.caption(f"Status: **{item.get('status', 'N/A')}** | Category: {item.get('category', 'N/A')} | Priority: {item.get('priority', 'N/A')}")
-                        
-                        # 🟢 NEW: Explicit tags for Notes and Public Message
-                        notes_text = item.get("notes", "").strip()
-                        public_msg = item.get("public_message", "").strip()
-                        
-                        if notes_text:
-                            col_text.markdown(f"**Notes / Description:** {notes_text}")
+                        if st.session_state["editing_backlog_id"] == item["id"]:
+                            render_edit_form(item, f"app_{item['id']}")
+                        else:
+                            col_text, col_act = st.columns([5, 1])
+                            col_text.markdown(f"**{item.get('feature', 'Unnamed Feature')}**")
+                            # Emphasize the Status visually to show the sorting order
+                            col_text.caption(f"Status: **{item.get('status', 'N/A')}** | Category: {item.get('category', 'N/A')} | Priority: {item.get('priority', 'N/A')}")
                             
-                        if public_msg:
-                            # Added a slight color tint to the public message so it stands out from internal notes!
-                            col_text.markdown(f"**Public Message:** <span style='color: #10B981;'>{public_msg}</span>", unsafe_allow_html=True)
-                        
-                        if col_act.button("✏️ Edit", key=f"edit_bl_{item['id']}"):
-                            st.session_state["editing_backlog_id"] = item["id"]
-                            st.rerun()
-                        st.divider()
+                            # 🟢 NEW: Explicit separation of Description and Work Notes
+                            notes_text = item.get("notes", "").strip()
+                            work_notes_text = item.get("work_notes", "").strip()
+                            public_msg = item.get("public_message", "").strip()
+                            version_info = item.get("version", "")
+                            
+                            if notes_text:
+                                col_text.markdown(f"**Description:** {notes_text}")
+                            
+                            if work_notes_text:
+                                col_text.markdown(f"**Work Notes:** {work_notes_text}")
+                                
+                            if public_msg:
+                                # Added a slight color tint to the public message so it stands out from internal notes!
+                                col_text.markdown(f"**Public Message:** <span style='color: #10B981;'>{public_msg}</span>", unsafe_allow_html=True)
+                            
+                            if version_info:
+                                col_text.caption(f"🏷️ Released as v{version_info}")
+                            
+                            if col_act.button("✏️ Edit", key=f"edit_bl_{item['id']}"):
+                                st.session_state["editing_backlog_id"] = item["id"]
+                                st.rerun()
+                            st.divider()
         else:
             st.info("Your master backlog is currently empty.")
+
+        # --- 5. Release Management (Below All App Sections) ---
+        st.markdown("---")
+        st.markdown("### 🚀 Release Management")
+
+        staged_items = [i for i in items if i.get("status") == "Staged"]
+        staged_count = len(staged_items)
+
+        # Staged expander at top of Release Management
+        if staged_items:
+            # Shared ordering for staged subgroup headings
+            def sort_key(app):
+                if app == "home_sync":
+                    return (0, app)
+                elif app == "get_fit":
+                    return (1, app)
+                elif app == "Global":
+                    return (2, app)
+                else:
+                    return (3, app)
+
+            with st.expander(f"🚀 Staged (All Apps) - {len(staged_items)}", expanded=False):
+                staged_apps = sorted(
+                    set(i.get("app_name") if i.get("app_name") else "unassigned" for i in staged_items),
+                    key=sort_key
+                )
+
+                for staged_app in staged_apps:
+                    staged_app_items = [
+                        i for i in staged_items
+                        if (i.get("app_name") == staged_app or (not i.get("app_name") and staged_app == "unassigned"))
+                    ]
+
+                    staged_app_name = str(staged_app).replace("_", " ").title()
+                    st.markdown(f"### {staged_app_name}")
+
+                    for item in staged_app_items:
+                        if st.session_state["editing_backlog_id"] == item["id"]:
+                            render_edit_form(item, f"staged_{item['id']}")
+                        else:
+                            col_text, col_act = st.columns([5, 1])
+                            col_text.markdown(f"**{item.get('feature', 'Unnamed Feature')}**")
+                            col_text.caption(
+                                f"Status: **{item.get('status', 'N/A')}** | "
+                                f"Category: {item.get('category', 'N/A')} | Priority: {item.get('priority', 'N/A')}"
+                            )
+
+                            notes_text = item.get("notes", "").strip()
+                            work_notes_text = item.get("work_notes", "").strip()
+                            public_msg = item.get("public_message", "").strip()
+                            version_info = item.get("version", "")
+
+                            if notes_text:
+                                col_text.markdown(f"**Description:** {notes_text}")
+
+                            if work_notes_text:
+                                col_text.markdown(f"**Work Notes:** {work_notes_text}")
+
+                            if public_msg:
+                                col_text.markdown(
+                                    f"**Public Message:** <span style='color: #10B981;'>{public_msg}</span>",
+                                    unsafe_allow_html=True
+                                )
+
+                            if version_info:
+                                col_text.caption(f"🏷️ Released as v{version_info}")
+
+                            if col_act.button("✏️ Edit", key=f"edit_staged_{item['id']}"):
+                                st.session_state["editing_backlog_id"] = item["id"]
+                                st.rerun()
+                            st.divider()
+
+        st.markdown("---")
+
+        staged_home_sync_items = [i for i in staged_items if i.get("app_name") == "home_sync"]
+        staged_get_fit_items = [i for i in staged_items if i.get("app_name") == "get_fit"]
+        staged_global_items = [i for i in staged_items if i.get("app_name") == "Global"]
+
+        home_sync_categories = [
+            i.get("category", "")
+            for i in staged_home_sync_items
+        ]
+        get_fit_categories = [
+            i.get("category", "")
+            for i in staged_get_fit_items
+        ]
+
+        home_sync_all_categories = [
+            i.get("category", "")
+            for i in staged_items
+            if i.get("app_name") in ["home_sync", "Global"]
+        ]
+        get_fit_all_categories = [
+            i.get("category", "")
+            for i in staged_items
+            if i.get("app_name") in ["get_fit", "Global"]
+        ]
+
+        current_home_sync_version = get_current_app_version("home_sync", fallback_version=APP_VERSION)
+        current_get_fit_version = get_current_app_version("get_fit", fallback_version=GET_FIT_BASELINE_VERSION)
+
+        next_home_sync_version = (
+            calculate_next_version(current_home_sync_version, home_sync_categories)
+            if home_sync_categories else current_home_sync_version
+        )
+        next_get_fit_version = (
+            calculate_next_version(current_get_fit_version, get_fit_categories)
+            if get_fit_categories else current_get_fit_version
+        )
+
+        next_home_sync_all_version = (
+            calculate_next_version(current_home_sync_version, home_sync_all_categories)
+            if home_sync_all_categories else current_home_sync_version
+        )
+        next_get_fit_all_version = (
+            calculate_next_version(current_get_fit_version, get_fit_all_categories)
+            if get_fit_all_categories else current_get_fit_version
+        )
+
+        col_home_preview, col_get_fit_preview = st.columns(2)
+        with col_home_preview:
+            st.caption(f"Home Sync: Current v{current_home_sync_version} -> Next v{next_home_sync_version}")
+        with col_get_fit_preview:
+            st.caption(f"Get Fit Together: Current v{current_get_fit_version} -> Next v{next_get_fit_version}")
+
+        if staged_count > 0:
+            col_home_cut, col_get_fit_cut = st.columns(2)
+
+            with col_home_cut:
+                if st.button("🚀 Cut Home Sync Release", type="primary", use_container_width=True):
+                    success, versions, message = cut_release(
+                        current_home_sync_version,
+                        current_get_fit_version,
+                        release_target="home_sync"
+                    )
+                    if success:
+                        st.success(message)
+                        st.session_state["APP_VERSION"] = versions.get("home_sync", current_home_sync_version)
+                        st.info(
+                            f"📝 Next step: Use Home Sync v{versions.get('home_sync', current_home_sync_version)} "
+                            f"for deployment."
+                        )
+                        st.rerun()
+                    else:
+                        st.error(message)
+
+            with col_get_fit_cut:
+                if st.button("🚀 Cut Get Fit Together Release", use_container_width=True):
+                    success, versions, message = cut_release(
+                        current_home_sync_version,
+                        current_get_fit_version,
+                        release_target="get_fit"
+                    )
+                    if success:
+                        st.success(message)
+                        st.info(
+                            f"📝 Next step: Use Get Fit Together v{versions.get('get_fit', current_get_fit_version)} "
+                            f"for deployment."
+                        )
+                        st.rerun()
+                    else:
+                        st.error(message)
+
+            if staged_global_items:
+                st.caption(
+                    f"Global staged items: {len(staged_global_items)}. "
+                    f"Use All Apps cut when you want Global changes released to both apps."
+                )
+                st.caption(
+                    f"All Apps preview -> Home Sync: v{current_home_sync_version} -> v{next_home_sync_all_version} | "
+                    f"Get Fit Together: v{current_get_fit_version} -> v{next_get_fit_all_version}"
+                )
+                if st.button("🚀 Cut All Apps Release (Includes Global)", use_container_width=True):
+                    success, versions, message = cut_release(
+                        current_home_sync_version,
+                        current_get_fit_version,
+                        release_target="all"
+                    )
+                    if success:
+                        st.success(message)
+                        st.session_state["APP_VERSION"] = versions.get("home_sync", current_home_sync_version)
+                        st.info(
+                            f"📝 Next step: Use Home Sync v{versions.get('home_sync', current_home_sync_version)} "
+                            f"and Get Fit Together v{versions.get('get_fit', current_get_fit_version)} in deployment scripts."
+                        )
+                        st.rerun()
+                    else:
+                        st.error(message)
+        else:
+            st.caption("No staged items currently. Next versions match current versions.")

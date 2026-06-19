@@ -1,6 +1,9 @@
 import streamlit as st
 from supabase import create_client, Client
 import pandas as pd
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from utils import calculate_next_version
 
 # 🟢 DYNAMIC ENVIRONMENT ROUTING
 env = st.secrets.get("app_config", {}).get("environment", "production")
@@ -123,12 +126,81 @@ def get_all_backlog_items():
         print(f"Error fetching backlog: {e}")
         return []
 
-def add_backlog_item(feature, notes, status="Backlog", app_name="home_sync", category="Core", priority="Medium"):
+def get_latest_released_version(app_name, fallback_version="0.0.0"):
+    """Returns the latest non-empty released version for an app from backlog."""
+    try:
+        require_privileged_user()
+        response = (
+            supabase
+            .table("backlog")
+            .select("version, release_date, created_at")
+            .eq("app_name", app_name)
+            .eq("status", "Done")
+            .order("release_date", desc=True)
+            .order("created_at", desc=True)
+            .limit(50)
+            .execute()
+        )
+
+        for row in (response.data or []):
+            version = str(row.get("version", "")).strip()
+            if version:
+                return version
+        return fallback_version
+    except Exception as e:
+        print(f"Error fetching latest released version for {app_name}: {e}")
+        return fallback_version
+
+
+def get_current_app_version(app_name, fallback_version="0.0.0"):
+    """Returns current app version from cloud release ledger, then backlog fallback."""
+    try:
+        require_privileged_user()
+        response = (
+            supabase
+            .table("app_release_ledger")
+            .select("version, released_at")
+            .eq("app_name", app_name)
+            .order("released_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+
+        if response.data and len(response.data) > 0:
+            version = str(response.data[0].get("version", "")).strip()
+            if version:
+                return version
+    except Exception as e:
+        print(f"Error fetching app version from ledger for {app_name}: {e}")
+
+    return get_latest_released_version(app_name, fallback_version=fallback_version)
+
+
+def log_release_version(app_name, version, release_target, release_date, backlog_items_released):
+    """Writes a release event to the cloud ledger."""
+    try:
+        require_privileged_user()
+        data = {
+            "app_name": app_name,
+            "version": version,
+            "release_target": release_target,
+            "release_date": release_date,
+            "backlog_items_released": backlog_items_released,
+            "created_by": st.session_state.get("username", "unknown")
+        }
+        supabase.table("app_release_ledger").insert(data).execute()
+        return True
+    except Exception as e:
+        print(f"Error logging release ledger event: {e}")
+        return False
+
+def add_backlog_item(feature, notes, status="Backlog", app_name="home_sync", category="Core", priority="Medium", work_notes=""):
     """Adds a new backlog item using the correct database columns."""
     try:
         data = {
             "feature": feature,  
-            "notes": notes,      
+            "notes": notes,
+            "work_notes": work_notes,      
             "status": status,
             "app_name": app_name,
             "category": category,
@@ -140,13 +212,14 @@ def add_backlog_item(feature, notes, status="Backlog", app_name="home_sync", cat
         print(f"Error inserting backlog item: {e}")
         return False
 
-def update_backlog_item(item_id, feature, notes, status, app_name, category, priority, public_message=""):
+def update_backlog_item(item_id, feature, notes, status, app_name, category, priority, public_message="", work_notes=""):
     """Updates an existing backlog ticket."""
     try:
         require_privileged_user()
         data = {
             "feature": feature,
             "notes": notes,
+            "work_notes": work_notes,
             "status": status,
             "app_name": app_name,
             "category": category,
@@ -168,6 +241,128 @@ def delete_backlog_item(item_id):
     except Exception as e:
         print(f"Error deleting backlog item: {e}")
         return False
+
+def cut_release(current_home_sync_version, current_get_fit_version, release_target="all"):
+    """
+    Cuts a release by:
+     1. Find staged backlog items.
+     2. Filter by release target: home_sync, get_fit, or all.
+     3. Calculate next version per app for the selected target.
+     4. Stamp release_date/version and move selected staged tickets to Done.
+     5. Return resulting versions for both apps.
+    
+    Returns: (success: bool, versions: dict, message: str)
+    """
+    try:
+        require_privileged_user()
+        
+        # Fetch all staged items first.
+        staged_response = supabase.table("backlog").select("id, category, app_name").eq("status", "Staged").execute()
+        staged_items_all = staged_response.data or []
+
+        if not staged_items_all:
+            return False, {
+                "home_sync": current_home_sync_version,
+                "get_fit": current_get_fit_version
+            }, "No staged items found. Add items to 'Staged' status to cut a release."
+
+        if release_target == "home_sync":
+            staged_items = [i for i in staged_items_all if i.get("app_name") == "home_sync"]
+        elif release_target == "get_fit":
+            staged_items = [i for i in staged_items_all if i.get("app_name") == "get_fit"]
+        else:
+            staged_items = [
+                i for i in staged_items_all
+                if i.get("app_name") in ["home_sync", "get_fit", "Global"]
+            ]
+
+        if not staged_items:
+            return False, {
+                "home_sync": current_home_sync_version,
+                "get_fit": current_get_fit_version
+            }, f"No staged items found for target '{release_target}'."
+        
+        home_sync_categories = [
+            item.get("category", "")
+            for item in staged_items
+            if item.get("app_name") == "home_sync" or (release_target == "all" and item.get("app_name") == "Global")
+        ]
+        get_fit_categories = [
+            item.get("category", "")
+            for item in staged_items
+            if item.get("app_name") == "get_fit" or (release_target == "all" and item.get("app_name") == "Global")
+        ]
+
+        next_home_sync_version = (
+            calculate_next_version(current_home_sync_version, home_sync_categories)
+            if home_sync_categories else current_home_sync_version
+        )
+        next_get_fit_version = (
+            calculate_next_version(current_get_fit_version, get_fit_categories)
+            if get_fit_categories else current_get_fit_version
+        )
+        
+        # Get today's date in Chicago timezone (for consistency with get-fit)
+        today_str = datetime.now(ZoneInfo("America/Chicago")).date().isoformat()
+        
+        # Update all staged items: set app-aware version, release_date, and move to Done
+        for item in staged_items:
+            app_name = item.get("app_name")
+            if app_name == "home_sync":
+                stamped_version = next_home_sync_version
+            elif app_name == "get_fit":
+                stamped_version = next_get_fit_version
+            elif app_name == "Global":
+                stamped_version = f"home_sync:{next_home_sync_version} | get_fit:{next_get_fit_version}"
+            else:
+                stamped_version = ""
+
+            update_data = {
+                "version": stamped_version,
+                "release_date": today_str,
+                "status": "Done"
+            }
+            supabase.table("backlog").update(update_data).eq("id", item["id"]).execute()
+
+        home_sync_released_count = len([
+            i for i in staged_items
+            if i.get("app_name") == "home_sync" or (release_target == "all" and i.get("app_name") == "Global")
+        ])
+        get_fit_released_count = len([
+            i for i in staged_items
+            if i.get("app_name") == "get_fit" or (release_target == "all" and i.get("app_name") == "Global")
+        ])
+
+        if home_sync_categories:
+            log_release_version(
+                app_name="home_sync",
+                version=next_home_sync_version,
+                release_target=release_target,
+                release_date=today_str,
+                backlog_items_released=home_sync_released_count
+            )
+
+        if get_fit_categories:
+            log_release_version(
+                app_name="get_fit",
+                version=next_get_fit_version,
+                release_target=release_target,
+                release_date=today_str,
+                backlog_items_released=get_fit_released_count
+            )
+        
+        return True, {
+            "home_sync": next_home_sync_version,
+            "get_fit": next_get_fit_version
+        }, f"✅ Release cut for '{release_target}'! {len(staged_items)} items moved to Done."
+        
+    except Exception as e:
+        print(f"Error cutting release: {e}")
+        return False, {
+            "home_sync": current_home_sync_version,
+            "get_fit": current_get_fit_version
+        }, f"Error cutting release: {str(e)}"
+
 
 def delete_task(task_id):
     """Deletes a to-do list task entirely."""

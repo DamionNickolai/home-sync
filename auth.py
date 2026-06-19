@@ -1,6 +1,25 @@
 import streamlit as st
 from supabase import create_client
-from streamlit_cookies_controller import CookieController
+try:
+    from streamlit_cookies_controller import CookieController
+except ImportError:
+    class CookieController:
+        """Fallback no-op cookie controller when optional dependency is unavailable."""
+
+        def __init__(self, *args, **kwargs):
+            self._cookies = {}
+
+        def get(self, key):
+            return self._cookies.get(key)
+
+        def set(self, key, value, **_kwargs):
+            self._cookies[key] = value
+
+        def remove(self, key, **_kwargs):
+            self._cookies.pop(key, None)
+
+        def refresh(self):
+            return None
 import uuid
 from datetime import datetime, timedelta, timezone
 

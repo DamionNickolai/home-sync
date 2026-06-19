@@ -27,12 +27,32 @@ fake_streamlit.secrets = {
 }
 fake_streamlit.cache_resource = passthrough_decorator
 fake_streamlit.cache_data = passthrough_decorator
+fake_streamlit.rerun = lambda: None
+
+
+class FakeCookieController:
+    def __init__(self, *args, **kwargs):
+        self._cookies = {}
+
+    def get(self, key):
+        return self._cookies.get(key)
+
+    def set(self, key, value, **_kwargs):
+        self._cookies[key] = value
+
+    def remove(self, key, **_kwargs):
+        self._cookies.pop(key, None)
+
+
+fake_cookie_module = types.ModuleType("streamlit_cookies_controller")
+fake_cookie_module.CookieController = FakeCookieController
 
 fake_supabase = types.ModuleType("supabase")
 fake_supabase.Client = object
 fake_supabase.create_client = lambda *_args, **_kwargs: MagicMock()
 
 sys.modules.setdefault("streamlit", fake_streamlit)
+sys.modules.setdefault("streamlit_cookies_controller", fake_cookie_module)
 sys.modules.setdefault("supabase", fake_supabase)
 sys.modules.setdefault("pandas", types.ModuleType("pandas"))
 
@@ -79,28 +99,20 @@ class AuthRegressionTests(unittest.TestCase):
         auth.st.session_state = {}
         database.st.session_state = {}
 
-    def test_check_password_restores_from_server_side_tokens(self):
-        auth_client = MagicMock()
-        verified_user = SimpleNamespace(
-            user=SimpleNamespace(id="auth-user-1", user_metadata={"username": "Casey"})
-        )
-        auth_client.auth.get_user.return_value = verified_user
-
+    def test_check_password_returns_true_for_hydrated_session(self):
+        controller = MagicMock()
         auth.st.session_state = {
-            "auth_access_token": "access-token",
-            "auth_refresh_token": "refresh-token",
+            "password_correct": True,
+            "session_id": "session-1",
+            "cookie_controller": controller,
         }
 
-        with patch.object(auth, "get_auth_client", return_value=auth_client), \
+        with patch.object(auth, "get_auth_client", return_value=MagicMock()), \
              patch.object(auth, "get_user_data_client", return_value=object()), \
-             patch.object(auth, "get_app_user_record", return_value={"username": "Casey"}) as get_record, \
-             patch.object(auth, "hydrate_user_session", return_value=True) as hydrate:
+             patch.object(auth, "ensure_session_cookie") as ensure_cookie:
             self.assertTrue(auth.check_password())
 
-        auth_client.auth.set_session.assert_called_once_with("access-token", "refresh-token")
-        get_record.assert_called_once()
-        self.assertEqual(get_record.call_args.args[1], "auth-user-1")
-        hydrate.assert_called_once()
+        ensure_cookie.assert_called_once_with(controller)
 
     def test_get_app_user_record_requires_auth_user_id_mapping(self):
         auth_id_query = QueryStub([])
