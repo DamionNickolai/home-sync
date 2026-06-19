@@ -78,6 +78,51 @@ if is_local_env:
 
 st.title("🏠 Home Sync Dashboard")
 
+# Developer-only bug radar (shows in both dev and prod).
+if user_role == "developer":
+    try:
+        radar_response = (
+            get_supabase_client()
+            .table("backlog")
+            .select("app_name")
+            .eq("category", "Bug")
+            .eq("status", "Backlog")
+            .execute()
+        )
+        bug_rows = radar_response.data or []
+        bug_counts = {"home_sync": 0, "get_fit": 0, "Global": 0, "unassigned": 0}
+
+        for row in bug_rows:
+            app_name = row.get("app_name") or "unassigned"
+            if app_name not in bug_counts:
+                bug_counts[app_name] = 0
+            bug_counts[app_name] += 1
+
+        total_bugs = sum(bug_counts.values())
+        if total_bugs > 0:
+            app_labels = {
+                "home_sync": "Home Sync",
+                "get_fit": "Get Fit Together",
+                "Global": "Global",
+                "unassigned": "Unassigned",
+            }
+            breakdown = " | ".join(
+                f"{app_labels.get(app, app)}: {count}"
+                for app, count in bug_counts.items()
+                if count > 0
+            )
+            st.markdown(
+                f"""
+                <div style="background-color: #fff7ed; border: 1px solid #fb923c; color: #9a3412; padding: 12px 14px; border-radius: 10px; margin: 8px 0 16px 0;">
+                    <strong>⚠️ Bug Radar:</strong> {total_bugs} open bugs across the ecosystem.<br/>
+                    <span style="font-size: 0.92em;">{breakdown}</span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+    except Exception:
+        pass
+
 # ==========================================
 #  SIDEBAR COMMAND CENTER
 # ==========================================
