@@ -1,4 +1,4 @@
-# Implementation Checklist - Home-Sync Backlog Enhancements
+# Implementation Checklist - Home-Sync Backlog + To-Do UX
 
 ## Pre-Deployment Steps
 
@@ -20,12 +20,30 @@
       -- run full migration file migrations/004_create_app_release_ledger.sql
       ```
 
+- [ ] **Apply To-Do Metadata Migration**
+   - Run migration `005_add_todo_metadata_and_recurrence.sql` against your Supabase database
+   - This adds task metadata + recurrence fields used by the current To-Do UX
+   - Command (via Supabase dashboard):
+      ```sql
+      -- run full migration file migrations/005_add_todo_metadata_and_recurrence.sql
+      ```
+
 - [x] **Test in Local Environment**
   - Set `environment: "local"` in `.streamlit/secrets.toml`
   - Run: `streamlit run home_sync.py`
   - Navigate to "📝 Master Ecosystem Backlog" tab (developer role required)
 
 ## Feature Testing Checklist
+
+### To-Do UX (Current)
+- [ ] Full-width task cards render correctly (desktop + mobile)
+- [ ] Card tap toggles inline edit open/close
+- [ ] Notes display only when present
+- [ ] Notifications are informational-only and do not filter task list
+- [ ] Recurrence options include Daily and Every 6 Months
+- [ ] Complete action from edit form works and recurring rollover behaves correctly
+- [ ] No checkbox/bulk-complete UI remains in active task list
+- [ ] Reference detailed checklist: `docs/TODO_UX_CHECKLIST.md`
 
 ### Add New Ticket Form
 - [x] All field labels appear correctly (Feature, Description, Work Notes)
@@ -144,6 +162,8 @@ If features don't appear:
 3. `home_sync.py` - Updated imports and backlog section
 4. `migrations/003_add_backlog_release_management.sql` - Review schema changes
 5. `migrations/004_create_app_release_ledger.sql` - Review release ledger schema
+6. `migrations/005_add_todo_metadata_and_recurrence.sql` - Review task metadata/recurrence schema
+7. `docs/TODO_UX_CHECKLIST.md` - Run To-Do UX regression pass
 
 ## Quick Reference: Status Workflow
 

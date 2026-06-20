@@ -56,16 +56,50 @@ def get_completed_tasks():
         print(f"Error fetching completed tasks: {e}")
         return []
 
-def add_new_task(task_name, category, priority, assigned_to, target_date):
+def _calculate_next_target_date(target_date_str, recurrence_pattern):
+    """Returns the next due date string for recurring tasks."""
+    if not target_date_str or not recurrence_pattern:
+        return None
+
+    try:
+        base_date = pd.to_datetime(target_date_str).date()
+    except Exception:
+        return None
+
+    pattern = str(recurrence_pattern).strip().lower()
+    if pattern == "daily":
+        next_date = pd.Timestamp(base_date) + pd.DateOffset(days=1)
+    elif pattern == "weekly":
+        next_date = pd.Timestamp(base_date) + pd.DateOffset(weeks=1)
+    elif pattern == "biweekly":
+        next_date = pd.Timestamp(base_date) + pd.DateOffset(weeks=2)
+    elif pattern == "monthly":
+        next_date = pd.Timestamp(base_date) + pd.DateOffset(months=1)
+    elif pattern == "quarterly":
+        next_date = pd.Timestamp(base_date) + pd.DateOffset(months=3)
+    elif pattern == "every 6 months":
+        next_date = pd.Timestamp(base_date) + pd.DateOffset(months=6)
+    elif pattern == "yearly":
+        next_date = pd.Timestamp(base_date) + pd.DateOffset(years=1)
+    else:
+        return None
+
+    return next_date.date().isoformat()
+
+
+def add_new_task(task_name, category, priority, assigned_to, target_date, notes="", is_recurring=False, recurrence_pattern=None):
     try:
         house_id = get_current_household_id()
         
         data = {
             "task_name": task_name,
+            "notes": notes or None,
             "category": category,
             "priority": priority,
             "assigned_to": assigned_to,
             "target_date": str(target_date) if target_date else None, 
+            "is_recurring": bool(is_recurring),
+            "recurrence_pattern": recurrence_pattern if is_recurring else None,
             "is_completed": False,
             "household_id": house_id  # 🟢 NEW: Stamp the task with the family's ID!
         }
@@ -79,29 +113,75 @@ def batch_update_tasks(task_ids, new_status):
     """Updates a list of task IDs to a specific status (True or False)."""
     try:
         house_id = get_current_household_id()
+        # If completing tasks, fetch row details first so recurring tasks can roll forward.
+        task_rows = []
+        if new_status:
+            response = (
+                supabase
+                .table(TASK_TABLE)
+                .select("id, task_name, notes, category, priority, assigned_to, target_date, is_recurring, recurrence_pattern")
+                .in_("id", task_ids)
+                .eq("household_id", house_id)
+                .execute()
+            )
+            task_rows = response.data or []
+
         # Loop through IDs and update each in the database
         for tid in task_ids:
             supabase.table(TASK_TABLE).update({"is_completed": new_status}).eq("id", tid).eq("household_id", house_id).execute()
+
+        # Spawn next occurrence for recurring tasks that were just completed.
+        if new_status and task_rows:
+            for task in task_rows:
+                if not task.get("is_recurring"):
+                    continue
+
+                next_target = _calculate_next_target_date(task.get("target_date"), task.get("recurrence_pattern"))
+                if not next_target:
+                    continue
+
+                next_task = {
+                    "task_name": task.get("task_name"),
+                    "notes": task.get("notes"),
+                    "category": task.get("category"),
+                    "priority": task.get("priority"),
+                    "assigned_to": task.get("assigned_to"),
+                    "target_date": next_target,
+                    "is_recurring": True,
+                    "recurrence_pattern": task.get("recurrence_pattern"),
+                    "is_completed": False,
+                    "household_id": house_id,
+                }
+                supabase.table(TASK_TABLE).insert(next_task).execute()
         return True
     except Exception as e:
         print(f"Error in batch update: {e}")
         return False
 
-def update_task(task_id, task_name=None, category=None, priority=None, assigned_to=None, target_date=None):
+def update_task(task_id, task_name=None, notes=None, category=None, priority=None, assigned_to=None, target_date=None, clear_target_date=False, is_recurring=None, recurrence_pattern=None):
     """Updates specific fields of a task."""
     try:
         house_id = get_current_household_id()
         update_data = {}
         if task_name is not None:
             update_data["task_name"] = task_name
+        if notes is not None:
+            update_data["notes"] = notes or None
         if category is not None:
             update_data["category"] = category
         if priority is not None:
             update_data["priority"] = priority
         if assigned_to is not None:
             update_data["assigned_to"] = assigned_to
-        if target_date is not None:
+        if clear_target_date:
+            update_data["target_date"] = None
+        elif target_date is not None:
             update_data["target_date"] = str(target_date) if target_date else None
+        if is_recurring is not None:
+            update_data["is_recurring"] = bool(is_recurring)
+            update_data["recurrence_pattern"] = recurrence_pattern if is_recurring else None
+        elif recurrence_pattern is not None:
+            update_data["recurrence_pattern"] = recurrence_pattern
         
         if update_data:
             supabase.table(TASK_TABLE).update(update_data).eq("id", task_id).eq("household_id", house_id).execute()

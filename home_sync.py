@@ -281,13 +281,77 @@ with tab1:
             user_role = st.session_state.get("user_role", "member") 
             # 🟢 NEW: Grab the household ID for this session
             current_household = st.session_state.get("household_id", "unassigned")
+
+            # Slightly larger tap targets for mobile task controls.
+            st.markdown(
+                """
+                <style>
+                div[data-testid="stCheckbox"] label {
+                    min-height: 2rem;
+                    align-items: center;
+                }
+                div[data-testid="stButton"] button {
+                    min-height: 2rem;
+                }
+                </style>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            recurrence_options = ["Daily", "Weekly", "Biweekly", "Monthly", "Quarterly", "Every 6 Months", "Yearly"]
+
+            def parse_assignees(assigned_to_raw):
+                try:
+                    if isinstance(assigned_to_raw, str) and assigned_to_raw.startswith('['):
+                        return json.loads(assigned_to_raw)
+                    return [assigned_to_raw]
+                except Exception:
+                    return [assigned_to_raw]
+
+            def get_due_status(target_date_str, priority):
+                days_remaining = None
+                if target_date_str:
+                    try:
+                        t_date = pd.to_datetime(target_date_str).tz_localize(None).date()
+                        today = pd.Timestamp.now(tz='UTC').tz_localize(None).date()
+                        days_remaining = (t_date - today).days
+                    except Exception:
+                        days_remaining = None
+
+                border_color = "#475569"
+                status_msg = "⚪ No Date"
+
+                if days_remaining is not None:
+                    if days_remaining < 0:
+                        border_color = "#EF4444"
+                        status_msg = f"🔴 Overdue by {abs(days_remaining)}d"
+                    elif days_remaining == 0:
+                        border_color = "#F97316"
+                        status_msg = "🟠 Due TODAY"
+                    elif days_remaining == 1:
+                        border_color = "#EAB308"
+                        status_msg = "🟡 Due Tomorrow"
+                    else:
+                        border_color = "#22C55E"
+                        status_msg = f"🟢 Due in {days_remaining}d"
+                else:
+                    if priority == "High":
+                        border_color = "#3B82F6"
+                        status_msg = "🔵 High Priority"
+                    elif priority == "Low":
+                        border_color = "#64748B"
+                        status_msg = "⚪ Low Priority"
+
+                return border_color, status_msg
             
             # --- 1. Form to Add a New Task (EVERYONE CAN ADD) ---
             with st.expander("➕ Add New Task", expanded=False):
                 with st.form("new_task_form", clear_on_submit=True):
                     col1, col2 = st.columns([3, 1])
-                    new_task = col1.text_input("Task Description", placeholder="e.g., Clean my room")
+                    new_task = col1.text_input("Task", placeholder="e.g., Change HVAC filter")
                     priority = col2.selectbox("Priority", ["Normal", "High", "Low"])
+
+                    new_notes = st.text_area("Notes", placeholder="Optional: tips, tools, or helper notes")
                     
                     col3, col4, col5 = st.columns(3)
                     category = col3.selectbox("Category", ["House", "Yard", "Admin", "Errand"])
@@ -304,13 +368,34 @@ with tab1:
                         assigned_to = [current_user]
                     
                     target_date = col5.date_input("Target Date", value=None)
+
+                    rec1, rec2 = st.columns([1, 2])
+                    is_recurring = rec1.checkbox("Recurring task", value=False)
+                    recurrence_pattern = rec2.selectbox(
+                        "Recurring",
+                        recurrence_options,
+                        index=3,
+                    )
                     
                     submit = st.form_submit_button("Save Task", type="primary", use_container_width=True)
                     if submit and new_task and assigned_to:
-                        success = add_new_task(new_task, category, priority, json.dumps(assigned_to), target_date)
+                        success = add_new_task(
+                            new_task,
+                            category,
+                            priority,
+                            json.dumps(assigned_to),
+                            target_date,
+                            new_notes,
+                            is_recurring,
+                            recurrence_pattern,
+                        )
                         if success:
                             st.success("Task added!")
                             st.rerun()
+                        else:
+                            st.error("Could not save task.")
+                    elif submit and not new_task:
+                        st.error("Task is required.")
                     elif submit and not assigned_to:
                         st.error("Please assign the task to at least one person.")
 
@@ -320,62 +405,6 @@ with tab1:
             if "editing_task_id" not in st.session_state:
                 st.session_state["editing_task_id"] = None
             
-            if st.session_state["editing_task_id"] is not None and user_role in ["developer", "admin"]:
-                # Find the task being edited
-                all_tasks = get_active_tasks()
-                editing_task = next((t for t in all_tasks if t["id"] == st.session_state["editing_task_id"]), None)
-                
-                if editing_task:
-                    with st.container(border=True):
-                        st.markdown("### ✏️ Edit Task")
-                        
-                        with st.form("edit_task_form"):
-                            # Parse current assignees securely
-                            assigned_to_raw = editing_task.get("assigned_to", "Unassigned")
-                            try:
-                                current_assignees = json.loads(assigned_to_raw) if isinstance(assigned_to_raw, str) and assigned_to_raw.startswith('[') else [assigned_to_raw]
-                            except:
-                                current_assignees = [assigned_to_raw]
-                            
-                            col1, col2 = st.columns([3, 1])
-                            edit_task_name = col1.text_input("Task Description", value=editing_task.get("task_name", ""))
-                            
-                            # Safely set priority index
-                            safe_priority = editing_task.get("priority", "Normal")
-                            p_index = ["Normal", "High", "Low"].index(safe_priority) if safe_priority in ["Normal", "High", "Low"] else 0
-                            edit_priority = col2.selectbox("Priority", ["Normal", "High", "Low"], index=p_index)
-                            
-                            col3, col4, col5 = st.columns(3)
-                            
-                            # Safely set category index
-                            safe_cat = editing_task.get("category", "House")
-                            c_index = ["House", "Yard", "Admin", "Errand"].index(safe_cat) if safe_cat in ["House", "Yard", "Admin", "Errand"] else 0
-                            edit_category = col3.selectbox("Category", ["House", "Yard", "Admin", "Errand"], index=c_index)
-                            
-                            # 🟢 NEW: Pull household-specific users for the dropdown!
-                            available_users = get_available_users(current_household)
-                            safe_defaults = [u for u in current_assignees if u in available_users]
-                            edit_assigned_to = col4.multiselect("Assign To", options=available_users, default=safe_defaults)
-                            
-                            edit_target_date = col5.date_input("Target Date", value=pd.to_datetime(editing_task.get("target_date")) if editing_task.get("target_date") else None)
-                            
-                            col_save, col_del, col_cancel = st.columns([2, 1, 1])
-                        
-                        if col_save.form_submit_button("💾 Save", type="primary", use_container_width=True):
-                            # Your existing update_task() code here...
-                            st.session_state["editing_task_id"] = None
-                            st.rerun()
-                            
-                        # 🟢 The new Delete Button
-                        if col_del.form_submit_button("🗑️ Delete", use_container_width=True):
-                            delete_task(st.session_state["editing_task_id"])
-                            st.session_state["editing_task_id"] = None
-                            st.rerun()
-                            
-                        if col_cancel.form_submit_button("❌ Cancel", use_container_width=True):
-                            st.session_state["editing_task_id"] = None
-                            st.rerun()
-            
             # --- 2. Display Active Tasks ---
             all_active_tasks = get_active_tasks()
             
@@ -383,27 +412,64 @@ with tab1:
             active_tasks = []
             for task in all_active_tasks:
                 assigned_to_raw = task.get("assigned_to", "Unassigned")
-                try:
-                    assignees = json.loads(assigned_to_raw) if isinstance(assigned_to_raw, str) and assigned_to_raw.startswith('[') else [assigned_to_raw]
-                except:
-                    assignees = [assigned_to_raw]
+                assignees = parse_assignees(assigned_to_raw)
                 
                 if user_role in ["developer", "admin"] or current_user in assignees:
                     active_tasks.append(task)
             
-            selected_task_ids = [] 
-            
             if not active_tasks:
                 st.info("🎉 You are all caught up! No active tasks.")
             else:
+                def get_due_bucket(task):
+                    target_str = task.get("target_date")
+                    if not target_str:
+                        return None
+                    try:
+                        due_date = pd.to_datetime(target_str).tz_localize(None).date()
+                    except Exception:
+                        return None
+                    today_local = pd.Timestamp.now(tz='UTC').tz_localize(None).date()
+                    delta_days = (due_date - today_local).days
+                    if delta_days < 0:
+                        return "overdue"
+                    if delta_days == 0:
+                        return "today"
+                    if 1 <= delta_days <= 7:
+                        return "week"
+                    return None
+
+                if user_role in ["developer", "admin"]:
+                    overdue_count = sum(1 for t in active_tasks if get_due_bucket(t) == "overdue")
+                    due_today_count = sum(1 for t in active_tasks if get_due_bucket(t) == "today")
+                    due_week_count = sum(1 for t in active_tasks if get_due_bucket(t) == "week")
+
+                    with st.container(border=True):
+                        st.markdown("#### 🔔 Task Notifications")
+                        st.markdown(
+                            f"""
+                            <div style=\"display:flex; gap:14px; flex-wrap:nowrap; overflow-x:auto;\">
+                                <div style=\"min-width:140px;\">
+                                    <div style=\"font-size:0.82em; color:#64748B;\">Overdue</div>
+                                    <div style=\"font-weight:700; color:#B91C1C; font-size:1.35em;\">{overdue_count}</div>
+                                </div>
+                                <div style=\"min-width:140px;\">
+                                    <div style=\"font-size:0.82em; color:#64748B;\">Due Today</div>
+                                    <div style=\"font-weight:700; color:#C2410C; font-size:1.35em;\">{due_today_count}</div>
+                                </div>
+                                <div style=\"min-width:160px;\">
+                                    <div style=\"font-size:0.82em; color:#64748B;\">Due in One Week</div>
+                                    <div style=\"font-weight:700; font-size:1.35em;\">{due_week_count}</div>
+                                </div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+
                 # Group the tasks dynamically by who they are assigned to
                 grouped_tasks = {}
                 for task in active_tasks:
                     assigned_to_raw = task.get("assigned_to", "Unassigned")
-                    try:
-                        assignees = json.loads(assigned_to_raw) if isinstance(assigned_to_raw, str) and assigned_to_raw.startswith('[') else [assigned_to_raw]
-                    except:
-                        assignees = [assigned_to_raw]
+                    assignees = parse_assignees(assigned_to_raw)
                     
                     # Sort the names alphabetically
                     assignee_str = ", ".join(sorted(assignees))
@@ -412,93 +478,146 @@ with tab1:
                         grouped_tasks[assignee_str] = []
                     grouped_tasks[assignee_str].append(task)
 
-                # Sort the groups
-                sorted_groups = sorted(grouped_tasks.keys(), key=lambda x: (-len(x.split(", ")), x))
+                # Sort groups with the active user's personal list first, then user-attached groups.
+                def group_sort_key(group_name):
+                    assignees = [x.strip() for x in group_name.split(",") if x.strip()]
+                    if assignees == [current_user]:
+                        return (0, group_name)
+                    if current_user in assignees:
+                        return (1, group_name)
+                    return (2, group_name)
+
+                sorted_groups = sorted(grouped_tasks.keys(), key=group_sort_key)
 
                 # Render each group
                 for group_name in sorted_groups:
                     header_icon = "👥" if "," in group_name else "👤"
-                    st.markdown(f"##### {header_icon} {group_name}")
-                    
                     tasks_in_group = grouped_tasks[group_name]
                     tasks_in_group.sort(key=lambda t: pd.to_datetime(t.get("target_date")).date() if t.get("target_date") else pd.Timestamp.max.date())
-                    
-                    for task in tasks_in_group:
-                        col_check, col_text, col_meta, col_actions = st.columns([0.5, 4, 1.5, 0.8])
-                        
-                        if col_check.checkbox(" ", key=f"task_{task['id']}"):
-                            st.session_state[f"to_complete_{task['id']}"] = True
-                        
-                        # ==========================================
-                        # 🧠 THE SMART URGENCY ENGINE
-                        # ==========================================
-                        task_name = task.get("task_name", "Unnamed Task")
-                        priority = task.get("priority", "Normal")
-                        target_date_str = task.get("target_date")
+                    group_assignees = [x.strip() for x in group_name.split(",")]
+                    group_expanded = current_user in group_assignees
 
-                        days_remaining = None
-                        if target_date_str:
-                            try:
-                                t_date = pd.to_datetime(target_date_str).tz_localize(None).date()
-                                today = pd.Timestamp.now(tz='UTC').tz_localize(None).date()
-                                days_remaining = (t_date - today).days
-                            except:
-                                pass
+                    with st.expander(f"{header_icon} {group_name} ({len(tasks_in_group)})", expanded=group_expanded):
+                        for task in tasks_in_group:
+                            task_name = task.get("task_name", "Unnamed Task")
+                            priority = task.get("priority", "Normal")
+                            target_date_str = task.get("target_date")
+                            notes = (task.get("notes") or "").strip()
+                            is_recurring = bool(task.get("is_recurring", False))
+                            recurrence_pattern = task.get("recurrence_pattern") or ""
 
-                        # Default Colors
-                        border_color = "#475569" # Slate
-                        status_msg = ""
+                            border_color, status_msg = get_due_status(target_date_str, priority)
+                            due_label = target_date_str if target_date_str else "No date"
+                            category = task.get("category", "Uncategorized")
+                            recurring_label = f" • 🔁 {recurrence_pattern}" if is_recurring and recurrence_pattern else ""
 
-                        if days_remaining is not None:
-                            if days_remaining < 0:
-                                border_color = "#EF4444" # Red
-                                status_msg = f"🔴 Overdue by {abs(days_remaining)}d"
-                            elif days_remaining == 0:
-                                border_color = "#F97316" # Orange
-                                status_msg = "🟠 Due TODAY"
-                            elif days_remaining == 1:
-                                border_color = "#EAB308" # Yellow
-                                status_msg = "🟡 Due Tomorrow"
-                            else:
-                                border_color = "#22C55E" # Green
-                                status_msg = f"🟢 Due in {days_remaining}d"
-                        else:
-                            # Priority Fallback
-                            if priority == "High":
-                                border_color = "#3B82F6" # Blue
-                                status_msg = "🔵 High Priority"
-                            elif priority == "Low":
-                                border_color = "#64748B" # Gray
-                                status_msg = "⚪ Low Priority"
-                            else:
-                                status_msg = "⚪ No Date"
+                            detail_parts = [status_msg, category, f"📅 {due_label}{recurring_label}"]
 
-                        # 🎨 THE UI INJECTION (Replaces old markdown)
-                        col_text.markdown(f"""
-                            <div style="border-left: 4px solid {border_color}; padding-left: 10px; margin-top: 4px;">
-                                <div style="font-weight: 600; font-size: 1.05em; line-height: 1.2;">{task_name}</div>
-                                <div style="font-size: 0.85em; color: gray; margin-top: 2px;">{status_msg}</div>
-                            </div>
-                        """, unsafe_allow_html=True)
-                        
-                        category = task.get("category", "Uncategorized")
-                        due = task.get("target_date", "No date")
-                        col_meta.caption(f"_{category}_ • 📅 {due}") 
-                        
-                        if user_role in ["developer", "admin"]:
-                            if col_actions.button("✏️", key=f"edit_{task['id']}", help="Edit task"):
-                                st.session_state["editing_task_id"] = task['id']
-                                st.rerun()
+                            with st.container(border=True):
+                                card_label = f"{task_name}"
+                                if user_role in ["developer", "admin"]:
+                                    if st.button(card_label, key=f"open_task_{task['id']}", use_container_width=True):
+                                        current_editing = st.session_state.get("editing_task_id")
+                                        st.session_state["editing_task_id"] = None if current_editing == task['id'] else task['id']
+                                        st.rerun()
+                                else:
+                                    st.write(f"**{card_label}**")
 
-                # Collect selected task IDs for the batch button
-                selected_task_ids = [task['id'] for task in active_tasks if st.session_state.get(f"to_complete_{task['id']}")]
+                                st.caption(" • ".join(detail_parts))
+                                if notes:
+                                    st.caption(f"Notes: {notes}")
 
-            # Batch Action Button
-            if selected_task_ids:
-                if st.button(f"✅ Mark {len(selected_task_ids)} Task(s) Complete"):
-                    if batch_update_tasks(selected_task_ids, True):
-                        st.success("Tasks updated!")
-                        st.rerun()
+                            if st.session_state.get("editing_task_id") == task['id'] and user_role in ["developer", "admin"]:
+                                assigned_to_raw = task.get("assigned_to", "Unassigned")
+                                current_assignees = parse_assignees(assigned_to_raw)
+
+                                with st.container(border=True):
+                                    st.caption("✏️ Edit Task")
+                                    with st.form(f"edit_task_form_{task['id']}"):
+                                        edit_col1, edit_col2 = st.columns([3, 1])
+                                        edit_task_name = edit_col1.text_input("Task", value=task.get("task_name", ""), key=f"edit_task_name_{task['id']}")
+
+                                        safe_priority = task.get("priority", "Normal")
+                                        p_index = ["Normal", "High", "Low"].index(safe_priority) if safe_priority in ["Normal", "High", "Low"] else 0
+                                        edit_priority = edit_col2.selectbox("Priority", ["Normal", "High", "Low"], index=p_index, key=f"edit_priority_{task['id']}")
+
+                                        edit_notes = st.text_area("Notes", value=task.get("notes") or "", key=f"edit_notes_{task['id']}")
+
+                                        edit_col3, edit_col4, edit_col5 = st.columns(3)
+                                        safe_cat = task.get("category", "House")
+                                        c_index = ["House", "Yard", "Admin", "Errand"].index(safe_cat) if safe_cat in ["House", "Yard", "Admin", "Errand"] else 0
+                                        edit_category = edit_col3.selectbox("Category", ["House", "Yard", "Admin", "Errand"], index=c_index, key=f"edit_cat_{task['id']}")
+
+                                        available_users = get_available_users(current_household)
+                                        safe_defaults = [u for u in current_assignees if u in available_users]
+                                        edit_assigned_to = edit_col4.multiselect("Assign To", options=available_users, default=safe_defaults, key=f"edit_assign_{task['id']}")
+
+                                        current_target_date = pd.to_datetime(task.get("target_date")).date() if task.get("target_date") else None
+                                        has_target_date = edit_col5.checkbox("Has Target Date", value=current_target_date is not None, key=f"has_target_{task['id']}")
+                                        edit_target_date = edit_col5.date_input(
+                                            "Target Date",
+                                            value=current_target_date or pd.Timestamp.now(tz='UTC').tz_localize(None).date(),
+                                            key=f"edit_target_{task['id']}",
+                                        )
+
+                                        edit_rec_col1, edit_rec_col2 = st.columns([1, 2])
+                                        safe_recurring = bool(task.get("is_recurring", False))
+                                        edit_is_recurring = edit_rec_col1.checkbox("Recurring task", value=safe_recurring, key=f"edit_recur_enabled_{task['id']}")
+                                        existing_pattern = task.get("recurrence_pattern", "Monthly")
+                                        rec_index = recurrence_options.index(existing_pattern) if existing_pattern in recurrence_options else 3
+                                        edit_recurrence_pattern = edit_rec_col2.selectbox(
+                                            "Recurring",
+                                            recurrence_options,
+                                            index=rec_index,
+                                            key=f"edit_recur_pattern_{task['id']}",
+                                        )
+
+                                        save_col, complete_col, del_col, cancel_col = st.columns([2, 1, 1, 1])
+                                        save_clicked = save_col.form_submit_button("💾 Save", type="primary", use_container_width=True)
+                                        complete_clicked = complete_col.form_submit_button("✅ Complete", use_container_width=True)
+                                        delete_clicked = del_col.form_submit_button("🗑️ Delete", use_container_width=True)
+                                        cancel_clicked = cancel_col.form_submit_button("❌ Cancel", use_container_width=True)
+
+                                    if save_clicked:
+                                        if not edit_task_name.strip():
+                                            st.error("Task is required.")
+                                        elif not edit_assigned_to:
+                                            st.error("Please assign the task to at least one person.")
+                                        else:
+                                            success = update_task(
+                                                task_id=task["id"],
+                                                task_name=edit_task_name,
+                                                notes=edit_notes,
+                                                category=edit_category,
+                                                priority=edit_priority,
+                                                assigned_to=json.dumps(edit_assigned_to),
+                                                target_date=edit_target_date if has_target_date else None,
+                                                clear_target_date=not has_target_date,
+                                                is_recurring=edit_is_recurring,
+                                                recurrence_pattern=edit_recurrence_pattern if edit_is_recurring else None,
+                                            )
+                                            if success:
+                                                st.session_state["editing_task_id"] = None
+                                                st.success("Task updated.")
+                                                st.rerun()
+                                            else:
+                                                st.error("Could not update task.")
+
+                                    if delete_clicked:
+                                        delete_task(task["id"])
+                                        st.session_state["editing_task_id"] = None
+                                        st.rerun()
+
+                                    if complete_clicked:
+                                        if batch_update_tasks([task["id"]], True):
+                                            st.session_state["editing_task_id"] = None
+                                            st.rerun()
+                                        else:
+                                            st.error("Could not complete task.")
+
+                                    if cancel_clicked:
+                                        st.session_state["editing_task_id"] = None
+                                        st.rerun()
 
             st.divider()
             

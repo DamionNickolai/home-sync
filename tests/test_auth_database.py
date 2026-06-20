@@ -64,8 +64,10 @@ class QueryStub:
     def __init__(self, data=None):
         self.data = data or []
         self.eq_calls = []
+        self.in_calls = []
         self.ilike_calls = []
         self.update_payload = None
+        self.insert_payload = None
         self.deleted = False
 
     def select(self, *_args, **_kwargs):
@@ -73,6 +75,10 @@ class QueryStub:
 
     def eq(self, column, value):
         self.eq_calls.append((column, value))
+        return self
+
+    def in_(self, column, values):
+        self.in_calls.append((column, values))
         return self
 
     def ilike(self, column, value):
@@ -84,6 +90,10 @@ class QueryStub:
 
     def update(self, payload):
         self.update_payload = payload
+        return self
+
+    def insert(self, payload):
+        self.insert_payload = payload
         return self
 
     def delete(self):
@@ -183,6 +193,51 @@ class DatabaseRegressionTests(unittest.TestCase):
 
         with self.assertRaises(PermissionError):
             database.require_privileged_user()
+
+    def test_update_task_can_clear_target_date(self):
+        query = QueryStub([])
+        supabase = MagicMock()
+        supabase.table.return_value = query
+
+        with patch.object(database, "supabase", supabase):
+            result = database.update_task(task_id=5, clear_target_date=True)
+
+        self.assertTrue(result)
+        self.assertEqual(query.update_payload.get("target_date"), None)
+        self.assertIn(("id", 5), query.eq_calls)
+        self.assertIn(("household_id", "house-7"), query.eq_calls)
+
+    def test_batch_update_tasks_rolls_forward_recurring_task(self):
+        fetch_query = QueryStub([
+            {
+                "id": 42,
+                "task_name": "Change filter",
+                "description": "Every month",
+                "notes": "Use MERV 13",
+                "category": "House",
+                "priority": "Normal",
+                "assigned_to": '["Casey"]',
+                "target_date": "2026-06-01",
+                "is_recurring": True,
+                "recurrence_pattern": "Monthly",
+            }
+        ])
+        update_query = QueryStub([])
+        insert_query = QueryStub([])
+
+        supabase = MagicMock()
+        supabase.table.side_effect = [fetch_query, update_query, insert_query]
+
+        with patch.object(database, "supabase", supabase):
+            with patch.object(database, "_calculate_next_target_date", return_value="2026-07-01"):
+                result = database.batch_update_tasks([42], True)
+
+        self.assertTrue(result)
+        self.assertEqual(fetch_query.in_calls[0], ("id", [42]))
+        self.assertEqual(insert_query.insert_payload.get("task_name"), "Change filter")
+        self.assertEqual(insert_query.insert_payload.get("target_date"), "2026-07-01")
+        self.assertEqual(insert_query.insert_payload.get("recurrence_pattern"), "Monthly")
+        self.assertEqual(insert_query.insert_payload.get("household_id"), "house-7")
 
 
 if __name__ == "__main__":
