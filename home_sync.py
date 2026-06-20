@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import time
 import json
+import re
 from auth import check_password
 from home_assist_api import fetch_ha_state
 from database import get_active_tasks, get_completed_tasks, add_new_task, batch_update_tasks, update_task, get_all_backlog_items, get_current_app_version, add_backlog_item, update_backlog_item, delete_backlog_item, delete_task, cut_release
@@ -77,51 +78,6 @@ if is_local_env:
     )
 
 st.title("🏠 Home Sync Dashboard")
-
-# Developer-only bug radar (shows in both dev and prod).
-if user_role == "developer":
-    try:
-        radar_response = (
-            get_supabase_client()
-            .table("backlog")
-            .select("app_name")
-            .eq("category", "Bug")
-            .eq("status", "Backlog")
-            .execute()
-        )
-        bug_rows = radar_response.data or []
-        bug_counts = {"home_sync": 0, "get_fit": 0, "Global": 0, "unassigned": 0}
-
-        for row in bug_rows:
-            app_name = row.get("app_name") or "unassigned"
-            if app_name not in bug_counts:
-                bug_counts[app_name] = 0
-            bug_counts[app_name] += 1
-
-        total_bugs = sum(bug_counts.values())
-        if total_bugs > 0:
-            app_labels = {
-                "home_sync": "Home Sync",
-                "get_fit": "Get Fit Together",
-                "Global": "Global",
-                "unassigned": "Unassigned",
-            }
-            breakdown = " | ".join(
-                f"{app_labels.get(app, app)}: {count}"
-                for app, count in bug_counts.items()
-                if count > 0
-            )
-            st.markdown(
-                f"""
-                <div style="background-color: #fff7ed; border: 1px solid #fb923c; color: #9a3412; padding: 12px 14px; border-radius: 10px; margin: 8px 0 16px 0;">
-                    <strong>⚠️ Bug Radar:</strong> {total_bugs} open bugs across the ecosystem.<br/>
-                    <span style="font-size: 0.92em;">{breakdown}</span>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-    except Exception:
-        pass
 
 # ==========================================
 #  SIDEBAR COMMAND CENTER
@@ -199,21 +155,23 @@ st.sidebar.caption(f"<div style='text-align: center; color: gray; padding-top: 1
 # 📋 MAIN DASHBOARD TABS
 # ==========================================
 if user_role == "developer":
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+        "🏠 Household Hub",
+        "☀️ Solar Production",
+        "🛡️ Security",
+        "🚗 Garage",        
+        "⚙️ System Logs",
+        "🆕 What's New",
+        "🛠️ Developer Dashboard"
+    ])
+else:
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "🏠 Household Hub",
         "☀️ Solar Production",
         "🛡️ Security",
         "🚗 Garage",        
         "⚙️ System Logs",
-        "📝 Backlog"
-    ])
-else:
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "🏠 Household Hub",
-        "☀️ Solar Production",
-        "🛡️ Security",
-        "🚗 Garage",        
-        "⚙️ System Logs"
+        "🆕 What's New"
     ])
 
 with tab1:
@@ -807,31 +765,357 @@ with tab5:
     st.subheader("Event History")
     st.write("Supabase database logs will render here...")
 
-# ==========================================
-# 📝 MASTER BACKLOG TAB (Developer Only)
-# ==========================================
+with tab6:
+    st.subheader("🆕 What's New")
+    st.caption("Release notes for Home Sync and Global items only.")
+
+    cat_display = {
+        "Core": "Core Features",
+        "UI": "User Interface / Experience",
+        "Bug": "Bug Fixes",
+        "Ops": "Operations",
+    }
+
+    def parse_home_sync_version(version_value):
+        try:
+            raw_version = str(version_value or "").strip().lower().replace("v", "")
+            if not raw_version:
+                return ""
+
+            if "home_sync" in raw_version:
+                match = re.search(r"home_sync\s*:\s*([0-9]+(?:\.[0-9]+){1,2})", raw_version)
+                return match.group(1) if match else ""
+
+            if "|" in raw_version:
+                # Allow future global payloads like "home_sync:1.2.3 | get_fit:2.1.0"
+                match = re.search(r"home_sync\s*:\s*([0-9]+(?:\.[0-9]+){1,2})", raw_version)
+                if match:
+                    return match.group(1)
+
+            parts = [int(p) for p in raw_version.split(".") if p != ""]
+            while len(parts) < 3:
+                parts.append(0)
+            return ".".join(str(p) for p in parts[:3])
+        except Exception:
+            return ""
+
+    # ==========================================
+    # DEV ONLY: DRAFT RELEASE PREVIEW
+    # ==========================================
+    supabase_client = get_supabase_client()
+
+    if user_role == "developer" and is_local_env:
+        staged_response = (
+            supabase_client
+            .table("backlog")
+            .select("*")
+            .eq("status", "Staged")
+            .in_("app_name", ["home_sync", "Global"])
+            .execute()
+        )
+
+        if staged_response.data:
+            categories = [r.get("category", "") for r in staged_response.data]
+            current_v = st.session_state.get("APP_VERSION", APP_VERSION)
+
+            try:
+                major, minor, patch = map(int, current_v.replace("v", "").strip().split("."))
+                if "Core" in categories:
+                    major += 1; minor = 0; patch = 0
+                elif "UI" in categories:
+                    minor += 1; patch = 0
+                elif "Bug" in categories:
+                    patch += 1
+                proposed_v = f"{major}.{minor}.{patch}"
+            except Exception:
+                proposed_v = current_v
+
+            st.markdown(f"""
+            <div style="background-color: #fef08a; padding: 12px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #facc15;">
+                <h4 style="color: #b91c1c; margin: 0px; text-align: center;">
+                    🚧 DRAFT PREVIEW: Proposed Release v{proposed_v}
+                </h4>
+            </div>
+            """, unsafe_allow_html=True)
+
+            batch_cats = sorted(
+                set(categories),
+                key=lambda x: ["Core", "UI", "Bug", "Ops"].index(x) if x in ["Core", "UI", "Bug", "Ops"] else 99
+            )
+
+            for cat in batch_cats:
+                st.markdown(f"#### {cat_display.get(cat, cat)}")
+                cat_items = [r for r in staged_response.data if r.get("category") == cat]
+
+                for item in cat_items:
+                    task = item.get("feature", "System Update")
+                    pub_msg = item.get("public_message", "")
+                    app_badge = "(Global) " if item.get("app_name") == "Global" else ""
+                    st.markdown(f"**• {app_badge}{task}**")
+                    if pub_msg and str(pub_msg).strip() not in ["", "None"]:
+                        st.caption(f"&emsp; *{pub_msg}*")
+                st.write("")
+            st.divider()
+
+    # ==========================================
+    # PROD FEED (The Formal History)
+    # ==========================================
+    try:
+        response = (
+            supabase_client
+            .table("backlog")
+            .select("*")
+            .eq("status", "Done")
+            .in_("app_name", ["home_sync", "Global"])
+            .execute()
+        )
+
+        if response.data:
+            df = pd.DataFrame(response.data)
+
+            df = df.rename(columns={
+                "feature": "Feature", "category": "Category",
+                "public_message": "Public Message", "release_date": "Release Date",
+                "version": "Version"
+            })
+
+            for col in ["Release Date", "Version", "Public Message", "app_name"]:
+                if col not in df.columns:
+                    df[col] = ""
+                df[col] = df[col].fillna("").astype(str)
+
+            df["Release Date"] = pd.to_datetime(df["Release Date"], errors="coerce").fillna(pd.Timestamp("2000-01-01"))
+
+            def extract_home_sync_version(row):
+                raw_v = str(row.get("Version", "")).strip()
+                app_name = str(row.get("app_name", "")).strip()
+                if app_name == "Global":
+                    match = re.search(r"home_sync\s*:\s*([0-9]+(?:\.[0-9]+){1,2})", raw_v, re.IGNORECASE)
+                    return match.group(1) if match else ""
+                return parse_home_sync_version(raw_v)
+
+            df["Display Version"] = df.apply(extract_home_sync_version, axis=1)
+            df = df[df["Display Version"].astype(str).str.strip() != ""]
+
+            def parse_version(v_str):
+                try:
+                    clean_v = str(v_str).lower().replace('v', '').strip()
+                    parts = [int(p) for p in clean_v.split('.') if p != ""]
+                    while len(parts) < 3:
+                        parts.append(0)
+                    return tuple(parts[:3])
+                except Exception:
+                    return (0, 0, 0)
+
+            current_app_v = parse_version(APP_VERSION)
+            df = df[df["Display Version"].apply(parse_version) <= current_app_v]
+
+            df = df.sort_values(by=["Release Date"], ascending=[False])
+            unique_versions = [v for v in df["Display Version"].unique() if str(v).strip() != ""]
+
+            recent_versions = unique_versions[:3]
+            older_versions = unique_versions[3:]
+
+            for v_val in recent_versions:
+                group = df[df["Display Version"] == v_val]
+                date_val = group["Release Date"].iloc[0]
+                date_str = pd.to_datetime(date_val).strftime("%Y-%m-%d") if date_val > pd.Timestamp("2000-01-01") else "Archive"
+
+                st.markdown(f"### 🚀 Update: {date_str} | v{v_val}")
+
+                version_cats = group["Category"].fillna("Ops").unique().tolist()
+                batch_cats = sorted(version_cats, key=lambda x: ["Core", "UI", "Bug", "Ops"].index(x) if x in ["Core", "UI", "Bug", "Ops"] else 99)
+
+                for cat in batch_cats:
+                    st.markdown(f"#### {cat_display.get(cat, cat)}")
+                    cat_df = group[group["Category"] == cat]
+
+                    for _, row in cat_df.iterrows():
+                        task = row.get("Feature", "System Update")
+                        pub_msg = row.get("Public Message", "")
+                        app_badge = "(Global) " if row.get("app_name") == "Global" else ""
+                        st.markdown(f"**• {app_badge}{task}**")
+                        if pd.notna(pub_msg) and str(pub_msg).strip() not in ["", "None"]:
+                            st.caption(f"&emsp; *{pub_msg}*")
+                    st.write("")
+                st.divider()
+
+            if len(older_versions) > 0:
+                with st.expander("🕰️ View Older Updates"):
+                    for v_val in older_versions:
+                        group = df[df["Display Version"] == v_val]
+                        date_val = group["Release Date"].iloc[0]
+                        date_str = pd.to_datetime(date_val).strftime("%Y-%m-%d") if date_val > pd.Timestamp("2000-01-01") else "Archive"
+
+                        st.markdown(f"### 🚀 Update: {date_str} | v{v_val}")
+
+                        version_cats = group["Category"].fillna("Ops").unique().tolist()
+                        batch_cats = sorted(version_cats, key=lambda x: ["Core", "UI", "Bug", "Ops"].index(x) if x in ["Core", "UI", "Bug", "Ops"] else 99)
+
+                        for cat in batch_cats:
+                            st.markdown(f"#### {cat_display.get(cat, cat)}")
+                            cat_df = group[group["Category"] == cat]
+
+                            for _, row in cat_df.iterrows():
+                                task = row.get("Feature", "System Update")
+                                pub_msg = row.get("Public Message", "")
+                                app_badge = "(Global) " if row.get("app_name") == "Global" else ""
+                                st.markdown(f"**• {app_badge}{task}**")
+                                if pd.notna(pub_msg) and str(pub_msg).strip() not in ["", "None"]:
+                                    st.caption(f"&emsp; *{pub_msg}*")
+                            st.write("")
+                        st.divider()
+        else:
+            st.info("No released updates yet.")
+
+    except Exception as e:
+        st.error(f"Could not load the changelog: {e}")
+
 if user_role == "developer":
-    with tab6:
-        st.subheader("📝 Master Ecosystem Backlog")
+    with tab7:
+        st.subheader("🛠️ Developer Dashboard")
+        st.caption("Backlog management plus future-facing operational tooling for your app ecosystem.")
+        backlog_status_options = ["In Progress", "Blocked", "Backlog", "Staged", "Done"]
+        backlog_category_options = ["Bug", "Core", "UI", "Ops"]
+        backlog_priority_options = ["High", "Medium", "Low"]
+
+        if "backlog_flash" not in st.session_state:
+            st.session_state["backlog_flash"] = None
+        if "open_backlog_app" not in st.session_state:
+            st.session_state["open_backlog_app"] = None
+        if "open_staged_expander" not in st.session_state:
+            st.session_state["open_staged_expander"] = False
+
+        try:
+            radar_response = (
+                get_supabase_client()
+                .table("backlog")
+                .select("app_name")
+                .eq("category", "Bug")
+                .eq("status", "Backlog")
+                .execute()
+            )
+            bug_rows = radar_response.data or []
+            bug_counts = {"home_sync": 0, "get_fit": 0, "Global": 0, "unassigned": 0}
+
+            for row in bug_rows:
+                app_name = row.get("app_name") or "unassigned"
+                if app_name not in bug_counts:
+                    bug_counts[app_name] = 0
+                bug_counts[app_name] += 1
+
+            total_bugs = sum(bug_counts.values())
+            if total_bugs > 0:
+                app_labels = {
+                    "home_sync": "Home Sync",
+                    "get_fit": "Get Fit Together",
+                    "Global": "Global",
+                    "unassigned": "Unassigned",
+                }
+                breakdown = " | ".join(
+                    f"{app_labels.get(app, app)}: {count}"
+                    for app, count in bug_counts.items()
+                    if count > 0
+                )
+                st.markdown(
+                    f"""
+                    <div style="background-color: #fff7ed; border: 1px solid #fb923c; color: #9a3412; padding: 12px 14px; border-radius: 10px; margin: 8px 0 16px 0;">
+                        <strong>⚠️ Bug Radar:</strong> {total_bugs} open bugs across the ecosystem.<br/>
+                        <span style="font-size: 0.92em;">{breakdown}</span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+        except Exception:
+            pass
+
+        st.markdown("### Developer Overview")
+        dev_col1, dev_col2 = st.columns(2)
+        with dev_col1.container(border=True):
+            st.markdown("#### System Health")
+            st.caption("Planned")
+            st.write("Supabase connection status, database size, and API request headroom.")
+
+        with dev_col2.container(border=True):
+            st.markdown("#### Technical Debt")
+            st.caption("Planned")
+            st.write("Python/runtime version tracking, library drift, and refactor backlog.")
+
+        dev_col3, dev_col4 = st.columns(2)
+        with dev_col3.container(border=True):
+            st.markdown("#### Environment Audit")
+            st.caption("Prep")
+            st.write("Track which secrets and env values are deployed to each app before releases.")
+
+        with dev_col4.container(border=True):
+            st.markdown("#### Active Analytics")
+            st.caption("Prep")
+            st.write("Usage metrics like households, logins, and creation activity across apps.")
+
+        with st.container(border=True):
+            st.markdown("#### Database Migrations")
+            st.caption("Prep")
+            st.write("Central history of schema changes, backfills, and environment-specific database updates.")
+            st.caption("Current tracked migrations: user sessions, backlog release management, release ledger, to-do metadata/recurrence.")
+
+        st.divider()
+
+        flash = st.session_state.get("backlog_flash")
+        if flash:
+            level = flash.get("level", "info")
+            message = flash.get("message", "")
+            if level == "success":
+                st.success(message)
+            elif level == "error":
+                st.error(message)
+            elif level == "warning":
+                st.warning(message)
+            else:
+                st.info(message)
+            st.session_state["backlog_flash"] = None
         
         # --- 1. The New Add Form (Wrapped in an Expander) ---
         with st.expander("➕ Add New Backlog Ticket", expanded=False):
             with st.form("add_master_backlog_form", clear_on_submit=True):
                 c1, c2, c3, c4 = st.columns(4)
-                new_status = c1.selectbox("Status", ["Backlog", "In Progress", "Blocked", "Staged", "Done"])
-                new_category = c2.selectbox("Category", ["Core", "UI", "Bug", "Ops"])
-                new_priority = c3.selectbox("Priority", ["High", "Medium", "Low"], index=1)
+                new_status = c1.selectbox("Status", backlog_status_options, index=2)
+                new_category = c2.selectbox("Category", backlog_category_options, index=1)
+                new_priority = c3.selectbox("Priority", backlog_priority_options, index=2)
                 target_app = c4.selectbox("Target App", ["home_sync", "get_fit", "Global"])
+
+                st.caption("Fields marked with * are required.")
                 
-                new_feature = st.text_input("Feature or Bug Name")
+                new_feature = st.text_input("Feature or Bug Name *")
                 new_notes = st.text_area("Description", help="External-facing description of the feature")
                 new_work_notes = st.text_area("Work Notes", help="Internal notes about implementation")
                 
                 if st.form_submit_button("Save Ticket", type="primary"):
-                    if new_feature:
-                        add_backlog_item(new_feature, new_notes, new_status, target_app, new_category, new_priority, new_work_notes)
-                        st.success(f"Added to {target_app}!")
-                        st.rerun()
+                    if not new_feature.strip():
+                        st.warning("Create blocked: Feature or Bug Name is required.")
+                    else:
+                        created = add_backlog_item(
+                            new_feature,
+                            new_notes,
+                            new_status,
+                            target_app,
+                            new_category,
+                            new_priority,
+                            new_work_notes,
+                        )
+                        if created:
+                            if new_status == "Staged":
+                                st.session_state["open_staged_expander"] = True
+                                st.session_state["open_backlog_app"] = None
+                            else:
+                                st.session_state["open_backlog_app"] = target_app
+                                st.session_state["open_staged_expander"] = False
+                            st.session_state["backlog_flash"] = {
+                                "level": "success",
+                                "message": f"Ticket created successfully in {target_app}.",
+                            }
+                            st.rerun()
+                        else:
+                            st.error("Failed to create ticket. Check logs and try again.")
                         
         st.divider()
         
@@ -851,20 +1135,20 @@ if user_role == "developer":
             df["priority"] = df["priority"].astype(str).str.title()
             
             # Clean and setup Category (Prevents Pandas4Warning)
-            valid_cats = ["Core", "UI", "Bug", "Ops"]
+            valid_cats = backlog_category_options
             if "category" in df.columns:
                 df["category"] = df["category"].apply(lambda x: x if x in valid_cats else "Core")
             
             # Apply Categorical Ordering
-            status_order = ["In Progress", "Backlog", "Blocked", "Staged", "Done"]
+            status_order = backlog_status_options
             if "status" in df.columns:
                 df["status"] = pd.Categorical(df["status"], categories=status_order, ordered=True)
 
-            category_order = ["Core", "UI", "Bug", "Ops"]
+            category_order = backlog_category_options
             if "category" in df.columns:
                 df["category"] = pd.Categorical(df["category"], categories=category_order, ordered=True)
             
-            priority_order = ["High", "Medium", "Low"]
+            priority_order = backlog_priority_options
             if "priority" in df.columns:
                 df["priority"] = pd.Categorical(df["priority"], categories=priority_order, ordered=True)
 
@@ -885,20 +1169,22 @@ if user_role == "developer":
                 with st.form(f"edit_backlog_form_{form_key_suffix}"):
                     c1, c2, c3, c4 = st.columns(4)
                     
-                    s_idx = ["Backlog", "In Progress", "Blocked", "Staged", "Done"].index(item.get("status", "Backlog")) if item.get("status") in ["Backlog", "In Progress", "Blocked", "Staged", "Done"] else 0
-                    e_status = c1.selectbox("Status", ["Backlog", "In Progress", "Blocked", "Staged", "Done"], index=s_idx, key=f"s_{form_key_suffix}")
+                    s_idx = backlog_status_options.index(item.get("status", "Backlog")) if item.get("status") in backlog_status_options else 0
+                    e_status = c1.selectbox("Status", backlog_status_options, index=s_idx, key=f"s_{form_key_suffix}")
                     
-                    cat_idx = ["Core", "UI", "Bug", "Ops"].index(item.get("category", "Core")) if item.get("category") in ["Core", "UI", "Bug", "Ops"] else 0
-                    e_category = c2.selectbox("Category", ["Core", "UI", "Bug", "Ops"], index=cat_idx, key=f"c_{form_key_suffix}")
+                    cat_idx = backlog_category_options.index(item.get("category", "Core")) if item.get("category") in backlog_category_options else 0
+                    e_category = c2.selectbox("Category", backlog_category_options, index=cat_idx, key=f"c_{form_key_suffix}")
                     
-                    p_idx = ["High", "Medium", "Low"].index(item.get("priority", "Medium")) if item.get("priority") in ["High", "Medium", "Low"] else 1
-                    e_priority = c3.selectbox("Priority", ["High", "Medium", "Low"], index=p_idx, key=f"p_{form_key_suffix}")
+                    p_idx = backlog_priority_options.index(item.get("priority", "Medium")) if item.get("priority") in backlog_priority_options else 1
+                    e_priority = c3.selectbox("Priority", backlog_priority_options, index=p_idx, key=f"p_{form_key_suffix}")
                     
                     app_opts = ["home_sync", "get_fit", "Global"]
                     app_idx = app_opts.index(item.get("app_name", "home_sync")) if item.get("app_name") in app_opts else 0
                     e_app = c4.selectbox("Target App", app_opts, index=app_idx, key=f"a_{form_key_suffix}")
 
-                    e_feature = st.text_input("Feature or Bug Name", value=item.get("feature", ""), key=f"f_{form_key_suffix}")
+                    st.caption("Fields marked with * are required.")
+
+                    e_feature = st.text_input("Feature or Bug Name *", value=item.get("feature", ""), key=f"f_{form_key_suffix}")
                     e_notes = st.text_area("Description", value=item.get("notes", ""), help="External-facing description", key=f"n_{form_key_suffix}")
                     e_work_notes = st.text_area("Work Notes", value=item.get("work_notes", ""), help="Internal implementation notes", key=f"w_{form_key_suffix}")
                     e_public_msg = st.text_area("Public Release Message", value=item.get("public_message", ""), key=f"pm_{form_key_suffix}")
@@ -906,18 +1192,59 @@ if user_role == "developer":
                     col_save, col_del, col_cancel = st.columns([2, 1, 1])
                     
                     if col_save.form_submit_button("💾 Save", type="primary", use_container_width=True):
-                        update_backlog_item(item["id"], e_feature, e_notes, e_status, e_app, e_category, e_priority, e_public_msg, e_work_notes)
-                        st.session_state["editing_backlog_id"] = None
+                        if not e_feature.strip():
+                            st.session_state["backlog_flash"] = {
+                                "level": "warning",
+                                "message": "Save blocked: Feature or Bug Name is required.",
+                            }
+                        else:
+                            updated = update_backlog_item(
+                                item["id"],
+                                e_feature,
+                                e_notes,
+                                e_status,
+                                e_app,
+                                e_category,
+                                e_priority,
+                                e_public_msg,
+                                e_work_notes,
+                            )
+                            if updated:
+                                st.session_state["backlog_flash"] = {
+                                    "level": "success",
+                                    "message": f"Ticket updated successfully for {e_app}.",
+                                }
+                                st.session_state["editing_backlog_id"] = None
+                            else:
+                                st.session_state["backlog_flash"] = {
+                                    "level": "error",
+                                    "message": "Failed to update ticket. Check logs and try again.",
+                                }
                         st.rerun()
                         
                     if col_del.form_submit_button("🗑️ Delete", use_container_width=True):
-                        delete_backlog_item(item["id"])
-                        st.session_state["editing_backlog_id"] = None
+                        deleted = delete_backlog_item(item["id"])
+                        if deleted:
+                            st.session_state["backlog_flash"] = {
+                                "level": "success",
+                                "message": "Ticket deleted successfully.",
+                            }
+                            st.session_state["editing_backlog_id"] = None
+                        else:
+                            st.session_state["backlog_flash"] = {
+                                "level": "error",
+                                "message": "Failed to delete ticket. Check logs and try again.",
+                            }
                         st.rerun()
                         
                     if col_cancel.form_submit_button("❌ Cancel", use_container_width=True):
                         st.session_state["editing_backlog_id"] = None
                         st.rerun()
+
+        def begin_backlog_edit(item_id, app_name, is_staged=False):
+            st.session_state["editing_backlog_id"] = item_id
+            st.session_state["open_staged_expander"] = bool(is_staged)
+            st.session_state["open_backlog_app"] = None if is_staged else app_name
                 
         # --- 4. Display Items (Expanders) ---
         if items:
@@ -939,7 +1266,10 @@ if user_role == "developer":
             for app in sorted_apps:
                 clean_name = str(app).replace("_", " ").title()
                 
-                with st.expander(f"📱 {clean_name}", expanded=False):
+                with st.expander(
+                    f"📱 {clean_name}",
+                    expanded=st.session_state.get("open_backlog_app") == app,
+                ):
                     app_items = [
                         i for i in items
                         if (i.get("app_name") == app or (not i.get("app_name") and app == "unassigned"))
@@ -977,9 +1307,12 @@ if user_role == "developer":
                             if version_info:
                                 col_text.caption(f"🏷️ Released as v{version_info}")
                             
-                            if col_act.button("✏️ Edit", key=f"edit_bl_{item['id']}"):
-                                st.session_state["editing_backlog_id"] = item["id"]
-                                st.rerun()
+                            col_act.button(
+                                "✏️ Edit",
+                                key=f"edit_bl_{item['id']}",
+                                on_click=begin_backlog_edit,
+                                args=(item["id"], app, False),
+                            )
                             st.divider()
         else:
             st.info("Your master backlog is currently empty.")
@@ -1004,7 +1337,10 @@ if user_role == "developer":
                 else:
                     return (3, app)
 
-            with st.expander(f"🚀 Staged (All Apps) - {len(staged_items)}", expanded=False):
+            with st.expander(
+                f"🚀 Staged (All Apps) - {len(staged_items)}",
+                expanded=st.session_state.get("open_staged_expander", False),
+            ):
                 staged_apps = sorted(
                     set(i.get("app_name") if i.get("app_name") else "unassigned" for i in staged_items),
                     key=sort_key
@@ -1050,9 +1386,12 @@ if user_role == "developer":
                             if version_info:
                                 col_text.caption(f"🏷️ Released as v{version_info}")
 
-                            if col_act.button("✏️ Edit", key=f"edit_staged_{item['id']}"):
-                                st.session_state["editing_backlog_id"] = item["id"]
-                                st.rerun()
+                            col_act.button(
+                                "✏️ Edit",
+                                key=f"edit_staged_{item['id']}",
+                                on_click=begin_backlog_edit,
+                                args=(item["id"], staged_app, True),
+                            )
                             st.divider()
 
         st.markdown("---")
