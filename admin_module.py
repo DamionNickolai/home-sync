@@ -35,6 +35,8 @@ def render_admin_sidebar_panel():
                         current_edit_projects = bool(u.get("can_edit_projects", legacy_view))
                         current_view_monthly = bool(u.get("can_view_monthly_budget", legacy_view))
                         current_edit_monthly = bool(u.get("can_edit_monthly_budget", False))
+                        current_view_wishlist_members = bool(u.get("can_view_wishlist_members", True))
+                        current_view_wishlist_admin = bool(u.get("can_view_wishlist_admin", False))
 
                         p_mod_col, p_view_label_col, p_view_toggle_col, p_edit_label_col, p_edit_toggle_col = st.columns([2.2, 1, 0.9, 1, 0.9])
                         p_mod_col.markdown("Projects:")
@@ -70,6 +72,23 @@ def render_admin_sidebar_panel():
                             label_visibility="collapsed",
                         )
 
+                        w_mod_col, w_members_label_col, w_members_toggle_col, w_admin_label_col, w_admin_toggle_col = st.columns([2.2, 1, 0.9, 1, 0.9])
+                        w_mod_col.markdown("Wish List:")
+                        w_members_label_col.caption("View Members")
+                        new_view_wishlist_members = w_members_toggle_col.toggle(
+                            "Wish List View Members",
+                            value=current_view_wishlist_members,
+                            key=f"perm_view_wishlist_members_{user_id}",
+                            label_visibility="collapsed",
+                        )
+                        w_admin_label_col.caption("View Admin")
+                        new_view_wishlist_admin = w_admin_toggle_col.toggle(
+                            "Wish List View Admin",
+                            value=current_view_wishlist_admin,
+                            key=f"perm_view_wishlist_admin_{user_id}",
+                            label_visibility="collapsed",
+                        )
+
                         # UI-side safety guard; database function also enforces this.
                         if new_edit_projects and not new_view_projects:
                             new_view_projects = True
@@ -89,6 +108,10 @@ def render_admin_sidebar_panel():
                             updates["can_view_monthly_budget"] = new_view_monthly
                         if new_edit_monthly != current_edit_monthly:
                             updates["can_edit_monthly_budget"] = new_edit_monthly
+                        if new_view_wishlist_members != current_view_wishlist_members:
+                            updates["can_view_wishlist_members"] = new_view_wishlist_members
+                        if new_view_wishlist_admin != current_view_wishlist_admin:
+                            updates["can_view_wishlist_admin"] = new_view_wishlist_admin
 
                         if updates:
                             if update_user_module_permissions(user_id, updates):

@@ -10,6 +10,7 @@ env = st.secrets.get("app_config", {}).get("environment", "production")
 TASK_TABLE = "household_tasks_dev" if env == "local" else "household_tasks"
 PROJECT_BUDGETS_TABLE = "project_budgets_dev" if env == "local" else "project_budgets"
 HOUSEHOLD_FINANCE_SETTINGS_TABLE = "household_finance_settings_dev" if env == "local" else "household_finance_settings"
+WISH_LIST_TABLE = "wish_list_dev" if env == "local" else "wish_list"
 
 @st.cache_resource
 def init_connection() -> Client:
@@ -519,6 +520,206 @@ def insert_project_budget_item(data: dict):
         return False
 
 
+def _can_manage_wishlist_row_server_side(row):
+    role = st.session_state.get("user_role", "member")
+    if role in ["admin", "developer"]:
+        return True
+
+    active_auth_user_id = st.session_state.get("auth_user_id")
+    row_auth_user_id = row.get("owner_auth_user_id")
+    if active_auth_user_id and str(row_auth_user_id or "") == str(active_auth_user_id):
+        return True
+
+    active_username = str(st.session_state.get("username", "")).strip()
+    row_username = str(row.get("owner_username") or "").strip()
+    return bool(active_username and row_username and active_username == row_username)
+
+
+def get_wish_list_items():
+    """Fetches household wish list items with role-aware visibility."""
+    try:
+        house_id = get_current_household_id()
+        query = (
+            supabase
+            .table(WISH_LIST_TABLE)
+            .select("*")
+            .eq("household_id", house_id)
+            .order("updated_at", desc=True)
+        )
+
+        response = query.execute()
+        return response.data or []
+    except Exception as e:
+        print(f"Error fetching wish list items: {e}")
+        return []
+
+
+def insert_wish_list_item(data: dict):
+    """Inserts a wish list item for the active household/user."""
+    try:
+        house_id = get_current_household_id()
+        role = st.session_state.get("user_role", "member")
+        active_auth_user_id = st.session_state.get("auth_user_id")
+        active_username = st.session_state.get("username")
+
+        payload = dict(data or {})
+        payload["household_id"] = house_id
+        payload["is_completed"] = bool(payload.get("is_completed", False))
+
+        payload["owner_auth_user_id"] = active_auth_user_id
+        payload["owner_username"] = active_username
+
+        response = supabase.table(WISH_LIST_TABLE).insert(payload).execute()
+        return bool(response.data)
+    except Exception as e:
+        print(f"Error inserting wish list item: {e}")
+        return False
+
+
+def update_wish_list_item(item_id: str, updated_data: dict):
+    """Updates a wish list item with role-aware row ownership checks."""
+    try:
+        house_id = get_current_household_id()
+        existing = (
+            supabase
+            .table(WISH_LIST_TABLE)
+            .select("id, owner_auth_user_id, owner_username")
+            .eq("id", item_id)
+            .eq("household_id", house_id)
+            .limit(1)
+            .execute()
+        )
+        if not existing.data:
+            return False
+
+        row = existing.data[0]
+        if not _can_manage_wishlist_row_server_side(row):
+            return False
+
+        payload = dict(updated_data or {})
+        payload.pop("owner_auth_user_id", None)
+        payload.pop("owner_username", None)
+        if "is_completed" in payload:
+            payload["is_completed"] = bool(payload.get("is_completed", False))
+
+        payload["updated_at"] = datetime.now(ZoneInfo("America/Chicago")).isoformat()
+
+        (
+            supabase
+            .table(WISH_LIST_TABLE)
+            .update(payload)
+            .eq("id", item_id)
+            .eq("household_id", house_id)
+            .execute()
+        )
+        return True
+    except Exception as e:
+        print(f"Error updating wish list item: {e}")
+        return False
+
+
+def delete_wish_list_item(item_id: str):
+    """Deletes a wish list item with role-aware row ownership checks."""
+    try:
+        house_id = get_current_household_id()
+        existing = (
+            supabase
+            .table(WISH_LIST_TABLE)
+            .select("id, owner_auth_user_id, owner_username")
+            .eq("id", item_id)
+            .eq("household_id", house_id)
+            .limit(1)
+            .execute()
+        )
+        if not existing.data:
+            return False
+
+        row = existing.data[0]
+        if not _can_manage_wishlist_row_server_side(row):
+            return False
+
+        (
+            supabase
+            .table(WISH_LIST_TABLE)
+            .delete()
+            .eq("id", item_id)
+            .eq("household_id", house_id)
+            .execute()
+        )
+        return True
+    except Exception as e:
+        print(f"Error deleting wish list item: {e}")
+        return False
+
+
+def complete_wish_list_item(item_id: str):
+    """Marks a wish list item as completed for the active household."""
+    try:
+        house_id = get_current_household_id()
+        existing = (
+            supabase
+            .table(WISH_LIST_TABLE)
+            .select("id, owner_auth_user_id, owner_username")
+            .eq("id", item_id)
+            .eq("household_id", house_id)
+            .limit(1)
+            .execute()
+        )
+        if not existing.data:
+            return False
+
+        row = existing.data[0]
+        if not _can_manage_wishlist_row_server_side(row):
+            return False
+
+        (
+            supabase
+            .table(WISH_LIST_TABLE)
+            .update({"is_completed": True, "updated_at": datetime.now(ZoneInfo("America/Chicago")).isoformat()})
+            .eq("id", item_id)
+            .eq("household_id", house_id)
+            .execute()
+        )
+        return True
+    except Exception as e:
+        print(f"Error completing wish list item: {e}")
+        return False
+
+
+def restore_wish_list_item(item_id: str):
+    """Restores a completed wish list item back to active status."""
+    try:
+        house_id = get_current_household_id()
+        existing = (
+            supabase
+            .table(WISH_LIST_TABLE)
+            .select("id, owner_auth_user_id, owner_username")
+            .eq("id", item_id)
+            .eq("household_id", house_id)
+            .limit(1)
+            .execute()
+        )
+        if not existing.data:
+            return False
+
+        row = existing.data[0]
+        if not _can_manage_wishlist_row_server_side(row):
+            return False
+
+        (
+            supabase
+            .table(WISH_LIST_TABLE)
+            .update({"is_completed": False, "updated_at": datetime.now(ZoneInfo("America/Chicago")).isoformat()})
+            .eq("id", item_id)
+            .eq("household_id", house_id)
+            .execute()
+        )
+        return True
+    except Exception as e:
+        print(f"Error restoring wish list item: {e}")
+        return False
+
+
 def get_household_finance_settings():
     """Fetches finance settings for the active household."""
     try:
@@ -571,32 +772,41 @@ def get_current_user_permissions():
         if not auth_user_id:
             return {}
 
-        try:
-            response = (
-                supabase
-                .table("users")
-                .select(
-                    "role, can_view_budget, can_view_projects, can_edit_projects, "
-                    "can_view_monthly_budget, can_edit_monthly_budget"
-                )
-                .eq("auth_user_id", auth_user_id)
-                .eq("household_id", house_id)
-                .limit(1)
-                .execute()
-            )
-        except Exception:
-            # Compatibility path before module-level columns are migrated.
-            response = (
-                supabase
-                .table("users")
-                .select("role, can_view_budget")
-                .eq("auth_user_id", auth_user_id)
-                .eq("household_id", house_id)
-                .limit(1)
-                .execute()
-            )
-        if response.data:
-            return response.data[0]
+        for attempt in range(2):
+            try:
+                try:
+                    response = (
+                        supabase
+                        .table("users")
+                        .select(
+                            "role, can_view_budget, can_view_projects, can_edit_projects, "
+                            "can_view_monthly_budget, can_edit_monthly_budget, "
+                            "can_view_wishlist_members, can_view_wishlist_admin"
+                        )
+                        .eq("auth_user_id", auth_user_id)
+                        .eq("household_id", house_id)
+                        .limit(1)
+                        .execute()
+                    )
+                except Exception:
+                    # Compatibility path before module-level columns are migrated.
+                    response = (
+                        supabase
+                        .table("users")
+                        .select("role, can_view_budget")
+                        .eq("auth_user_id", auth_user_id)
+                        .eq("household_id", house_id)
+                        .limit(1)
+                        .execute()
+                    )
+
+                if response.data:
+                    return response.data[0]
+                return {}
+            except Exception as query_error:
+                if attempt == 0:
+                    continue
+                print(f"Error fetching current user permissions: {query_error}")
         return {}
     except Exception as e:
         print(f"Error fetching current user permissions: {e}")
@@ -616,7 +826,8 @@ def get_household_users_for_admin():
                 .select(
                     "auth_user_id, username, role, can_view_budget, "
                     "can_view_projects, can_edit_projects, "
-                    "can_view_monthly_budget, can_edit_monthly_budget"
+                    "can_view_monthly_budget, can_edit_monthly_budget, "
+                    "can_view_wishlist_members, can_view_wishlist_admin"
                 ) \
                 .eq("household_id", house_id) \
                 .execute()
@@ -669,6 +880,8 @@ def update_user_module_permissions(auth_user_id: str, updates: dict):
             "can_view_monthly_budget",
             "can_edit_monthly_budget",
             "can_view_budget",
+            "can_view_wishlist_members",
+            "can_view_wishlist_admin",
         }
         payload = {k: bool(v) for k, v in (updates or {}).items() if k in allowed_keys}
         if not payload:

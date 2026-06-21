@@ -136,6 +136,8 @@ def refresh_permissions_from_db() -> bool:
     st.session_state["can_edit_projects"] = bool(latest.get("can_edit_projects", legacy_budget_view))
     st.session_state["can_view_monthly_budget"] = bool(latest.get("can_view_monthly_budget", legacy_budget_view))
     st.session_state["can_edit_monthly_budget"] = bool(latest.get("can_edit_monthly_budget", False))
+    st.session_state["can_view_wishlist_members"] = bool(latest.get("can_view_wishlist_members", True))
+    st.session_state["can_view_wishlist_admin"] = bool(latest.get("can_view_wishlist_admin", False))
     st.session_state["permissions_refreshed_at"] = central_now().strftime("%I:%M:%S %p")
     return True
 

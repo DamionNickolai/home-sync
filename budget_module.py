@@ -9,6 +9,13 @@ from database import (
     insert_project_budget_item,
     get_household_finance_settings,
     update_household_projects_funds,
+    get_household_users_for_admin,
+    get_wish_list_items,
+    insert_wish_list_item,
+    update_wish_list_item,
+    delete_wish_list_item,
+    complete_wish_list_item,
+    restore_wish_list_item,
 )
 
 
@@ -180,6 +187,12 @@ def render_budget_module():
         st.session_state["projects_active_section"] = "overview"
     if "projects_workspace_active_category" not in st.session_state:
         st.session_state["projects_workspace_active_category"] = "priority"
+    if "editing_wishlist_id" not in st.session_state:
+        st.session_state["editing_wishlist_id"] = None
+    if "wishlist_active_owner" not in st.session_state:
+        st.session_state["wishlist_active_owner"] = None
+    if "wishlist_pending_owner" not in st.session_state:
+        st.session_state["wishlist_pending_owner"] = None
 
     view = st.session_state["budget_view"]
     can_access_projects = _can_access_projects_module()
@@ -190,7 +203,7 @@ def render_budget_module():
         st.subheader("Budget Modules")
         st.caption("Pick a budget module to open.")
 
-        card_col1, card_col2 = st.columns(2)
+        card_col1, card_col2, card_col3 = st.columns(3)
 
         with card_col1:
             with st.container(border=True):
@@ -216,11 +229,20 @@ def render_budget_module():
                     st.caption("Projects access is controlled by your household admin.")
                     st.button("Projects Locked", key="budget_card_projects_locked", type="secondary", width="stretch", disabled=True)
 
+        with card_col3:
+            with st.container(border=True):
+                st.markdown("### 💝 Wish List")
+                st.caption("Track purchase ideas and actuals in a shared household list.")
+                if st.button("Open Wish List", key="budget_card_wishlist", type="secondary", width="stretch"):
+                    st.session_state["budget_view"] = "wishlist"
+                    st.rerun()
+
         return
 
     if st.button("⬅️ Back to Budget Modules", width="content"):
         st.session_state["budget_view"] = "menu"
         st.session_state["editing_project_budget_id"] = None
+        st.session_state["editing_wishlist_id"] = None
         st.rerun()
 
     st.divider()
@@ -237,6 +259,268 @@ def render_budget_module():
         if st.button("⬅️ Return to Budget Modules", key="monthly_access_denied_return"):
             st.session_state["budget_view"] = "menu"
             st.rerun()
+        return
+
+    if view == "wishlist":
+        st.subheader("💝 Wish List")
+        st.caption("Visible to all roles. Entries are individually owned.")
+
+        role = st.session_state.get("user_role", "member")
+        active_auth_user_id = st.session_state.get("auth_user_id")
+        active_username = _clean_text(st.session_state.get("username"))
+        can_view_wishlist_members = bool(st.session_state.get("can_view_wishlist_members", True))
+        can_view_wishlist_admin = bool(st.session_state.get("can_view_wishlist_admin", False))
+
+        household_users = get_household_users_for_admin()
+        username_to_auth = {
+            _clean_text(u.get("username")): u.get("auth_user_id")
+            for u in household_users
+            if _clean_text(u.get("username"))
+        }
+        username_to_role = {
+            _clean_text(u.get("username")): _clean_text(u.get("role")).lower()
+            for u in household_users
+            if _clean_text(u.get("username"))
+        }
+
+        wish_rows = get_wish_list_items()
+
+        def get_row_owner_username(row):
+            return _clean_text(row.get("owner_username")) or "unassigned"
+
+        def get_row_owner_auth_user_id(row):
+            return row.get("owner_auth_user_id")
+
+        def can_edit_wish_row(row):
+            if role in ["admin", "developer"]:
+                return True
+            row_auth_user = get_row_owner_auth_user_id(row)
+            if active_auth_user_id and str(row_auth_user or "") == str(active_auth_user_id):
+                return True
+            row_user = get_row_owner_username(row)
+            return bool(active_username and row_user and active_username == row_user)
+
+        def is_row_visible_to_member(row):
+            owner_name = get_row_owner_username(row)
+            owner_role = username_to_role.get(owner_name, "member")
+            if owner_role in ["admin", "developer"]:
+                return can_view_wishlist_admin
+            return can_view_wishlist_members
+
+        if role in ["admin", "developer"]:
+            visible_rows = wish_rows
+        else:
+            visible_rows = [r for r in wish_rows if is_row_visible_to_member(r)]
+
+        all_owner_names = sorted({get_row_owner_username(r) for r in visible_rows if get_row_owner_username(r)})
+        if role in ["admin", "developer"]:
+            available_owner_names = sorted(set(list(username_to_auth.keys()) + all_owner_names))
+        else:
+            available_owner_names = sorted(set(all_owner_names + ([active_username] if active_username else [])))
+
+        if not available_owner_names:
+            available_owner_names = ["unassigned"]
+
+        pending_owner = st.session_state.pop("wishlist_pending_owner", None)
+        if pending_owner in available_owner_names:
+            st.session_state["wishlist_active_owner"] = pending_owner
+
+        if st.session_state.get("wishlist_active_owner") not in available_owner_names:
+            st.session_state["wishlist_active_owner"] = active_username if active_username in available_owner_names else available_owner_names[0]
+
+        selected_owner = st.radio(
+            "Wish List Owner",
+            options=available_owner_names,
+            key="wishlist_active_owner",
+            horizontal=True,
+            label_visibility="collapsed",
+            format_func=lambda owner: f"👤 {owner}",
+        )
+
+        active_rows = [r for r in visible_rows if not bool(r.get("is_completed", False))]
+        completed_rows = [r for r in visible_rows if bool(r.get("is_completed", False))]
+
+        filtered_rows = [r for r in active_rows if get_row_owner_username(r) == selected_owner]
+
+        with st.expander("➕ Add Wish List Item", expanded=False):
+            with st.form("add_wishlist_item_form", clear_on_submit=True):
+                a1, a2 = st.columns([2, 1])
+                new_item = a1.text_input("Item *", placeholder="e.g., New patio furniture")
+                new_est_price_raw = a2.text_input("Estimated Price", placeholder="Enter amount")
+                new_owner_username = active_username or "unassigned"
+
+                new_description = st.text_area("Description", placeholder="Why this item is wanted")
+
+                b1, b2, b3 = st.columns([1, 1, 2])
+                new_actual_raw = b1.text_input("Actual Cost", placeholder="Enter amount")
+                new_vet_discount = b2.checkbox("Veteran Discount", value=False)
+                new_vendor = b3.text_input("Vendor", placeholder="Store or seller")
+
+                new_notes = st.text_area("Notes", placeholder="Optional notes")
+
+                add_save_col, add_complete_col = st.columns(2)
+                add_clicked = add_save_col.form_submit_button("Save Wish Item", type="primary", width="stretch")
+                complete_clicked = add_complete_col.form_submit_button("Complete", width="stretch")
+                if add_clicked or complete_clicked:
+                    parsed_est = _parse_currency_input(new_est_price_raw)
+                    parsed_actual = _parse_currency_input(new_actual_raw)
+
+                    if not new_item.strip():
+                        st.warning("Item is required.")
+                    elif "invalid" in [parsed_est, parsed_actual]:
+                        st.warning("Estimated Price and Actual Cost must be valid numbers.")
+                    else:
+                        payload = {
+                            "item": new_item.strip(),
+                            "description": _clean_text(new_description) or None,
+                            "estimated_price": float(parsed_est) if parsed_est is not None else None,
+                            "actual_cost": float(parsed_actual) if parsed_actual is not None else None,
+                            "veteran_discount": bool(new_vet_discount),
+                            "vendor": _clean_text(new_vendor) or None,
+                            "notes": _clean_text(new_notes) or None,
+                            "owner_username": active_username or new_owner_username,
+                            "owner_auth_user_id": active_auth_user_id or username_to_auth.get(new_owner_username),
+                            "is_completed": bool(complete_clicked),
+                        }
+                        if insert_wish_list_item(payload):
+                            st.session_state["wishlist_pending_owner"] = new_owner_username
+                            st.success("Wish list item added.")
+                            st.rerun()
+                        else:
+                            st.error("Could not add wish list item.")
+
+        if not filtered_rows:
+            st.info(f"No wish list items for {selected_owner} yet.")
+            return
+
+        for row in filtered_rows:
+            row_id = row.get("id")
+            if row_id is None:
+                continue
+
+            item_name = row.get("item") or "Unnamed Item"
+            description = _clean_text(row.get("description"))
+            est_price = row.get("estimated_price")
+            actual_cost = row.get("actual_cost")
+            vendor = _clean_text(row.get("vendor"))
+            notes = _clean_text(row.get("notes"))
+            veteran_discount = bool(row.get("veteran_discount", False))
+            owner_name = get_row_owner_username(row)
+
+            editable = can_edit_wish_row(row)
+
+            with st.container(border=True):
+                left, right = st.columns([6, 1])
+                left.markdown(f"**{item_name}**")
+                if description:
+                    left.markdown(f"**Description:** {description}")
+                if vendor:
+                    left.markdown(f"**Brand or Vendor:** {vendor}")
+                if est_price is not None:
+                    left.markdown(
+                        f"**Estimated:** <span style='color: #16A34A; font-weight: 700;'>{_format_money(est_price)}</span>",
+                        unsafe_allow_html=True,
+                    )
+                if notes:
+                    left.markdown(f"**Notes:** {notes}")
+                if veteran_discount:
+                    left.caption("Eligible for veteran discount.")
+
+                if editable:
+                    if right.button("✏️ Edit", key=f"edit_wishlist_{row_id}", width="stretch"):
+                        current_edit = st.session_state.get("editing_wishlist_id")
+                        st.session_state["editing_wishlist_id"] = None if current_edit == row_id else row_id
+                        st.rerun()
+
+            if editable and st.session_state.get("editing_wishlist_id") == row_id:
+                with st.container(border=True):
+                    st.markdown("### ✏️ Edit Wish Item")
+                    with st.form(f"edit_wishlist_form_{row_id}"):
+                        e1, e2 = st.columns([2, 1])
+                        e_item = e1.text_input("Item *", value=item_name)
+                        e_est_raw = e2.text_input("Estimated Price", value=_format_currency_for_input(est_price))
+
+                        e_description = st.text_area("Description", value=description)
+
+                        f1, f2, f3 = st.columns([1, 1, 2])
+                        e_actual_raw = f1.text_input("Actual Cost", value=_format_currency_for_input(actual_cost))
+                        e_vet_discount = f2.checkbox("Veteran Discount", value=veteran_discount)
+                        e_vendor = f3.text_input("Vendor", value=vendor)
+
+                        e_notes = st.text_area("Notes", value=notes)
+
+                        save_col, complete_col, delete_col, cancel_col = st.columns([2, 1, 1, 1])
+                        save_clicked = save_col.form_submit_button("💾 Save", type="primary", width="stretch")
+                        complete_clicked = complete_col.form_submit_button("✅ Complete", width="stretch")
+                        delete_clicked = delete_col.form_submit_button("🗑️ Delete", width="stretch")
+                        cancel_clicked = cancel_col.form_submit_button("❌ Cancel", width="stretch")
+
+                    if save_clicked:
+                        parsed_est = _parse_currency_input(e_est_raw)
+                        parsed_actual = _parse_currency_input(e_actual_raw)
+
+                        if not e_item.strip():
+                            st.warning("Item is required.")
+                        elif "invalid" in [parsed_est, parsed_actual]:
+                            st.warning("Estimated Price and Actual Cost must be valid numbers.")
+                        else:
+                            update_payload = {
+                                "item": e_item.strip(),
+                                "description": _clean_text(e_description) or None,
+                                "estimated_price": float(parsed_est) if parsed_est is not None else None,
+                                "actual_cost": float(parsed_actual) if parsed_actual is not None else None,
+                                "veteran_discount": bool(e_vet_discount),
+                                "vendor": _clean_text(e_vendor) or None,
+                                "notes": _clean_text(e_notes) or None,
+                            }
+                            if update_wish_list_item(str(row_id), update_payload):
+                                st.session_state["wishlist_pending_owner"] = owner_name
+                                st.session_state["editing_wishlist_id"] = None
+                                st.success("Wish list item updated.")
+                                st.rerun()
+                            else:
+                                st.error("Could not update this wish list item.")
+
+                    if complete_clicked:
+                        if complete_wish_list_item(str(row_id)):
+                            st.session_state["editing_wishlist_id"] = None
+                            st.success("Wish list item completed.")
+                            st.rerun()
+                        else:
+                            st.error("Could not complete this wish list item.")
+
+                    if delete_clicked:
+                        if delete_wish_list_item(str(row_id)):
+                            st.session_state["editing_wishlist_id"] = None
+                            st.success("Wish list item deleted.")
+                            st.rerun()
+                        else:
+                            st.error("Could not delete this wish list item.")
+
+                    if cancel_clicked:
+                        st.session_state["editing_wishlist_id"] = None
+                        st.rerun()
+
+            st.divider()
+
+        if completed_rows:
+            with st.expander("✅ Completed Items", expanded=False):
+                for row in completed_rows:
+                    completed_name = row.get("item") or "Unnamed Item"
+                    completed_actual = row.get("actual_cost")
+                    completed_editable = can_edit_wish_row(row)
+                    col_text, col_action = st.columns([6, 1])
+                    col_text.caption(f"{completed_name}")
+                    if completed_actual is not None:
+                        col_text.caption(f"Actual: {_format_money(completed_actual)}")
+                    if completed_editable:
+                        if col_action.button("↩️ Restore", key=f"restore_wishlist_{row.get('id')}", width="stretch"):
+                            if restore_wish_list_item(str(row.get("id"))):
+                                st.success("Wish list item restored.")
+                                st.rerun()
+                            else:
+                                st.error("Could not restore this wish list item.")
+
         return
 
     raw_data = get_project_budgets()
