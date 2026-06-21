@@ -822,6 +822,16 @@ def render_budget_module():
                             st.session_state["editing_project_budget_id"] = None
                             st.rerun()
 
+            def render_tab_totals(project_rows):
+                tab_est_low = sum(p.get("_est_low", 0) for p in project_rows)
+                tab_est_high = sum(p.get("_est_high", 0) for p in project_rows)
+                tab_spent = sum(p.get("_actual", 0) for p in project_rows)
+                t1, t2, t3 = st.columns(3)
+                t1.metric("Est Low", _format_money(tab_est_low))
+                t2.metric("Estimated High", _format_money(tab_est_high))
+                t3.metric("Spent", _format_money(tab_spent))
+                st.divider()
+
             priority_projects.sort(key=lambda x: (str(x.get("category") or "Uncategorized").lower(), -x.get("_est_high", 0), str(x.get("item", "")).lower()))
 
             priority_grouped = {}
@@ -836,6 +846,7 @@ def render_budget_module():
             category_tabs = st.tabs(category_tab_labels)
 
             with category_tabs[0]:
+                render_tab_totals(priority_projects)
                 if not priority_projects:
                     st.caption("No priority 1 projects right now.")
                 else:
@@ -851,6 +862,7 @@ def render_budget_module():
                 cat_projects.sort(key=lambda x: (x.get("_priority", 99), -x.get("_est_high", 0), str(x.get("item", "")).lower()))
 
                 with category_tabs[idx + 1]:
+                    render_tab_totals(cat_projects)
                     for item in cat_projects:
                         render_project_item(item)
 
