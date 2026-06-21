@@ -56,5 +56,8 @@ pip install -r requirements.txt
 ENTER VIRTUAL ENV:
 .\venv\Scripts\activate
 
+RUN DATABASE MIGRATIONS:
+python maintenance/migrate_projects.py
+
 RUN APP:
 python -m streamlit run home_sync.py

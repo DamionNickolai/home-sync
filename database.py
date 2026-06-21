@@ -1,6 +1,7 @@
 import streamlit as st
 from supabase import create_client, Client
 import pandas as pd
+from security import encrypt_data, decrypt_text, decrypt_float
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from utils import calculate_next_version
@@ -470,9 +471,22 @@ def _can_edit_projects_server_side():
         return bool(st.session_state.get("can_edit_projects"))
     return bool(st.session_state.get("can_view_budget", False))
 
+# ==========================================
+# 💰 BUDGET FUNCTIONS
+# ==========================================
+
+def _can_edit_projects_server_side():
+    """Authoritative guard for project write operations."""
+    role = st.session_state.get("user_role", "member")
+    if role in ["admin", "developer"]:
+        return True
+    if st.session_state.get("can_edit_projects") is not None:
+        return bool(st.session_state.get("can_edit_projects"))
+    return bool(st.session_state.get("can_view_budget", False))
+
 def get_project_budgets():
     """
-    Fetches all project budget items for the active session's household.
+    Fetches and decrypts all project budget items for the active session's household.
     """
     try:
         house_id = get_current_household_id()
@@ -481,21 +495,48 @@ def get_project_budgets():
             .eq("household_id", house_id) \
             .order("priority", desc=False) \
             .execute()
-        return response.data
+            
+        data = response.data
+        
+        # 🟢 DECRYPT DATA BEFORE SENDING TO STREAMLIT UI
+        if data:
+            for row in data:
+                # Text fields
+                row["item"] = decrypt_text(row.get("item"))
+                row["description"] = decrypt_text(row.get("description"))
+                row["vendors"] = decrypt_text(row.get("vendors"))
+                row["notes"] = decrypt_text(row.get("notes"))
+                
+                # Financial fields (converted back to floats for math)
+                row["est_low_cost"] = decrypt_float(row.get("est_low_cost"))
+                row["est_high_cost"] = decrypt_float(row.get("est_high_cost"))
+                row["actual_cost"] = decrypt_float(row.get("actual_cost"))
+                
+        return data
     except Exception as e:
         print(f"Error fetching project budgets: {e}")
         return []
 
 def update_project_budget_item(item_id: str, updated_data: dict):
     """
-    Updates a specific budget item. Useful for the st.data_editor.
+    Encrypts sensitive fields and updates a specific budget item.
     """
     try:
         if not _can_edit_projects_server_side():
             return False
         house_id = get_current_household_id()
+        
+        payload = dict(updated_data or {})
+        
+        # 🟢 ENCRYPT SENSITIVE FIELDS BEFORE SAVING
+        fields_to_encrypt = ["item", "description", "est_low_cost", "est_high_cost", "actual_cost", "vendors", "notes"]
+        
+        for field in fields_to_encrypt:
+            if field in payload and payload[field] is not None:
+                payload[field] = encrypt_data(payload[field])
+                
         response = supabase.table(PROJECT_BUDGETS_TABLE) \
-            .update(updated_data) \
+            .update(payload) \
             .eq("id", item_id) \
             .eq("household_id", house_id) \
             .execute()
@@ -506,14 +547,24 @@ def update_project_budget_item(item_id: str, updated_data: dict):
 
 def insert_project_budget_item(data: dict):
     """
-    Inserts a new budget item.
+    Encrypts sensitive fields and inserts a new budget item.
     """
     try:
         if not _can_edit_projects_server_side():
             return False
         house_id = get_current_household_id()
-        data["household_id"] = house_id # Ensure the active household ID is stamped
-        response = supabase.table(PROJECT_BUDGETS_TABLE).insert(data).execute()
+        
+        payload = dict(data or {})
+        payload["household_id"] = house_id # Ensure the active household ID is stamped
+        
+        # 🟢 ENCRYPT SENSITIVE FIELDS BEFORE SAVING
+        fields_to_encrypt = ["item", "description", "est_low_cost", "est_high_cost", "actual_cost", "vendors", "notes"]
+        
+        for field in fields_to_encrypt:
+            if field in payload and payload[field] is not None:
+                payload[field] = encrypt_data(payload[field])
+                
+        response = supabase.table(PROJECT_BUDGETS_TABLE).insert(payload).execute()
         return True
     except Exception as e:
         print(f"Error inserting budget item: {e}")
@@ -536,7 +587,7 @@ def _can_manage_wishlist_row_server_side(row):
 
 
 def get_wish_list_items():
-    """Fetches household wish list items with role-aware visibility."""
+    """Fetches household wish list items with role-aware visibility and decrypts them."""
     try:
         house_id = get_current_household_id()
         query = (
@@ -548,26 +599,48 @@ def get_wish_list_items():
         )
 
         response = query.execute()
-        return response.data or []
+        data = response.data or []
+        
+        # 🟢 DECRYPT DATA BEFORE SENDING IT TO STREAMLIT
+        if data:
+            for row in data:
+                # Text fields
+                row["item"] = decrypt_text(row.get("item"))
+                row["description"] = decrypt_text(row.get("description"))
+                row["vendor"] = decrypt_text(row.get("vendor"))
+                row["notes"] = decrypt_text(row.get("notes"))
+                
+                # Financial fields
+                row["estimated_price"] = decrypt_float(row.get("estimated_price"))
+                row["actual_cost"] = decrypt_float(row.get("actual_cost"))
+                
+                # Note: veteran_discount and is_completed are booleans and left alone
+                
+        return data
     except Exception as e:
         print(f"Error fetching wish list items: {e}")
         return []
 
 
 def insert_wish_list_item(data: dict):
-    """Inserts a wish list item for the active household/user."""
+    """Encrypts and inserts a wish list item for the active household/user."""
     try:
         house_id = get_current_household_id()
-        role = st.session_state.get("user_role", "member")
         active_auth_user_id = st.session_state.get("auth_user_id")
         active_username = st.session_state.get("username")
 
         payload = dict(data or {})
         payload["household_id"] = house_id
         payload["is_completed"] = bool(payload.get("is_completed", False))
-
         payload["owner_auth_user_id"] = active_auth_user_id
         payload["owner_username"] = active_username
+
+        # 🟢 ENCRYPT SENSITIVE FIELDS BEFORE SAVING
+        fields_to_encrypt = ["item", "description", "estimated_price", "actual_cost", "vendor", "notes"]
+        
+        for field in fields_to_encrypt:
+            if field in payload and payload[field] is not None:
+                payload[field] = encrypt_data(payload[field])
 
         response = supabase.table(WISH_LIST_TABLE).insert(payload).execute()
         return bool(response.data)
@@ -577,7 +650,7 @@ def insert_wish_list_item(data: dict):
 
 
 def update_wish_list_item(item_id: str, updated_data: dict):
-    """Updates a wish list item with role-aware row ownership checks."""
+    """Updates a wish list item with role-aware checks and encrypts the payload."""
     try:
         house_id = get_current_household_id()
         existing = (
@@ -599,10 +672,18 @@ def update_wish_list_item(item_id: str, updated_data: dict):
         payload = dict(updated_data or {})
         payload.pop("owner_auth_user_id", None)
         payload.pop("owner_username", None)
+        
         if "is_completed" in payload:
             payload["is_completed"] = bool(payload.get("is_completed", False))
 
         payload["updated_at"] = datetime.now(ZoneInfo("America/Chicago")).isoformat()
+
+        # 🟢 ENCRYPT SENSITIVE FIELDS BEFORE SAVING
+        fields_to_encrypt = ["item", "description", "estimated_price", "actual_cost", "vendor", "notes"]
+        
+        for field in fields_to_encrypt:
+            if field in payload and payload[field] is not None:
+                payload[field] = encrypt_data(payload[field])
 
         (
             supabase
