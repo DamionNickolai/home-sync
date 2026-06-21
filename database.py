@@ -8,6 +8,8 @@ from utils import calculate_next_version
 # 🟢 DYNAMIC ENVIRONMENT ROUTING
 env = st.secrets.get("app_config", {}).get("environment", "production")
 TASK_TABLE = "household_tasks_dev" if env == "local" else "household_tasks"
+PROJECT_BUDGETS_TABLE = "project_budgets_dev" if env == "local" else "project_budgets"
+HOUSEHOLD_FINANCE_SETTINGS_TABLE = "household_finance_settings_dev" if env == "local" else "household_finance_settings"
 
 @st.cache_resource
 def init_connection() -> Client:
@@ -452,4 +454,254 @@ def delete_task(task_id):
         return True
     except Exception as e:
         print(f"Error deleting task: {e}")
+        return False
+
+# ==========================================
+# 💰 BUDGET FUNCTIONS
+# ==========================================
+
+def _can_edit_projects_server_side():
+    """Authoritative guard for project write operations."""
+    role = st.session_state.get("user_role", "member")
+    if role in ["admin", "developer"]:
+        return True
+    if st.session_state.get("can_edit_projects") is not None:
+        return bool(st.session_state.get("can_edit_projects"))
+    return bool(st.session_state.get("can_view_budget", False))
+
+def get_project_budgets():
+    """
+    Fetches all project budget items for the active session's household.
+    """
+    try:
+        house_id = get_current_household_id()
+        response = supabase.table(PROJECT_BUDGETS_TABLE) \
+            .select("*") \
+            .eq("household_id", house_id) \
+            .order("priority", desc=False) \
+            .execute()
+        return response.data
+    except Exception as e:
+        print(f"Error fetching project budgets: {e}")
+        return []
+
+def update_project_budget_item(item_id: str, updated_data: dict):
+    """
+    Updates a specific budget item. Useful for the st.data_editor.
+    """
+    try:
+        if not _can_edit_projects_server_side():
+            return False
+        house_id = get_current_household_id()
+        response = supabase.table(PROJECT_BUDGETS_TABLE) \
+            .update(updated_data) \
+            .eq("id", item_id) \
+            .eq("household_id", house_id) \
+            .execute()
+        return True
+    except Exception as e:
+        print(f"Error updating budget item: {e}")
+        return False
+
+def insert_project_budget_item(data: dict):
+    """
+    Inserts a new budget item.
+    """
+    try:
+        if not _can_edit_projects_server_side():
+            return False
+        house_id = get_current_household_id()
+        data["household_id"] = house_id # Ensure the active household ID is stamped
+        response = supabase.table(PROJECT_BUDGETS_TABLE).insert(data).execute()
+        return True
+    except Exception as e:
+        print(f"Error inserting budget item: {e}")
+        return False
+
+
+def get_household_finance_settings():
+    """Fetches finance settings for the active household."""
+    try:
+        house_id = get_current_household_id()
+        response = (
+            supabase
+            .table(HOUSEHOLD_FINANCE_SETTINGS_TABLE)
+            .select("household_id, projects_funds, projects_funds_year, updated_at")
+            .eq("household_id", house_id)
+            .limit(1)
+            .execute()
+        )
+        if response.data:
+            return response.data[0]
+        return {}
+    except Exception as e:
+        print(f"Error fetching household finance settings: {e}")
+        return {}
+
+
+def update_household_projects_funds(projects_funds, projects_funds_year=None):
+    """Upserts projects_funds for the active household."""
+    try:
+        if not _can_edit_projects_server_side():
+            return False
+        house_id = get_current_household_id()
+        payload = {
+            "household_id": house_id,
+            "projects_funds": projects_funds,
+            "projects_funds_year": projects_funds_year,
+            "updated_at": datetime.now(ZoneInfo("America/Chicago")).isoformat(),
+        }
+        (
+            supabase
+            .table(HOUSEHOLD_FINANCE_SETTINGS_TABLE)
+            .upsert(payload, on_conflict="household_id")
+            .execute()
+        )
+        return True
+    except Exception as e:
+        print(f"Error updating projects funds: {e}")
+        return False
+
+
+def get_current_user_permissions():
+    """Returns role and module-access permissions for the active signed-in user."""
+    try:
+        house_id = get_current_household_id()
+        auth_user_id = st.session_state.get("auth_user_id")
+        if not auth_user_id:
+            return {}
+
+        try:
+            response = (
+                supabase
+                .table("users")
+                .select(
+                    "role, can_view_budget, can_view_projects, can_edit_projects, "
+                    "can_view_monthly_budget, can_edit_monthly_budget"
+                )
+                .eq("auth_user_id", auth_user_id)
+                .eq("household_id", house_id)
+                .limit(1)
+                .execute()
+            )
+        except Exception:
+            # Compatibility path before module-level columns are migrated.
+            response = (
+                supabase
+                .table("users")
+                .select("role, can_view_budget")
+                .eq("auth_user_id", auth_user_id)
+                .eq("household_id", house_id)
+                .limit(1)
+                .execute()
+            )
+        if response.data:
+            return response.data[0]
+        return {}
+    except Exception as e:
+        print(f"Error fetching current user permissions: {e}")
+        return {}
+
+# ==========================================
+# 🛡️ ADMIN FUNCTIONS
+# ==========================================
+
+def get_household_users_for_admin():
+    """Fetches all users in the current household so admins can manage them."""
+    try:
+        house_id = get_current_household_id()
+        # FIXED: Changed 'id' to 'auth_user_id'
+        try:
+            response = supabase.table("users") \
+                .select(
+                    "auth_user_id, username, role, can_view_budget, "
+                    "can_view_projects, can_edit_projects, "
+                    "can_view_monthly_budget, can_edit_monthly_budget"
+                ) \
+                .eq("household_id", house_id) \
+                .execute()
+        except Exception:
+            # Compatibility path before module-level columns are migrated.
+            response = supabase.table("users") \
+                .select("auth_user_id, username, role, can_view_budget") \
+                .eq("household_id", house_id) \
+                .execute()
+        return response.data
+    except Exception as e:
+        print(f"Error fetching users: {e}")
+        return []
+
+def update_user_budget_access(auth_user_id: str, can_view: bool):
+    """Allows an Admin/Developer to toggle budget access for a household member."""
+    try:
+        current_role = st.session_state.get("user_role")
+        if current_role not in ["admin", "developer"]:
+            return False # Security check!
+
+        house_id = get_current_household_id()
+        
+        payload = {
+            "can_view_budget": bool(can_view),
+            "can_view_projects": bool(can_view),
+            "can_edit_projects": bool(can_view),
+            "can_view_monthly_budget": bool(can_view),
+        }
+
+        # FIXED: Changed 'id' to 'auth_user_id'
+        supabase.table("users").update(payload) \
+            .eq("auth_user_id", auth_user_id).eq("household_id", house_id).execute()
+        return True
+    except Exception as e:
+        print(f"Error updating user access: {e}")
+        return False
+
+
+def update_user_module_permissions(auth_user_id: str, updates: dict):
+    """Allows Admin/Developer to update explicit module-level permissions."""
+    try:
+        current_role = st.session_state.get("user_role")
+        if current_role not in ["admin", "developer"]:
+            return False
+
+        allowed_keys = {
+            "can_view_projects",
+            "can_edit_projects",
+            "can_view_monthly_budget",
+            "can_edit_monthly_budget",
+            "can_view_budget",
+        }
+        payload = {k: bool(v) for k, v in (updates or {}).items() if k in allowed_keys}
+        if not payload:
+            return False
+
+        # Enforce write-implies-read safety invariants.
+        if payload.get("can_edit_projects") is True:
+            payload["can_view_projects"] = True
+        if payload.get("can_view_projects") is False:
+            payload["can_edit_projects"] = False
+
+        if payload.get("can_edit_monthly_budget") is True:
+            payload["can_view_monthly_budget"] = True
+        if payload.get("can_view_monthly_budget") is False:
+            payload["can_edit_monthly_budget"] = False
+
+        # Keep legacy rollup for backwards compatibility.
+        if "can_view_projects" in payload or "can_view_monthly_budget" in payload:
+            projects_view = payload.get("can_view_projects")
+            monthly_view = payload.get("can_view_monthly_budget")
+            if projects_view is not None and monthly_view is not None:
+                payload["can_view_budget"] = bool(projects_view or monthly_view)
+
+        house_id = get_current_household_id()
+        (
+            supabase
+            .table("users")
+            .update(payload)
+            .eq("auth_user_id", auth_user_id)
+            .eq("household_id", house_id)
+            .execute()
+        )
+        return True
+    except Exception as e:
+        print(f"Error updating module permissions: {e}")
         return False

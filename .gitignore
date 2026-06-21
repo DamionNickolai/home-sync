@@ -1,11 +1,20 @@
 # Streamlit Secrets (NEVER PUSH THIS)
 .streamlit/secrets.toml
 .streamlit/secrets.*
+secrets.toml
+secrets.*
 
 .env
 .env.*
 !.env.example
 !maintenance/.env.example
+
+# Credentials and key material
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
 
 # Python Virtual Environments
 .venv/
@@ -16,6 +25,8 @@ env/
 __pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
+.mypy_cache/
 
 .vscode/
 *.code-workspace

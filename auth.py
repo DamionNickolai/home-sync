@@ -21,11 +21,13 @@ except ImportError:
         def refresh(self):
             return None
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 
 SESSION_COOKIE_NAME = "home_sync_session_v2"
 LEGACY_SESSION_COOKIE_NAME = "home_sync_session"
+APP_TIMEZONE = ZoneInfo("America/Chicago")
 
 
 def get_auth_client():
@@ -50,8 +52,8 @@ def get_device_fingerprint():
     return st.session_state["device_fingerprint"]
 
 
-def utc_now():
-    return datetime.now(timezone.utc)
+def app_now():
+    return datetime.now(APP_TIMEZONE)
 
 
 def parse_iso_datetime(value):
@@ -129,9 +131,9 @@ def create_user_session(supabase, auth_user_id, refresh_token):
             "auth_user_id": auth_user_id,
             "refresh_token": refresh_token,
             "device_fingerprint": get_device_fingerprint(),
-            "created_at": utc_now().isoformat(),
-            "last_accessed_at": utc_now().isoformat(),
-            "expires_at": (utc_now() + timedelta(days=30)).isoformat(),
+            "created_at": app_now().isoformat(),
+            "last_accessed_at": app_now().isoformat(),
+            "expires_at": (app_now() + timedelta(days=30)).isoformat(),
             "is_active": True,
         }
         supabase.table("user_sessions").insert(session_record).execute()
@@ -148,7 +150,7 @@ def get_session_from_database(supabase, session_id):
             session = result.data[0]
             if session.get("is_active"):
                 expires_at = parse_iso_datetime(session.get("expires_at"))
-                if expires_at and utc_now() < expires_at:
+                if expires_at and app_now() < expires_at:
                     return session
             return None
         return None
@@ -160,7 +162,7 @@ def refresh_session_access_time(supabase, session_id):
     """Update the last_accessed_at timestamp."""
     try:
         supabase.table("user_sessions").update(
-            {"last_accessed_at": utc_now().isoformat()}
+            {"last_accessed_at": app_now().isoformat()}
         ).eq("session_id", session_id).execute()
     except Exception:
         pass
@@ -173,7 +175,7 @@ def update_session_refresh_token(supabase, session_id, refresh_token):
         supabase.table("user_sessions").update(
             {
                 "refresh_token": refresh_token,
-                "last_accessed_at": utc_now().isoformat(),
+                "last_accessed_at": app_now().isoformat(),
             }
         ).eq("session_id", session_id).execute()
     except Exception:
@@ -207,6 +209,11 @@ def clear_auth_session():
         "username",
         "household_id",
         "user_role",
+        "can_view_budget",
+        "can_view_projects",
+        "can_edit_projects",
+        "can_view_monthly_budget",
+        "can_edit_monthly_budget",
         "primary_color",
         "sidebar_color",
         "line_color",
@@ -244,6 +251,11 @@ def hydrate_user_session(db_user, auth_user_id=None):
     st.session_state["username"] = db_user["username"]
     st.session_state["household_id"] = db_user.get("household_id", "unassigned")
     st.session_state["user_role"] = db_user.get("role", "member")
+    st.session_state["can_view_budget"] = db_user.get("can_view_budget", False)
+    st.session_state["can_view_projects"] = db_user.get("can_view_projects", db_user.get("can_view_budget", False))
+    st.session_state["can_edit_projects"] = db_user.get("can_edit_projects", db_user.get("can_view_budget", False))
+    st.session_state["can_view_monthly_budget"] = db_user.get("can_view_monthly_budget", db_user.get("can_view_budget", False))
+    st.session_state["can_edit_monthly_budget"] = db_user.get("can_edit_monthly_budget", False)
     st.session_state["primary_color"] = db_user.get("primary_color", "#1E3A8A")
     st.session_state["sidebar_color"] = db_user.get("sidebar_color", "#162A61")
     st.session_state["line_color"] = db_user.get("line_color", "#60A5FA")
