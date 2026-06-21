@@ -176,6 +176,10 @@ def render_budget_module():
         st.session_state["pending_restore_project_id"] = None
     if "projects_funds_input" not in st.session_state:
         st.session_state["projects_funds_input"] = ""
+    if "projects_active_section" not in st.session_state:
+        st.session_state["projects_active_section"] = "overview"
+    if "projects_workspace_active_category" not in st.session_state:
+        st.session_state["projects_workspace_active_category"] = "priority"
 
     view = st.session_state["budget_view"]
     can_access_projects = _can_access_projects_module()
@@ -334,13 +338,28 @@ def render_budget_module():
 
     archive_years = [y for y in available_years if y != selected_year]
 
-    overview_tab, workspace_tab, completed_tab = st.tabs([
-        "📊 Projects Overview",
-        "🧭 Projects Workspace",
-        "✅ Completed Projects",
-    ])
+    projects_section_keys = ["overview", "workspace", "completed"]
 
-    with overview_tab:
+    if st.session_state.get("projects_active_section") not in projects_section_keys:
+        st.session_state["projects_active_section"] = "overview"
+
+    def projects_section_label(section_key):
+        if section_key == "overview":
+            return "📊 Projects Overview"
+        if section_key == "workspace":
+            return "🧭 Projects Workspace"
+        return "✅ Completed Projects"
+
+    selected_projects_section = st.radio(
+        "Projects Section",
+        options=projects_section_keys,
+        key="projects_active_section",
+        horizontal=True,
+        label_visibility="collapsed",
+        format_func=projects_section_label,
+    )
+
+    if selected_projects_section == "overview":
         with st.expander("🎛️ Overview Filters", expanded=False):
             selected_year = st.selectbox(
                 "Overview Year",
@@ -544,7 +563,7 @@ def render_budget_module():
                     y1.metric(f"{year_value} Projects", f"{year_project_count}")
                     y2.metric(f"{year_value} Spent", f"${year_spent:,.2f}")
 
-    with workspace_tab:
+    elif selected_projects_section == "workspace":
         st.caption("Open this section to add and manage project records.")
 
         if not can_edit_projects:
@@ -839,13 +858,26 @@ def render_budget_module():
                 p_cat = p_item.get("category") or "Uncategorized"
                 priority_grouped.setdefault(p_cat, []).append(p_item)
 
-            category_tab_labels = [f"🔴 Priority ({len(priority_projects)})"] + [
-                f"📁 {cat_name} ({len(grouped_active.get(cat_name, []))})" for cat_name in sorted_categories
-            ]
+            workspace_section_keys = ["priority"] + [f"category::{cat_name}" for cat_name in sorted_categories]
+            if st.session_state.get("projects_workspace_active_category") not in workspace_section_keys:
+                st.session_state["projects_workspace_active_category"] = workspace_section_keys[0]
 
-            category_tabs = st.tabs(category_tab_labels)
+            def workspace_section_label(section_key):
+                if section_key == "priority":
+                    return f"🔴 Priority ({len(priority_projects)})"
+                category_name = section_key.split("::", 1)[1]
+                return f"📁 {category_name} ({len(grouped_active.get(category_name, []))})"
 
-            with category_tabs[0]:
+            selected_workspace_section = st.radio(
+                "Project Workspace Section",
+                options=workspace_section_keys,
+                key="projects_workspace_active_category",
+                horizontal=True,
+                label_visibility="collapsed",
+                format_func=workspace_section_label,
+            )
+
+            if selected_workspace_section == "priority":
                 render_tab_totals(priority_projects)
                 if not priority_projects:
                     st.caption("No priority 1 projects right now.")
@@ -856,17 +888,15 @@ def render_budget_module():
                         cat_items.sort(key=lambda x: (-x.get("_est_high", 0), str(x.get("item", "")).lower()))
                         for item in cat_items:
                             render_project_item(item)
-
-            for idx, cat_name in enumerate(sorted_categories):
+            else:
+                cat_name = selected_workspace_section.split("::", 1)[1]
                 cat_projects = grouped_active.get(cat_name, [])
                 cat_projects.sort(key=lambda x: (x.get("_priority", 99), -x.get("_est_high", 0), str(x.get("item", "")).lower()))
+                render_tab_totals(cat_projects)
+                for item in cat_projects:
+                    render_project_item(item)
 
-                with category_tabs[idx + 1]:
-                    render_tab_totals(cat_projects)
-                    for item in cat_projects:
-                        render_project_item(item)
-
-    with completed_tab:
+    else:
         st.caption("Completed items are excluded from active totals. Restore any project back to Active.")
 
         if not completed_projects:

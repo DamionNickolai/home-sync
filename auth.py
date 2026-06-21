@@ -297,15 +297,6 @@ def check_password():
         except Exception:
             pass
 
-    if (
-        not st.session_state.get("logout_in_progress", False)
-        and not st.session_state.get("password_correct", False)
-    ):
-        bootstrap_attempts = st.session_state.get("auth_bootstrap_attempts", 0)
-        if bootstrap_attempts < 5:
-            st.session_state["auth_bootstrap_attempts"] = bootstrap_attempts + 1
-            st.rerun()
-
     if not st.session_state.get("logout_in_progress", False):
         if st.session_state.get("password_correct", False):
             ensure_session_cookie(controller)
@@ -345,6 +336,15 @@ def check_password():
                 remove_session_cookie(controller)
             except Exception:
                 pass
+
+    if (
+        not st.session_state.get("logout_in_progress", False)
+        and not st.session_state.get("password_correct", False)
+    ):
+        bootstrap_attempts = st.session_state.get("auth_bootstrap_attempts", 0)
+        if bootstrap_attempts < 5:
+            st.session_state["auth_bootstrap_attempts"] = bootstrap_attempts + 1
+            st.rerun()
 
     def perform_login(email, password):
         st.session_state.pop("logout_in_progress", None)

@@ -535,14 +535,32 @@ with tab1:
                     return (1, name)
 
                 sorted_users = sorted(single_user_tasks.keys(), key=user_tab_sort)
-                tab_labels = [f"👤 {u} ({len(single_user_tasks.get(u, []))})" for u in sorted_users]
+                task_bucket_keys = [f"user::{u}" for u in sorted_users]
                 if multi_assigned_tasks:
-                    tab_labels.append(f"👥 Multi-Assigned ({len(multi_assigned_tasks)})")
+                    task_bucket_keys.append("multi")
 
-                if not tab_labels:
+                if not task_bucket_keys:
                     st.info("No active tasks found for the selected visibility.")
                 else:
-                    task_tabs = st.tabs(tab_labels)
+                    if "todo_active_bucket" not in st.session_state:
+                        st.session_state["todo_active_bucket"] = task_bucket_keys[0]
+                    if st.session_state.get("todo_active_bucket") not in task_bucket_keys:
+                        st.session_state["todo_active_bucket"] = task_bucket_keys[0]
+
+                    def task_bucket_label(bucket_key):
+                        if bucket_key == "multi":
+                            return f"👥 Multi-Assigned ({len(multi_assigned_tasks)})"
+                        bucket_user = bucket_key.split("::", 1)[1]
+                        return f"👤 {bucket_user} ({len(single_user_tasks.get(bucket_user, []))})"
+
+                    selected_task_bucket = st.radio(
+                        "Task Buckets",
+                        options=task_bucket_keys,
+                        key="todo_active_bucket",
+                        horizontal=True,
+                        label_visibility="collapsed",
+                        format_func=task_bucket_label,
+                    )
 
                     def due_sort_value(task_row):
                         try:
@@ -671,23 +689,21 @@ with tab1:
                                     st.session_state["editing_task_id"] = None
                                     st.rerun()
 
-                    for idx, username in enumerate(sorted_users):
-                        with task_tabs[idx]:
-                            tasks_in_bucket = [x[0] for x in single_user_tasks.get(username, [])]
-                            tasks_in_bucket.sort(key=due_sort_value)
-                            for task in tasks_in_bucket:
-                                assigned_to_raw = task.get("assigned_to", "Unassigned")
-                                assignees = sorted([a for a in parse_assignees(assigned_to_raw) if str(a).strip()])
-                                render_task_item(task, assignees, f"user_{username}_{task['id']}")
-
-                    if multi_assigned_tasks:
-                        with task_tabs[-1]:
-                            tasks_in_bucket = [x[0] for x in multi_assigned_tasks]
-                            tasks_in_bucket.sort(key=due_sort_value)
-                            for task in tasks_in_bucket:
-                                assigned_to_raw = task.get("assigned_to", "Unassigned")
-                                assignees = sorted([a for a in parse_assignees(assigned_to_raw) if str(a).strip()])
-                                render_task_item(task, assignees, f"multi_{task['id']}")
+                    if selected_task_bucket == "multi":
+                        tasks_in_bucket = [x[0] for x in multi_assigned_tasks]
+                        tasks_in_bucket.sort(key=due_sort_value)
+                        for task in tasks_in_bucket:
+                            assigned_to_raw = task.get("assigned_to", "Unassigned")
+                            assignees = sorted([a for a in parse_assignees(assigned_to_raw) if str(a).strip()])
+                            render_task_item(task, assignees, f"multi_{task['id']}")
+                    else:
+                        username = selected_task_bucket.split("::", 1)[1]
+                        tasks_in_bucket = [x[0] for x in single_user_tasks.get(username, [])]
+                        tasks_in_bucket.sort(key=due_sort_value)
+                        for task in tasks_in_bucket:
+                            assigned_to_raw = task.get("assigned_to", "Unassigned")
+                            assignees = sorted([a for a in parse_assignees(assigned_to_raw) if str(a).strip()])
+                            render_task_item(task, assignees, f"user_{username}_{task['id']}")
 
             st.divider()
             
@@ -1094,6 +1110,8 @@ if user_role == "developer":
             st.session_state["backlog_flash"] = None
         if "editing_backlog_id" not in st.session_state:
             st.session_state["editing_backlog_id"] = None
+        if "backlog_active_section" not in st.session_state:
+            st.session_state["backlog_active_section"] = None
 
         dev_view = st.session_state.get("developer_dashboard_view", "menu")
 
@@ -1102,9 +1120,10 @@ if user_role == "developer":
                 radar_response = (
                     get_supabase_client()
                     .table("backlog")
-                    .select("app_name")
+                    .select("app_name, status")
                     .eq("category", "Bug")
-                    .eq("status", "Backlog")
+                    .neq("status", "Staged")
+                    .neq("status", "Done")
                     .execute()
                 )
                 bug_rows = radar_response.data or []
@@ -1166,6 +1185,7 @@ if user_role == "developer":
 
             st.divider()
 
+            st.subheader("🎟️ Backlog & Release Management")
             if dev_view == "overview":
                 st.markdown("### Developer Overview")
                 dev_col1, dev_col2 = st.columns(2)
@@ -1250,8 +1270,6 @@ if user_role == "developer":
                                     st.rerun()
                                 else:
                                     st.error("Failed to create ticket. Check logs and try again.")
-
-                st.divider()
 
                 raw_items = get_all_backlog_items()
                 if raw_items:
@@ -1358,6 +1376,40 @@ if user_role == "developer":
                 def begin_backlog_edit(item_id, app_name, is_staged=False):
                     current_id = st.session_state.get("editing_backlog_id")
                     st.session_state["editing_backlog_id"] = None if current_id == item_id else item_id
+                    st.session_state["backlog_active_section"] = "staged" if is_staged else f"app::{app_name}"
+
+                def render_backlog_item(item, app_name, is_staged=False):
+                    col_text, col_act = st.columns([5, 1])
+                    col_text.markdown(f"**{item.get('feature', 'Unnamed Feature')}**")
+                    col_text.caption(
+                        f"Status: **{item.get('status', 'N/A')}** | Category: **{item.get('category', 'N/A')}** | Priority: **{item.get('priority', 'N/A')}**"
+                    )
+
+                    notes_text = item.get("notes", "").strip()
+                    work_notes_text = item.get("work_notes", "").strip()
+                    public_msg = item.get("public_message", "").strip()
+                    version_info = item.get("version", "")
+
+                    if notes_text:
+                        col_text.markdown(f"**Description:** {notes_text}")
+                    if work_notes_text:
+                        col_text.markdown(f"**Work Notes:** {work_notes_text}")
+                    if public_msg:
+                        col_text.markdown(f"**Public Message:** <span style='color: #10B981;'>{public_msg}</span>", unsafe_allow_html=True)
+                    if version_info:
+                        col_text.caption(f"🏷️ Released as v{version_info}")
+
+                    col_act.button(
+                        "✏️ Edit",
+                        key=f"edit_{'staged' if is_staged else 'bl'}_{item['id']}",
+                        on_click=begin_backlog_edit,
+                        args=(item["id"], app_name, is_staged),
+                    )
+
+                    if st.session_state["editing_backlog_id"] == item["id"]:
+                        render_edit_form(item, f"{'staged' if is_staged else 'app'}_{item['id']}")
+
+                    st.divider()
 
                 def sort_key(app):
                     if app == "home_sync":
@@ -1372,53 +1424,41 @@ if user_role == "developer":
                 sorted_apps = sorted(apps, key=sort_key)
                 staged_items = [i for i in items if i.get("status") == "Staged"]
 
-                tab_labels = [f"📱 {str(app).replace('_', ' ').title()}" for app in sorted_apps]
-                tab_labels.append(f"🚀 Staged ({len(staged_items)})")
-                tab_labels.append("🚀 Release Management")
-                backlog_tabs = st.tabs(tab_labels)
+                backlog_section_keys = [f"app::{app}" for app in sorted_apps] + ["staged", "release"]
+                if st.session_state.get("backlog_active_section") not in backlog_section_keys:
+                    st.session_state["backlog_active_section"] = backlog_section_keys[0] if backlog_section_keys else "release"
 
-                for tab_index, app in enumerate(sorted_apps):
-                    with backlog_tabs[tab_index]:
-                        app_items = [
-                            i for i in items
-                            if (i.get("app_name") == app or (not i.get("app_name") and app == "unassigned"))
-                            and i.get("status") != "Staged"
-                        ]
-                        if not app_items:
-                            st.caption("No non-staged items in this app section.")
+                def backlog_section_label(section_key):
+                    if section_key == "staged":
+                        return f"🚀 Staged ({len(staged_items)})"
+                    if section_key == "release":
+                        return "🚀 Release Management"
+                    app_name = section_key.split("::", 1)[1]
+                    return f"📱 {str(app_name).replace('_', ' ').title()}"
 
-                        for item in app_items:
-                            col_text, col_act = st.columns([5, 1])
-                            col_text.markdown(f"**{item.get('feature', 'Unnamed Feature')}**")
-                            col_text.caption(f"Status: **{item.get('status', 'N/A')}** | Category: {item.get('category', 'N/A')} | Priority: {item.get('priority', 'N/A')}")
+                selected_backlog_section = st.radio(
+                    "Backlog Section",
+                    options=backlog_section_keys,
+                    key="backlog_active_section",
+                    horizontal=True,
+                    label_visibility="collapsed",
+                    format_func=backlog_section_label,
+                )
 
-                            notes_text = item.get("notes", "").strip()
-                            work_notes_text = item.get("work_notes", "").strip()
-                            public_msg = item.get("public_message", "").strip()
-                            version_info = item.get("version", "")
+                if selected_backlog_section.startswith("app::"):
+                    app = selected_backlog_section.split("::", 1)[1]
+                    app_items = [
+                        i for i in items
+                        if (i.get("app_name") == app or (not i.get("app_name") and app == "unassigned"))
+                        and i.get("status") != "Staged"
+                    ]
+                    if not app_items:
+                        st.caption("No non-staged items in this app section.")
 
-                            if notes_text:
-                                col_text.markdown(f"**Description:** {notes_text}")
-                            if work_notes_text:
-                                col_text.markdown(f"**Work Notes:** {work_notes_text}")
-                            if public_msg:
-                                col_text.markdown(f"**Public Message:** <span style='color: #10B981;'>{public_msg}</span>", unsafe_allow_html=True)
-                            if version_info:
-                                col_text.caption(f"🏷️ Released as v{version_info}")
+                    for item in app_items:
+                        render_backlog_item(item, app, False)
 
-                            col_act.button(
-                                "✏️ Edit",
-                                key=f"edit_bl_{item['id']}",
-                                on_click=begin_backlog_edit,
-                                args=(item["id"], app, False),
-                            )
-
-                            if st.session_state["editing_backlog_id"] == item["id"]:
-                                render_edit_form(item, f"app_{item['id']}")
-
-                            st.divider()
-
-                with backlog_tabs[len(sorted_apps)]:
+                elif selected_backlog_section == "staged":
                     if staged_items:
                         staged_apps = sorted(
                             set(i.get("app_name") if i.get("app_name") else "unassigned" for i in staged_items),
@@ -1434,45 +1474,11 @@ if user_role == "developer":
                             st.markdown(f"### {staged_app_name}")
 
                             for item in staged_app_items:
-                                col_text, col_act = st.columns([5, 1])
-                                col_text.markdown(f"**{item.get('feature', 'Unnamed Feature')}**")
-                                col_text.caption(
-                                    f"Status: **{item.get('status', 'N/A')}** | "
-                                    f"Category: {item.get('category', 'N/A')} | Priority: {item.get('priority', 'N/A')}"
-                                )
-
-                                notes_text = item.get("notes", "").strip()
-                                work_notes_text = item.get("work_notes", "").strip()
-                                public_msg = item.get("public_message", "").strip()
-                                version_info = item.get("version", "")
-
-                                if notes_text:
-                                    col_text.markdown(f"**Description:** {notes_text}")
-                                if work_notes_text:
-                                    col_text.markdown(f"**Work Notes:** {work_notes_text}")
-                                if public_msg:
-                                    col_text.markdown(
-                                        f"**Public Message:** <span style='color: #10B981;'>{public_msg}</span>",
-                                        unsafe_allow_html=True
-                                    )
-                                if version_info:
-                                    col_text.caption(f"🏷️ Released as v{version_info}")
-
-                                col_act.button(
-                                    "✏️ Edit",
-                                    key=f"edit_staged_{item['id']}",
-                                    on_click=begin_backlog_edit,
-                                    args=(item["id"], staged_app, True),
-                                )
-
-                                if st.session_state["editing_backlog_id"] == item["id"]:
-                                    render_edit_form(item, f"staged_{item['id']}")
-
-                                st.divider()
+                                render_backlog_item(item, staged_app, True)
                     else:
                         st.caption("No staged items currently.")
 
-                with backlog_tabs[len(sorted_apps) + 1]:
+                else:
                     st.markdown("### 🚀 Release Management")
                     staged_count = len(staged_items)
 
