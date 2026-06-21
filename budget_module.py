@@ -829,7 +829,9 @@ def render_budget_module():
                 p_cat = p_item.get("category") or "Uncategorized"
                 priority_grouped.setdefault(p_cat, []).append(p_item)
 
-            category_tab_labels = ["🔴 Priority"] + [f"📁 {cat_name}" for cat_name in sorted_categories]
+            category_tab_labels = [f"🔴 Priority ({len(priority_projects)})"] + [
+                f"📁 {cat_name} ({len(grouped_active.get(cat_name, []))})" for cat_name in sorted_categories
+            ]
 
             category_tabs = st.tabs(category_tab_labels)
 
