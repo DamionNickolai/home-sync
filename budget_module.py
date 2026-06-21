@@ -662,175 +662,195 @@ def render_budget_module():
                         else:
                             st.error("Could not save project.")
 
-        # Group active projects by category with priority-1 callouts.
+        priority_projects = [p for p in active_projects if p.get("_priority", 99) == 1]
+        non_priority_projects = [p for p in active_projects if p.get("_priority", 99) != 1]
+
+        # Group non-priority active projects by category.
         grouped_active = {}
-        for item in active_projects:
+        for item in non_priority_projects:
             cat_key = item.get("category") or "Uncategorized"
             grouped_active.setdefault(cat_key, []).append(item)
 
         sorted_categories = sorted(grouped_active.keys())
-        if sorted_categories:
-            category_tab_labels = []
-            for cat_name in sorted_categories:
-                cat_projects = grouped_active.get(cat_name, [])
-                p1_count = sum(1 for p in cat_projects if p.get("_priority", 99) == 1)
-                category_tab_labels.append(f"📁 {cat_name} ({len(cat_projects)}) | 🔴 {p1_count}")
+        if priority_projects or sorted_categories:
+            def render_project_item(item):
+                project_id = item.get("id")
+                title = item.get("item") or "Unnamed Project"
+                category = item.get("category") or "Uncategorized"
+                priority = item.get("_priority", 99)
+                description = _clean_text(item.get("description"))
+                vendors = _clean_text(item.get("vendors"))
+                notes = _clean_text(item.get("notes"))
+                est_low = item.get("_est_low", 0)
+                est_high = item.get("_est_high", 0)
+                actual = item.get("_actual", 0)
+                budget_cap = est_high if est_high > 0 else est_low
+                remaining_balance = budget_cap - actual if budget_cap > 0 else None
+                has_vet_discount = bool(item.get("veteran_discount", False))
+
+                budget_status = "On Track"
+                if est_high > 0 and actual > est_high:
+                    budget_status = "Over Budget"
+                elif est_high > 0 and actual >= (est_high * 0.85):
+                    budget_status = "At Risk"
+
+                with st.container(border=True):
+                    left_col, right_col = st.columns([6, 1])
+                    left_col.markdown(f"**{title}**")
+                    left_col.caption(f"Priority: {priority} | Category: {category} | Status: {budget_status}")
+                    left_col.markdown(
+                        "Estimated: "
+                        f"<span style='color:#16A34A; font-weight:600;'>&#36;{est_low:,.2f}</span> - "
+                        f"<span style='color:#DC2626; font-weight:600;'>&#36;{est_high:,.2f}</span> | "
+                        f"Actual: {_format_money(actual)}",
+                        unsafe_allow_html=True,
+                    )
+                    if remaining_balance is not None:
+                        remaining_color = "#16A34A" if remaining_balance >= 0 else "#DC2626"
+                        left_col.markdown(
+                            f"**Remaining Budget:** <span style='color:{remaining_color}; font-weight:700;'>{_format_money(remaining_balance)}</span>",
+                            unsafe_allow_html=True,
+                        )
+
+                    if est_high > 0:
+                        left_col.progress(min(actual / est_high, 1.0))
+
+                    if description:
+                        left_col.markdown(f"**Description:** {description}")
+                    if vendors:
+                        left_col.markdown(f"**Vendors:** {vendors}")
+                    if notes and notes != COMPLETED_TAG:
+                        left_col.markdown(f"**Notes:** {notes.replace(COMPLETED_TAG, '').strip()}")
+                    if has_vet_discount:
+                        left_col.caption("Eligible for veteran discount.")
+
+                    if can_edit_projects:
+                        right_col.button(
+                            "✏️ Edit",
+                            key=f"edit_project_budget_{project_id}",
+                            width="stretch",
+                            on_click=_toggle_project_edit,
+                            args=(project_id,),
+                        )
+
+                if can_edit_projects and st.session_state.get("editing_project_budget_id") == project_id:
+                    with st.container(border=True):
+                        st.markdown("### ✏️ Edit Project")
+                        with st.form(f"edit_project_budget_form_{project_id}"):
+                            e1, e2, e3 = st.columns([2, 1, 1])
+                            e_item = e1.text_input("Project Name *", value=title)
+                            safe_category = category if category in PROJECT_CATEGORIES else "Home Improvement"
+                            e_category = e2.selectbox(
+                                "Category",
+                                PROJECT_CATEGORIES,
+                                index=PROJECT_CATEGORIES.index(safe_category),
+                                key=f"edit_cat_{project_id}",
+                            )
+                            e_priority = e3.number_input("Priority", min_value=1, step=1, value=max(priority, 1))
+
+                            e_description = st.text_area("Description", value=description)
+
+                            eb1, eb2, eb3 = st.columns(3)
+                            e_est_low_raw = eb1.text_input(
+                                "Est. Low ($)",
+                                value=_format_currency_for_input(est_low),
+                                placeholder="Enter amount",
+                                key=f"edit_est_low_{project_id}",
+                            )
+                            e_est_high_raw = eb2.text_input(
+                                "Est. High ($)",
+                                value=_format_currency_for_input(est_high),
+                                placeholder="Enter amount",
+                                key=f"edit_est_high_{project_id}",
+                            )
+                            e_actual_raw = eb3.text_input(
+                                "Actual Spent ($)",
+                                value=_format_currency_for_input(actual),
+                                placeholder="Enter amount",
+                                key=f"edit_actual_{project_id}",
+                            )
+
+                            if budget_cap > 0:
+                                remaining_preview = budget_cap - _to_number(e_actual_raw if _clean_text(e_actual_raw) else actual, 0)
+                                preview_color = "#16A34A" if remaining_preview >= 0 else "#DC2626"
+                                st.markdown(
+                                    f"**Remaining Budget:** <span style='color:{preview_color}; font-weight:700;'>{_format_money(remaining_preview)}</span>",
+                                    unsafe_allow_html=True,
+                                )
+
+                            en1, en2 = st.columns(2)
+                            e_vendors = en1.text_input("Vendors", value=vendors)
+                            e_vet_discount = en2.checkbox("Veteran Discount", value=has_vet_discount)
+                            cleaned_edit_notes = notes.replace(COMPLETED_TAG, "").strip()
+                            e_notes = st.text_area("Notes", value=cleaned_edit_notes)
+
+                            save_col, complete_col, cancel_col = st.columns([2, 2, 1])
+                            save_clicked = save_col.form_submit_button("💾 Save", type="primary", width="stretch")
+                            complete_clicked = complete_col.form_submit_button("✅ Complete Project", width="stretch")
+                            cancel_clicked = cancel_col.form_submit_button("❌ Cancel", width="stretch")
+
+                        if save_clicked or complete_clicked:
+                            parsed_low = _parse_currency_input(e_est_low_raw)
+                            parsed_high = _parse_currency_input(e_est_high_raw)
+                            parsed_actual = _parse_currency_input(e_actual_raw)
+
+                            if not e_item.strip():
+                                st.warning("Project Name is required.")
+                            elif "invalid" in [parsed_low, parsed_high, parsed_actual]:
+                                st.warning("Est. Low, Est. High, and Actual Spent must be valid numbers.")
+                            else:
+                                update_payload = {
+                                    "item": e_item.strip(),
+                                    "category": e_category,
+                                    "priority": int(e_priority),
+                                    "description": _clean_text(e_description) or None,
+                                    "est_low_cost": float(parsed_low) if parsed_low is not None else float(est_low),
+                                    "est_high_cost": float(parsed_high) if parsed_high is not None else float(est_high),
+                                    "actual_cost": float(parsed_actual) if parsed_actual is not None else float(actual),
+                                    "veteran_discount": bool(e_vet_discount),
+                                    "vendors": _clean_text(e_vendors) or None,
+                                    "notes": _mark_completed_notes(e_notes) if complete_clicked else (_clean_text(e_notes) or None),
+                                }
+                                if update_project_budget_item(project_id, update_payload):
+                                    st.session_state["editing_project_budget_id"] = None
+                                    st.success("Project completed and moved out of active totals." if complete_clicked else "Project updated.")
+                                    st.rerun()
+                                else:
+                                    st.error("Could not update project.")
+
+                        if cancel_clicked:
+                            st.session_state["editing_project_budget_id"] = None
+                            st.rerun()
+
+            priority_projects.sort(key=lambda x: (str(x.get("category") or "Uncategorized").lower(), -x.get("_est_high", 0), str(x.get("item", "")).lower()))
+
+            priority_grouped = {}
+            for p_item in priority_projects:
+                p_cat = p_item.get("category") or "Uncategorized"
+                priority_grouped.setdefault(p_cat, []).append(p_item)
+
+            category_tab_labels = ["🔴 Priority"] + [f"📁 {cat_name}" for cat_name in sorted_categories]
 
             category_tabs = st.tabs(category_tab_labels)
+
+            with category_tabs[0]:
+                if not priority_projects:
+                    st.caption("No priority 1 projects right now.")
+                else:
+                    for p_cat in sorted(priority_grouped.keys()):
+                        st.markdown(f"#### {p_cat}")
+                        cat_items = priority_grouped.get(p_cat, [])
+                        cat_items.sort(key=lambda x: (-x.get("_est_high", 0), str(x.get("item", "")).lower()))
+                        for item in cat_items:
+                            render_project_item(item)
 
             for idx, cat_name in enumerate(sorted_categories):
                 cat_projects = grouped_active.get(cat_name, [])
                 cat_projects.sort(key=lambda x: (x.get("_priority", 99), -x.get("_est_high", 0), str(x.get("item", "")).lower()))
 
-                with category_tabs[idx]:
+                with category_tabs[idx + 1]:
                     for item in cat_projects:
-                        project_id = item.get("id")
-                        title = item.get("item") or "Unnamed Project"
-                        category = item.get("category") or "Uncategorized"
-                        priority = item.get("_priority", 99)
-                        description = _clean_text(item.get("description"))
-                        vendors = _clean_text(item.get("vendors"))
-                        notes = _clean_text(item.get("notes"))
-                        est_low = item.get("_est_low", 0)
-                        est_high = item.get("_est_high", 0)
-                        actual = item.get("_actual", 0)
-                        budget_cap = est_high if est_high > 0 else est_low
-                        remaining_balance = budget_cap - actual if budget_cap > 0 else None
-                        has_vet_discount = bool(item.get("veteran_discount", False))
-
-                        budget_status = "On Track"
-                        if est_high > 0 and actual > est_high:
-                            budget_status = "Over Budget"
-                        elif est_high > 0 and actual >= (est_high * 0.85):
-                            budget_status = "At Risk"
-
-                        with st.container(border=True):
-                            left_col, right_col = st.columns([6, 1])
-                            left_col.markdown(f"**{title}**")
-                            left_col.caption(f"Priority: {priority} | Category: {category} | Status: {budget_status}")
-                            left_col.markdown(
-                                "Estimated: "
-                                f"<span style='color:#16A34A; font-weight:600;'>&#36;{est_low:,.2f}</span> - "
-                                f"<span style='color:#DC2626; font-weight:600;'>&#36;{est_high:,.2f}</span> | "
-                                f"Actual: {_format_money(actual)}",
-                                unsafe_allow_html=True,
-                            )
-                            if remaining_balance is not None:
-                                remaining_color = "#16A34A" if remaining_balance >= 0 else "#DC2626"
-                                left_col.markdown(
-                                    f"**Remaining Budget:** <span style='color:{remaining_color}; font-weight:700;'>{_format_money(remaining_balance)}</span>",
-                                    unsafe_allow_html=True,
-                                )
-
-                            if est_high > 0:
-                                left_col.progress(min(actual / est_high, 1.0))
-
-                            if description:
-                                left_col.markdown(f"**Description:** {description}")
-                            if vendors:
-                                left_col.markdown(f"**Vendors:** {vendors}")
-                            if notes and notes != COMPLETED_TAG:
-                                left_col.markdown(f"**Notes:** {notes.replace(COMPLETED_TAG, '').strip()}")
-                            if has_vet_discount:
-                                left_col.caption("Eligible for veteran discount.")
-
-                            if can_edit_projects:
-                                right_col.button(
-                                    "✏️ Edit",
-                                    key=f"edit_project_budget_{project_id}",
-                                    width="stretch",
-                                    on_click=_toggle_project_edit,
-                                    args=(project_id,),
-                                )
-
-                        if can_edit_projects and st.session_state.get("editing_project_budget_id") == project_id:
-                            with st.container(border=True):
-                                st.markdown("### ✏️ Edit Project")
-                                with st.form(f"edit_project_budget_form_{project_id}"):
-                                    e1, e2, e3 = st.columns([2, 1, 1])
-                                    e_item = e1.text_input("Project Name *", value=title)
-                                    safe_category = category if category in PROJECT_CATEGORIES else "Home Improvement"
-                                    e_category = e2.selectbox(
-                                        "Category",
-                                        PROJECT_CATEGORIES,
-                                        index=PROJECT_CATEGORIES.index(safe_category),
-                                        key=f"edit_cat_{project_id}",
-                                    )
-                                    e_priority = e3.number_input("Priority", min_value=1, step=1, value=max(priority, 1))
-
-                                    e_description = st.text_area("Description", value=description)
-
-                                    eb1, eb2, eb3 = st.columns(3)
-                                    e_est_low_raw = eb1.text_input(
-                                        "Est. Low ($)",
-                                        value=_format_currency_for_input(est_low),
-                                        placeholder="Enter amount",
-                                        key=f"edit_est_low_{project_id}",
-                                    )
-                                    e_est_high_raw = eb2.text_input(
-                                        "Est. High ($)",
-                                        value=_format_currency_for_input(est_high),
-                                        placeholder="Enter amount",
-                                        key=f"edit_est_high_{project_id}",
-                                    )
-                                    e_actual_raw = eb3.text_input(
-                                        "Actual Spent ($)",
-                                        value=_format_currency_for_input(actual),
-                                        placeholder="Enter amount",
-                                        key=f"edit_actual_{project_id}",
-                                    )
-
-                                    if budget_cap > 0:
-                                        remaining_preview = budget_cap - _to_number(e_actual_raw if _clean_text(e_actual_raw) else actual, 0)
-                                        preview_color = "#16A34A" if remaining_preview >= 0 else "#DC2626"
-                                        st.markdown(
-                                            f"**Remaining Budget:** <span style='color:{preview_color}; font-weight:700;'>{_format_money(remaining_preview)}</span>",
-                                            unsafe_allow_html=True,
-                                        )
-
-                                    en1, en2 = st.columns(2)
-                                    e_vendors = en1.text_input("Vendors", value=vendors)
-                                    e_vet_discount = en2.checkbox("Veteran Discount", value=has_vet_discount)
-                                    cleaned_edit_notes = notes.replace(COMPLETED_TAG, "").strip()
-                                    e_notes = st.text_area("Notes", value=cleaned_edit_notes)
-
-                                    save_col, complete_col, cancel_col = st.columns([2, 2, 1])
-                                    save_clicked = save_col.form_submit_button("💾 Save", type="primary", width="stretch")
-                                    complete_clicked = complete_col.form_submit_button("✅ Complete Project", width="stretch")
-                                    cancel_clicked = cancel_col.form_submit_button("❌ Cancel", width="stretch")
-
-                                if save_clicked or complete_clicked:
-                                    parsed_low = _parse_currency_input(e_est_low_raw)
-                                    parsed_high = _parse_currency_input(e_est_high_raw)
-                                    parsed_actual = _parse_currency_input(e_actual_raw)
-
-                                    if not e_item.strip():
-                                        st.warning("Project Name is required.")
-                                    elif "invalid" in [parsed_low, parsed_high, parsed_actual]:
-                                        st.warning("Est. Low, Est. High, and Actual Spent must be valid numbers.")
-                                    else:
-                                        update_payload = {
-                                            "item": e_item.strip(),
-                                            "category": e_category,
-                                            "priority": int(e_priority),
-                                            "description": _clean_text(e_description) or None,
-                                            "est_low_cost": float(parsed_low) if parsed_low is not None else float(est_low),
-                                            "est_high_cost": float(parsed_high) if parsed_high is not None else float(est_high),
-                                            "actual_cost": float(parsed_actual) if parsed_actual is not None else float(actual),
-                                            "veteran_discount": bool(e_vet_discount),
-                                            "vendors": _clean_text(e_vendors) or None,
-                                            "notes": _mark_completed_notes(e_notes) if complete_clicked else (_clean_text(e_notes) or None),
-                                        }
-                                        if update_project_budget_item(project_id, update_payload):
-                                            st.session_state["editing_project_budget_id"] = None
-                                            st.success("Project completed and moved out of active totals." if complete_clicked else "Project updated.")
-                                            st.rerun()
-                                        else:
-                                            st.error("Could not update project.")
-
-                                if cancel_clicked:
-                                    st.session_state["editing_project_budget_id"] = None
-                                    st.rerun()
+                        render_project_item(item)
 
     with completed_tab:
         st.caption("Completed items are excluded from active totals. Restore any project back to Active.")
