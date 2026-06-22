@@ -130,24 +130,24 @@
 *Objective: Lock down live health and coaching data.*
 
 ### `coach_chat_history`
-- [ ] Step 1: Execute Schema Update.
-- [ ] Step 2: Run Data Migration Script.
-- [ ] Step 3: Verify in app.
+- [x] Step 1: Execute Schema Update.
+- [x] Step 2: Run Data Migration Script.
+- [x] Step 3: Verify in app.
 
 ### `garmin_metrics`
-- [ ] Step 1: Execute Schema Update.
-- [ ] Step 2: Run Data Migration Script.
-- [ ] Step 3: Verify in app.
+- [x] Step 1: Execute Schema Update.
+- [x] Step 2: Run Data Migration Script.
+- [x] Step 3: Verify in app.
 
 ### `history`
-- [ ] Step 1: Execute Schema Update.
-- [ ] Step 2: Run Data Migration Script.
-- [ ] Step 3: Verify production data loads cleanly.
+- [x] Step 1: Execute Schema Update.
+- [x] Step 2: Run Data Migration Script.
+- [x] Step 3: Verify production data loads cleanly.
 
 ### `gym_user_profiles`
-- [ ] Step 1: Execute Schema Update.
-- [ ] Step 2: Run Data Migration Script.
-- [ ] Step 3: Verify in app.
+- [x] Step 1: Execute Schema Update.
+- [x] Step 2: Run Data Migration Script.
+- [x] Step 3: Verify in app.
 
 ### 🎯 Full Ecosystem Production Smoke Test
 - [ ] Ensure seamless navigation between Home Sync and Get Fit Together apps.

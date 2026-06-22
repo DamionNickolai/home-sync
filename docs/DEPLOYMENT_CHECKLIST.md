@@ -20,7 +20,7 @@
       -- run full migration file migrations/004_create_app_release_ledger.sql
       ```
 
-- [ ] **Apply To-Do Metadata Migration**
+- [x] **Apply To-Do Metadata Migration**
    - Run migration `005_add_todo_metadata_and_recurrence.sql` against your Supabase database
    - This adds task metadata + recurrence fields used by the current To-Do UX
    - Command (via Supabase dashboard):
@@ -36,14 +36,14 @@
 ## Feature Testing Checklist
 
 ### To-Do UX (Current)
-- [ ] Full-width task cards render correctly (desktop + mobile)
-- [ ] Card tap toggles inline edit open/close
-- [ ] Notes display only when present
-- [ ] Notifications are informational-only and do not filter task list
-- [ ] Recurrence options include Daily and Every 6 Months
-- [ ] Complete action from edit form works and recurring rollover behaves correctly
-- [ ] No checkbox/bulk-complete UI remains in active task list
-- [ ] Reference detailed checklist: `docs/TODO_UX_CHECKLIST.md`
+- [x] Full-width task cards render correctly (desktop + mobile)
+- [x] Card tap toggles inline edit open/close
+- [x] Notes display only when present
+- [x] Notifications are informational-only and do not filter task list
+- [x] Recurrence options include Daily and Every 6 Months
+- [x] Complete action from edit form works and recurring rollover behaves correctly
+- [x] No checkbox/bulk-complete UI remains in active task list
+- [x] Reference detailed checklist: `docs/TODO_UX_CHECKLIST.md`
 
 ### Add New Ticket Form
 - [x] All field labels appear correctly (Feature, Description, Work Notes)
@@ -101,34 +101,34 @@ Test with different category combinations in Staged items:
 
 ## Post-Deployment
 
-- [ ] Test production (environment: "production")
-- [ ] Create first test release with a backlog item
-- [ ] Verify version appears in Done items
-- [ ] Document new workflow for team
+- [x] Test production (environment: "production")
+- [x] Create first test release with a backlog item
+- [x] Verify version appears in Done items
+- [x] Document new workflow for team
 
 ## Cross app changes testing
 
-- [ ] Create three staged backlog items in Home Sync:
+- [x] Create three staged backlog items in Home Sync:
    - one with `app_name = home_sync`
    - one with `app_name = get_fit`
    - one with `app_name = Global`
-- [ ] Add a `public_message` to each staged item so release notes can render user-facing text.
-- [ ] In Home Sync Release Management, confirm Current -> Next previews update correctly for both apps.
-- [ ] Cut `Home Sync` release only:
+- [x] Add a `public_message` to each staged item so release notes can render user-facing text.
+- [x] In Home Sync Release Management, confirm Current -> Next previews update correctly for both apps.
+- [x] Cut `Home Sync` release only:
    - verify only Home Sync-targeted staged items are moved to Done
    - verify `app_release_ledger` gets a new `home_sync` row only
-- [ ] Cut `Get Fit Together` release only:
+- [x] Cut `Get Fit Together` release only:
    - verify only Get Fit-targeted staged items are moved to Done
    - verify `app_release_ledger` gets a new `get_fit` row only
-- [ ] Cut `All Apps` release with at least one Global staged item:
+- [x] Cut `All Apps` release with at least one Global staged item:
    - verify Global items are moved to Done
    - verify both `home_sync` and `get_fit` ledger rows are written
-- [ ] Validate release notes feed in Get Fit Together:
+- [x] Validate release notes feed in Get Fit Together:
    - newest 3 versions appear directly
    - older versions appear only in closed expander
    - Global items are visible and labeled in the release feed
-- [ ] Validate Home Sync backlog view still shows Global/app grouping and inline editing behavior.
-- [ ] Run a final DB sanity check:
+- [x] Validate Home Sync backlog view still shows Global/app grouping and inline editing behavior.
+- [x] Run a final DB sanity check:
    - `backlog` has no unintended staged leftovers
    - `app_release_ledger` latest versions match expected values for both apps
 
