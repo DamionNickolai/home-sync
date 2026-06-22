@@ -44,7 +44,16 @@ def get_active_tasks():
         
         # 🟢 NEW: Added the .eq("household_id", house_id) filter!
         response = supabase.table(TASK_TABLE).select("*").eq("is_completed", False).eq("household_id", house_id).execute()
-        return response.data
+        data = response.data
+        
+        # 🟢 DECRYPT DATA BEFORE SENDING TO UI
+        if data:
+            for row in data:
+                row["task_name"] = decrypt_text(row.get("task_name"))
+                row["notes"] = decrypt_text(row.get("notes"))
+                row["description"] = decrypt_text(row.get("description"))
+                
+        return data
     except Exception as e:
         print(f"Error fetching tasks: {e}")
         return []
@@ -55,7 +64,16 @@ def get_completed_tasks():
         
         # 🟢 NEW: Added the .eq("household_id", house_id) filter!
         response = supabase.table(TASK_TABLE).select("*").eq("is_completed", True).eq("household_id", house_id).order("created_at", desc=True).limit(50).execute()
-        return response.data
+        data = response.data
+        
+        # 🟢 DECRYPT DATA BEFORE SENDING TO UI
+        if data:
+            for row in data:
+                row["task_name"] = decrypt_text(row.get("task_name"))
+                row["notes"] = decrypt_text(row.get("notes"))
+                row["description"] = decrypt_text(row.get("description"))
+                
+        return data
     except Exception as e:
         print(f"Error fetching completed tasks: {e}")
         return []
@@ -96,8 +114,6 @@ def add_new_task(task_name, category, priority, assigned_to, target_date, notes=
         house_id = get_current_household_id()
         
         data = {
-            "task_name": task_name,
-            "notes": notes or None,
             "category": category,
             "priority": priority,
             "assigned_to": assigned_to,
@@ -105,7 +121,11 @@ def add_new_task(task_name, category, priority, assigned_to, target_date, notes=
             "is_recurring": bool(is_recurring),
             "recurrence_pattern": recurrence_pattern if is_recurring else None,
             "is_completed": False,
-            "household_id": house_id  # 🟢 NEW: Stamp the task with the family's ID!
+            "household_id": house_id,  # 🟢 NEW: Stamp the task with the family's ID!
+            
+            # 🟢 ENCRYPT SENSITIVE STRINGS
+            "task_name": encrypt_data(task_name),
+            "notes": encrypt_data(notes) if notes else None
         }
         supabase.table(TASK_TABLE).insert(data).execute()
         return True
@@ -144,6 +164,8 @@ def batch_update_tasks(task_ids, new_status):
                 if not next_target:
                     continue
 
+                # The fetched task_name and notes are ALREADY encrypted ciphertext here, 
+                # so inserting them directly safely preserves the encryption!
                 next_task = {
                     "task_name": task.get("task_name"),
                     "notes": task.get("notes"),
@@ -167,10 +189,13 @@ def update_task(task_id, task_name=None, notes=None, category=None, priority=Non
     try:
         house_id = get_current_household_id()
         update_data = {}
+        
+        # 🟢 ENCRYPT SENSITIVE STRINGS IF PROVIDED
         if task_name is not None:
-            update_data["task_name"] = task_name
+            update_data["task_name"] = encrypt_data(task_name)
         if notes is not None:
-            update_data["notes"] = notes or None
+            update_data["notes"] = encrypt_data(notes) if notes else None
+            
         if category is not None:
             update_data["category"] = category
         if priority is not None:
@@ -802,7 +827,7 @@ def restore_wish_list_item(item_id: str):
 
 
 def get_household_finance_settings():
-    """Fetches finance settings for the active household."""
+    """Fetches and decrypts finance settings for the active household."""
     try:
         house_id = get_current_household_id()
         response = (
@@ -814,7 +839,10 @@ def get_household_finance_settings():
             .execute()
         )
         if response.data:
-            return response.data[0]
+            data = response.data[0]
+            # 🟢 DECRYPT DOLLAR VALUE
+            data["projects_funds"] = decrypt_float(data.get("projects_funds"))
+            return data
         return {}
     except Exception as e:
         print(f"Error fetching household finance settings: {e}")
@@ -822,17 +850,24 @@ def get_household_finance_settings():
 
 
 def update_household_projects_funds(projects_funds, projects_funds_year=None):
-    """Upserts projects_funds for the active household."""
+    """Encrypts and upserts projects_funds for the active household."""
     try:
         if not _can_edit_projects_server_side():
             return False
         house_id = get_current_household_id()
+        
         payload = {
             "household_id": house_id,
-            "projects_funds": projects_funds,
             "projects_funds_year": projects_funds_year,
             "updated_at": datetime.now(ZoneInfo("America/Chicago")).isoformat(),
         }
+        
+        # 🟢 ENCRYPT DOLLAR VALUE IF IT EXISTS
+        if projects_funds is not None:
+            payload["projects_funds"] = encrypt_data(projects_funds)
+        else:
+            payload["projects_funds"] = None
+            
         (
             supabase
             .table(HOUSEHOLD_FINANCE_SETTINGS_TABLE)
