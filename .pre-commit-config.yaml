@@ -1,0 +1,11 @@
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.0
+    hooks:
+      - id: gitleaks
+        name: gitleaks
+        description: Detect secrets with gitleaks
+        entry: gitleaks protect --verbose --redact
+        language: golang
+        stages: [commit]
+        pass_filenames: false
