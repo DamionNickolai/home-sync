@@ -59,5 +59,9 @@ ENTER VIRTUAL ENV:
 RUN DATABASE MIGRATIONS:
 python maintenance/migrate_projects.py
 
+BACKFILL ENCRYPTED SESSION TOKENS:
+.\venv\Scripts\python.exe maintenance/migrate_user_sessions_refresh_tokens.py
+.\venv\Scripts\python.exe maintenance/migrate_user_sessions_refresh_tokens.py --apply
+
 RUN APP:
 python -m streamlit run home_sync.py

@@ -4,7 +4,7 @@
 CREATE TABLE IF NOT EXISTS public.user_sessions (
     session_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     auth_user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
-    refresh_token TEXT NOT NULL,
+    refresh_token TEXT,
     device_fingerprint TEXT NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     last_accessed_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,

@@ -2,6 +2,7 @@ import importlib
 import sys
 import types
 import unittest
+from datetime import datetime, timezone
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -157,6 +158,54 @@ class AuthRegressionTests(unittest.TestCase):
         auth.clear_auth_session()
 
         self.assertEqual(auth.st.session_state, {})
+
+    def test_create_user_session_encrypts_refresh_token(self):
+        query = QueryStub([])
+        supabase = MagicMock()
+        supabase.table.return_value = query
+
+        now = datetime(2026, 6, 21, 10, 0, tzinfo=timezone.utc)
+
+        with patch.object(auth, "encrypt_data", return_value="encrypted-token"), \
+             patch.object(auth, "get_device_fingerprint", return_value="fingerprint-1"), \
+             patch.object(auth, "app_now", return_value=now):
+            session_id = auth.create_user_session(supabase, "auth-user-1", "plain-token")
+
+        self.assertIsNotNone(session_id)
+        self.assertEqual(query.insert_payload["refresh_token"], "encrypted-token")
+
+    def test_get_session_from_database_decrypts_refresh_token(self):
+        query = QueryStub([
+            {
+                "session_id": "session-1",
+                "refresh_token": "encrypted-token",
+                "is_active": True,
+                "expires_at": "2026-06-22T10:00:00+00:00",
+            }
+        ])
+        supabase = MagicMock()
+        supabase.table.return_value = query
+
+        now = datetime(2026, 6, 21, 10, 0, tzinfo=timezone.utc)
+
+        with patch.object(auth, "decrypt_text", return_value="plain-token"), \
+             patch.object(auth, "app_now", return_value=now):
+            result = auth.get_session_from_database(supabase, "session-1")
+
+        self.assertEqual(result["refresh_token"], "plain-token")
+
+    def test_update_session_refresh_token_encrypts_refresh_token(self):
+        query = QueryStub([])
+        supabase = MagicMock()
+        supabase.table.return_value = query
+
+        now = datetime(2026, 6, 21, 10, 0, tzinfo=timezone.utc)
+
+        with patch.object(auth, "encrypt_data", return_value="encrypted-token"), \
+             patch.object(auth, "app_now", return_value=now):
+            auth.update_session_refresh_token(supabase, "session-1", "plain-token")
+
+        self.assertEqual(query.update_payload["refresh_token"], "encrypted-token")
 
 
 class DatabaseRegressionTests(unittest.TestCase):
