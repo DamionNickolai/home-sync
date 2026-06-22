@@ -63,5 +63,8 @@ BACKFILL ENCRYPTED SESSION TOKENS:
 .\venv\Scripts\python.exe maintenance/migrate_user_sessions_refresh_tokens.py
 .\venv\Scripts\python.exe maintenance/migrate_user_sessions_refresh_tokens.py --apply
 
+ENCRYPTION KEY NOTE:
+Home Sync and Get Fit Together must use the same ENCRYPTION_KEY in production because they share the user_sessions table.
+
 RUN APP:
 python -m streamlit run home_sync.py
