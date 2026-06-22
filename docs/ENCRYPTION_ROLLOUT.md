@@ -85,49 +85,44 @@
 *Objective: Extend the security engine into the fitness module.*
 
 ### Engine Integration
-- [ ] Step 1: Verify `security.py` imports correctly into Get Fit Together Python files.
-- [ ] Step 2: Add dynamic routing for GFT tables (e.g., `GARMIN_TABLE = garmin_metrics_dev if local...`).
+- [x] Step 1: Verify `security.py` imports correctly into Get Fit Together Python files.
+- [x] Step 2: Add dynamic routing for GFT tables (e.g., `GARMIN_TABLE = garmin_metrics_dev if local...`).
 
 ### `coach_chat_history_dev`
 **3-Step Verification**
-- [ ] Step 1: Run SQL Schema Audit.
-- [ ] Step 2: Classify columns (Likely sensitive: `message_body`, `coach_notes`).
-- [ ] Step 3: Cross-check against GFT database functions.
+- [x] Step 1: Run SQL Schema Audit.
+- [x] Step 2: Classify columns (Likely sensitive: `message_body`, `coach_notes`).
+- [x] Step 3: Cross-check against GFT database functions.
 **Encryption Implementation**
-- [ ] Step 1: Execute Schema Update.
-- [ ] Step 2: Run Data Migration Script.
-- [ ] Step 3: Code Injection.
-- [ ] Step 4: Local UI Test (Send a chat message, verify encryption).
-
+- [x] Step 1: Execute Schema Update.
+- [x] Step 2: Run Data Migration Script.
+- [x] Step 3: Code Injection.
+- [x] Step 4: Local UI Test (Send a chat message, verify encryption).
 ### `garmin_metrics_dev`
 **3-Step Verification**
-- [ ] Step 1: Run SQL Schema Audit.
-- [ ] Step 2: Classify columns (Likely sensitive: `weight`, `sleep_score`, `stress_level`).
-- [ ] Step 3: Cross-check against GFT database functions.
+- [x] Step 1: Run SQL Schema Audit.
+- [x] Step 2: Classify columns (Likely sensitive: `weight`, `sleep_score`, `stress_level`).
+- [x] Step 3: Cross-check against GFT database functions.
 **Encryption Implementation**
-- [ ] Step 1: Execute Schema Update (Convert health numerics to `TEXT`).
-- [ ] Step 2: Run Data Migration Script.
-- [ ] Step 3: Code Injection.
-- [ ] Step 4: Local UI Test (Check Garmin dashboard rendering and math).
+- [x] Step 1: Execute Schema Update (Convert health numerics to `TEXT`).
+- [x] Step 2: Run Data Migration Script.
+- [x] Step 3: Code Injection.
+- [x] Step 4: Local UI Test (Check Garmin dashboard rendering and math).
 
 ### `history_dev`
 **3-Step Verification**
-- [ ] Step 1: Run SQL Schema Audit.
-- [ ] Step 2: Classify columns.
-- [ ] Step 3: Cross-check Bucket C against Python logs.
+- [x] Step 1: Run SQL Schema Audit.
+- [x] Step 2: Classify columns.
+- [x] Step 3: Cross-check Bucket C against Python logs.
 **Encryption Implementation**
-- [ ] Step 1: Execute Schema Update.
-- [ ] Step 2: Run Data Migration Script.
-- [ ] Step 3: Code Injection.
-- [ ] Step 4: Local UI Test.
-
-### `gym_user_profiles_dev` *(If applicable)*
-- [ ] Execute standard 3-Step Verification.
-- [ ] Execute standard Encryption Implementation.
+- [x] Step 1: Execute Schema Update.
+- [x] Step 2: Run Data Migration Script.
+- [x] Step 3: Code Injection.
+- [x] Step 4: Local UI Test.
 
 ### 🚦 GFT Final Dev Validation
-- [ ] Check math on Garmin metrics (ensure Pandas handles the decrypted string-to-float conversions correctly).
-- [ ] Verify coach chat history loads chronologically without breaking.
+- [x] Check math on Garmin metrics (ensure Pandas handles the decrypted string-to-float conversions correctly).
+- [x] Verify coach chat history loads chronologically without breaking.
 
 ---
 
