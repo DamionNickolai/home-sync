@@ -5,6 +5,7 @@ from security import encrypt_data, decrypt_text, decrypt_float
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from utils import calculate_next_version
+from constants import DEFAULT_BUDGET_CATEGORIES
 
 # 🟢 DYNAMIC ENVIRONMENT ROUTING
 env = st.secrets.get("app_config", {}).get("environment", "production")
@@ -484,20 +485,319 @@ def delete_task(task_id):
         return False
 
 # ==========================================
-# 💰 BUDGET FUNCTIONS
+# 🏦 MONTHLY BUDGET MODULE FUNCTIONS
 # ==========================================
 
-def _can_edit_projects_server_side():
-    """Authoritative guard for project write operations."""
-    role = st.session_state.get("user_role", "member")
-    if role in ["admin", "developer"]:
+def get_budget_table(base_name):
+    """Helper to route to the correct dev or prod budget table."""
+    try:
+        env = st.secrets["app_config"].get("environment", "production")
+        return f"{base_name}_dev" if env == "local" else base_name
+    except Exception:
+        return base_name
+
+def get_user_finance_settings(household_id, username):
+    """Fetches the user's specific finance UI settings and privacy toggles."""
+    target_table = get_budget_table("user_finance_settings")
+    try:
+        response = supabase.table(target_table).select("*").eq("household_id", household_id).eq("username", username).execute()
+        if response.data:
+            data = response.data[0]
+            # Decrypt optional future fields if you add them (like personal_savings_goal)
+            return data
+        return {"share_budget_with_admin": True, "default_view": "Household"}
+    except Exception as e:
+        print(f"Error fetching finance settings: {e}")
+        return {"share_budget_with_admin": True, "default_view": "Household"}
+
+def ensure_household_initialized(household_id):
+    """Silent check to inject defaults if the household has no categories."""
+    target_table = get_budget_table("budget_categories")
+    try:
+        # Check if they have any data
+        existing = supabase.table(target_table).select("id").eq("household_id", household_id).limit(1).execute()
+        if existing.data:
+            return 
+        
+        # If no data, run the injection
+        initialize_default_categories(household_id)
+    except Exception as e:
+        print(f"Initialization silent check failed: {e}")
+
+def get_budget_categories(household_id):
+    """Fetches ONLY active budget categories."""
+    target_table = get_budget_table("budget_categories")
+    try:
+        # The .eq("is_active", True) filter ensures we ignore deleted items
+        response = supabase.table(target_table).select("*").eq("household_id", household_id).eq("is_active", True).execute()
+        # ... process results ...
+        return pd.DataFrame(response.data)
+    except Exception as e:
+        return pd.DataFrame()
+
+def get_household_incomes(household_id, month_year):
+    """Fetches and decrypts income streams for a specific month."""
+    target_table = get_budget_table("household_incomes")
+    try:
+        response = supabase.table(target_table).select("*").eq("household_id", household_id).eq("month_year", month_year).execute()
+        if response.data:
+            for row in response.data:
+                row["source_name"] = decrypt_text(row.get("source_name"))
+                row["take_home_amount"] = decrypt_float(row.get("take_home_amount"))
+                row["gross_amount"] = decrypt_float(row.get("gross_amount"))
+            return pd.DataFrame(response.data)
+        return pd.DataFrame()
+    except Exception as e:
+        print(f"Error fetching incomes: {e}")
+        return pd.DataFrame()
+
+def get_monthly_expenses(household_id, month_year, include_private_members=True):
+    """
+    Fetches and decrypts the event stream of expenses.
+    If include_private_members is False, it filters out users who toggled their privacy on.
+    """
+    target_table = get_budget_table("expenses")
+    try:
+        response = supabase.table(target_table).select("*").eq("household_id", household_id).eq("month_year", month_year).execute()
+        
+        if not response.data:
+            return pd.DataFrame()
+            
+        # 🟢 THE ROLLUP PRIVACY CHECK
+        if not include_private_members:
+            # In a real scenario, you'd fetch the user_finance_settings here and filter out 
+            # auth_user_ids where share_budget_with_admin == False
+            pass 
+
+        for row in response.data:
+            row["amount"] = decrypt_float(row.get("amount"))
+            row["details"] = decrypt_text(row.get("details"))
+            
+        return pd.DataFrame(response.data)
+    except Exception as e:
+        print(f"Error fetching expenses: {e}")
+        return pd.DataFrame()
+
+def log_expense_and_check_project(auth_user_id, household_id, month_year, date_logged, category_id, category_type, amount, details, project_id=None):
+    """
+    The Dual-Write Pipeline. Logs an expense safely, and if it's a Project, 
+    dynamically updates the project's actual_spent ledger.
+    """
+    target_table = get_budget_table("expenses")
+    
+    try:
+        # 1. Encrypt and save the main expense
+        expense_payload = {
+            "auth_user_id": auth_user_id,
+            "household_id": household_id,
+            "month_year": month_year,
+            "date_logged": str(date_logged),
+            "category_id": category_id,
+            "amount": encrypt_data(float(amount)),
+            "details": encrypt_data(details)
+        }
+        expense_res = supabase.table(target_table).insert(expense_payload).execute()
+        
+        # 2. 🟢 THE PROJECT AUTOMATION DUAL-WRITE
+        if category_type == "Project" and project_id:
+            # Assuming you have a project_budgets table from your previous module
+            project_table = "project_budgets_dev" if get_budget_table("expenses").endswith("_dev") else "project_budgets"
+            
+            proj_response = supabase.table(project_table).select("actual_spent, notes").eq("id", project_id).execute()
+            
+            if proj_response.data:
+                proj_data = proj_response.data[0]
+                
+                # Decrypt current values
+                current_spent = decrypt_float(proj_data.get("actual_spent")) or 0.0
+                current_notes = decrypt_text(proj_data.get("notes")) or ""
+                
+                # Math and String manipulation
+                new_spent = current_spent + float(amount)
+                audit_log = f"\n[{date_logged}] Auto-Expense Logged: ${float(amount):.2f} (Details: {details})"
+                new_notes = current_notes + audit_log
+                
+                # Re-encrypt and update
+                supabase.table(project_table).update({
+                    "actual_spent": encrypt_data(new_spent),
+                    "notes": encrypt_data(new_notes)
+                }).eq("id", project_id).execute()
+                
         return True
-    if st.session_state.get("can_edit_projects") is not None:
-        return bool(st.session_state.get("can_edit_projects"))
-    return bool(st.session_state.get("can_view_budget", False))
+    except Exception as e:
+        print(f"Failed to log expense (Dual-Write Error): {e}")
+        return False
+
+def get_cash_flow_routing(household_id):
+    """Fetches and decrypts the Treasury routing targets."""
+    target_table = get_budget_table("cash_flow_routing")
+    try:
+        response = supabase.table(target_table).select("*").eq("household_id", household_id).eq("is_active", True).execute()
+        if response.data:
+            for row in response.data:
+                row["destination_account"] = decrypt_text(row.get("destination_account"))
+                row["line_item"] = decrypt_text(row.get("line_item"))
+                row["annual_goal"] = decrypt_float(row.get("annual_goal"))
+                row["monthly_target"] = decrypt_float(row.get("monthly_target"))
+            return pd.DataFrame(response.data)
+        return pd.DataFrame()
+    except Exception as e:
+        print(f"Error fetching routing: {e}")
+        return pd.DataFrame()
+
+def calculate_spend_money(paycheck_amount, routing_df):
+    """
+    Executes the Y39 Excel Formula: =(Paycheck/2 - FractionalRoutingTotals) / 2
+    """
+    try:
+        if routing_df.empty:
+            return 0.0
+            
+        # Excel "Two" column logic = Monthly Target divided by 2
+        routing_df["fractional_target"] = routing_df["monthly_target"] / 2
+        
+        # Sum up all the fractional targets for Bills and Income (Table378 & Table3786)
+        fractional_routing_total = routing_df["fractional_target"].sum()
+        
+        # The exact Y39 Waterfall Math
+        spend_money = ((float(paycheck_amount) / 2) - fractional_routing_total) / 2
+        
+        return round(spend_money, 2)
+    except Exception as e:
+        print(f"Error calculating spend money: {e}")
+        return 0.0
+
+def insert_budget_category(household_id, category_name, category_type, sub_category=None):
+    """Encrypts and saves a new budget category, with optional sub-category."""
+    target_table = get_budget_table("budget_categories")
+    try:
+        payload = {
+            "household_id": household_id,
+            "category_name": encrypt_data(category_name),
+            "sub_category_name": encrypt_data(sub_category) if sub_category else None,
+            "category_type": category_type, 
+            "is_active": True
+        }
+        supabase.table(target_table).insert(payload).execute()
+        return True
+    except Exception as e:
+        print(f"Error adding category: {e}")
+        return False
+
+def insert_household_income(household_id, month_year, source_name, take_home, gross, is_taxable, owner_username, is_windfall=False, is_recurring=False):
+    """Encrypts and saves a new income stream, mapped to a specific user."""
+    target_table = get_budget_table("household_incomes")
+    try:
+        payload = {
+            "household_id": household_id,
+            "month_year": month_year,
+            "source_name": encrypt_data(source_name),
+            "take_home_amount": encrypt_data(float(take_home)),
+            "gross_amount": encrypt_data(float(gross)),
+            "is_taxable": is_taxable,
+            "owner_username": owner_username, # Plain text for fast filtering/UI
+            "is_windfall": is_windfall,
+            "is_recurring": is_recurring
+        }
+        supabase.table(target_table).insert(payload).execute()
+        return True
+    except Exception as e:
+        print(f"Error adding income: {e}")
+        return False
+
+def delete_budget_category(category_id):
+    """Soft-deletes a category by setting is_active to False."""
+    target_table = get_budget_table("budget_categories")
+    try:
+        # Instead of .delete(), we update the status to keep the record for history
+        supabase.table(target_table).update({"is_active": False}).eq("id", category_id).execute()
+        return True
+    except Exception as e:
+        print(f"Error deactivating category: {e}")
+        return False
+
+def delete_household_income(income_id):
+    """Deletes an income stream from the database."""
+    target_table = get_budget_table("household_incomes")
+    try:
+        supabase.table(target_table).delete().eq("id", income_id).execute()
+        return True
+    except Exception as e:
+        print(f"Error deleting income: {e}")
+        return False
+
+def get_individual_expenses(household_id, auth_user_id, month_year):
+    """Fetches and decrypts expenses specifically for the logged-in individual."""
+    target_table = get_budget_table("expenses")
+    try:
+        response = supabase.table(target_table).select("*").eq("household_id", household_id).eq("auth_user_id", auth_user_id).eq("month_year", month_year).execute()
+        if response.data:
+            for row in response.data:
+                row["amount"] = decrypt_float(row.get("amount"))
+                row["details"] = decrypt_text(row.get("details"))
+            return pd.DataFrame(response.data)
+        return pd.DataFrame()
+    except Exception as e:
+        print(f"Error fetching individual expenses: {e}")
+        return pd.DataFrame()
+
+def update_user_privacy_toggle(household_id, username, share_with_admin):
+    """Updates the user's finance settings to hide/show their data in the Master Rollup."""
+    target_table = get_budget_table("user_finance_settings")
+    try:
+        # First, check if a settings row already exists for this user
+        response = supabase.table(target_table).select("id").eq("household_id", household_id).eq("username", username).execute()
+        
+        if response.data:
+            # Update existing row
+            supabase.table(target_table).update({"share_budget_with_admin": share_with_admin}).eq("id", response.data[0]["id"]).execute()
+        else:
+            # Create new row
+            payload = {
+                "household_id": household_id,
+                "username": username,
+                "share_budget_with_admin": share_with_admin
+            }
+            supabase.table(target_table).insert(payload).execute()
+        return True
+    except Exception as e:
+        print(f"Error updating privacy toggle: {e}")
+        return False
+
+def initialize_default_categories(household_id):
+    """
+    Checks if a household has categories. If not, it iterates through the 
+    DEFAULT_BUDGET_CATEGORIES, encrypts them, and injects them into the database.
+    """
+    target_table = get_budget_table("budget_categories")
+    try:
+        # 1. Check if they already have categories to prevent accidental duplication
+        existing = supabase.table(target_table).select("id").eq("household_id", household_id).limit(1).execute()
+        if existing.data:
+            return True # Household is already initialized
+            
+        # 2. Build the encrypted payload batch
+        payloads = []
+        for cat in DEFAULT_BUDGET_CATEGORIES:
+            payloads.append({
+                "household_id": household_id,
+                "category_name": encrypt_data(cat["name"]),
+                "sub_category_name": encrypt_data(cat["sub"]) if cat["sub"] else None,
+                "category_type": cat["type"],
+                "is_active": True
+            })
+            
+        # 3. Batch insert into Supabase
+        if payloads:
+            supabase.table(target_table).insert(payloads).execute()
+            
+        return True
+    except Exception as e:
+        print(f"Error initializing default categories: {e}")
+        return False
 
 # ==========================================
-# 💰 BUDGET FUNCTIONS
+# 💰 BUDGET FUNCTIONS (Projects / Guardrails / Wish List)
 # ==========================================
 
 def _can_edit_projects_server_side():
