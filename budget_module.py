@@ -752,7 +752,7 @@ def render_budget_module():
                 with st.container(border=True):
                     st.markdown(f"#### 💵 Add Income ({selected_month})")
                     with st.form("add_income_form", clear_on_submit=True):
-                        source_name = st.text_input("Source Name", placeholder="e.g., NFCU Pay, VA")
+                        source_name = st.text_input("Source Name", placeholder="e.g., Paycheck, Other Income")
                         
                         # 🟢 Assign Ownership Dropdown
                         owner_username = st.selectbox("Assign to Earner", user_options)
