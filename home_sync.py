@@ -1212,7 +1212,13 @@ if user_role == "developer":
                     st.caption("Prep")
                     st.write("Usage metrics like households, logins, and creation activity across apps.")
 
-                with st.container(border=True):
+                dev_col5, dev_col6 = st.columns(2)
+                with dev_col5.container(border=True):
+                    st.markdown("#### Vulnerability Management")
+                    st.caption("Planned")
+                    st.write("Placeholder for dependency CVEs, secret leak checks, and remediation status across HS/GFT.")
+
+                with dev_col6.container(border=True):
                     st.markdown("#### Database Migrations")
                     st.caption("Prep")
                     st.write("Central history of schema changes, backfills, and environment-specific database updates.")
