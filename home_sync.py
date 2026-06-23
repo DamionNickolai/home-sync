@@ -21,6 +21,55 @@ GET_FIT_BASELINE_VERSION = "2.1.0"
 FALLBACK_TIMEZONE = "America/Chicago"
 
 
+def queue_rerun_reason(reason: str) -> None:
+    if reason:
+        st.session_state["pending_rerun_reason"] = reason
+
+
+def rerun_with_reason(reason: str) -> None:
+    queue_rerun_reason(reason)
+    st.rerun()
+
+
+def track_rerun_diagnostics() -> None:
+    diagnostics = st.session_state.get("rerun_diagnostics") or {
+        "total_runs": 0,
+        "reasons": {},
+        "last_reason": "initial_load",
+    }
+
+    diagnostics["total_runs"] = int(diagnostics.get("total_runs", 0)) + 1
+    pending_reason = st.session_state.pop("pending_rerun_reason", None)
+
+    if pending_reason:
+        reasons = diagnostics.setdefault("reasons", {})
+        reasons[pending_reason] = int(reasons.get(pending_reason, 0)) + 1
+        diagnostics["last_reason"] = pending_reason
+    elif diagnostics["total_runs"] > 1:
+        reasons = diagnostics.setdefault("reasons", {})
+        reasons["widget_or_streamlit"] = int(reasons.get("widget_or_streamlit", 0)) + 1
+        diagnostics["last_reason"] = "widget_or_streamlit"
+
+    st.session_state["rerun_diagnostics"] = diagnostics
+
+
+def render_rerun_debug_panel() -> None:
+    if st.session_state.get("user_role") != "developer":
+        return
+
+    diagnostics = st.session_state.get("rerun_diagnostics") or {}
+    reasons = diagnostics.get("reasons") or {}
+
+    ordered_reasons = sorted(reasons.items(), key=lambda item: (-item[1], item[0]))
+    reason_text = ", ".join([f"{name}:{count}" for name, count in ordered_reasons[:5]]) or "none"
+
+    st.sidebar.caption(
+        f"Reruns total: {diagnostics.get('total_runs', 0)} | "
+        f"Last: {diagnostics.get('last_reason', 'initial_load')}"
+    )
+    st.sidebar.caption(f"Rerun buckets: {reason_text}")
+
+
 def get_app_timezone() -> ZoneInfo:
     tz_name = st.session_state.get("user_timezone", FALLBACK_TIMEZONE)
     try:
@@ -52,7 +101,12 @@ def initialize_user_timezone():
     if "user_timezone" not in st.session_state:
         st.session_state["user_timezone"] = FALLBACK_TIMEZONE
 
+    # Guard against repeated mobile rerun loops from JS timezone probing.
+    if st.session_state.get("user_timezone_initialized", False):
+        return
+
     if streamlit_js_eval is None:
+        st.session_state["user_timezone_initialized"] = True
         return
 
     detected_tz = streamlit_js_eval(
@@ -64,7 +118,10 @@ def initialize_user_timezone():
         detected_tz = detected_tz.strip()
         if st.session_state.get("user_timezone") != detected_tz:
             st.session_state["user_timezone"] = detected_tz
-            st.rerun()
+            st.session_state["user_timezone_initialized"] = True
+            rerun_with_reason("timezone_bootstrap")
+
+    st.session_state["user_timezone_initialized"] = True
 
 @st.cache_resource
 def get_supabase_client() -> Client:
@@ -86,6 +143,7 @@ def get_available_users(household_id):
 
 # 1. Page Config must ALWAYS be the very first Streamlit command
 st.set_page_config(page_title="Home Sync Dashboard", page_icon="🏠", layout="wide")
+track_rerun_diagnostics()
 
 # Initialize per-user timezone (device/browser) with US Central fallback.
 initialize_user_timezone()
@@ -114,7 +172,7 @@ st.markdown("""
 # ==========================================
 is_authenticated = check_password()
 if is_authenticated and st.session_state.pop("post_login_clean_rerun", False):
-    st.rerun()
+    rerun_with_reason("post_login_clean")
 
 if not is_authenticated:
     st.stop()
@@ -240,7 +298,9 @@ if st.sidebar.button("🚪 Log Out", width='stretch'):
     st.session_state["logout_in_progress"] = True
         
     st.query_params.clear() 
-    st.rerun()
+    rerun_with_reason("logout_action")
+
+render_rerun_debug_panel()
 
 # 🏷️ APPLICATION TAG
 st.sidebar.caption(f"<div style='text-align: center; color: gray; padding-top: 10px;'>Home Sync Hub v{APP_VERSION}</div>", unsafe_allow_html=True)
@@ -292,14 +352,14 @@ with tab1:
                 st.caption("Manage daily chores and household projects.")
                 if st.button("Open To-Do List", type="secondary", width='stretch'):
                     st.session_state["active_hub_view"] = "todo"
-                    st.rerun()
+                    rerun_with_reason("hub_nav")
                     
             with st.container(border=True):
                 st.markdown("### 💰 Budget")
                 st.caption("Track monthly spending and financial goals.")
                 if st.button("Open Budget", type="secondary", width='stretch'):
                     st.session_state["active_hub_view"] = "budget"
-                    st.rerun()
+                    rerun_with_reason("hub_nav")
                     
         with col2:
             with st.container(border=True):
@@ -307,14 +367,14 @@ with tab1:
                 st.caption("Shared family grocery list and meal prep.")
                 if st.button("Open Groceries", type="secondary", width='stretch'):
                     st.session_state["active_hub_view"] = "groceries"
-                    st.rerun()
+                    rerun_with_reason("hub_nav")
                     
             with st.container(border=True):
                 st.markdown("### 📅 Calendar")
                 st.caption("Family schedule, appointments, and events.")
                 if st.button("Open Calendar", type="secondary", width='stretch'):
                     st.session_state["active_hub_view"] = "calendar"
-                    st.rerun()
+                    rerun_with_reason("hub_nav")
 
     # ==========================================
     # VIEW: SUB-MODULES (What happens when you click a card)
@@ -323,7 +383,7 @@ with tab1:
         # Universal "Back" button to return to the grid
         if st.button("⬅️ Back to Hub Menu"):
             st.session_state["active_hub_view"] = "main_menu"
-            st.rerun()
+            rerun_with_reason("hub_nav")
             
         st.divider()
         

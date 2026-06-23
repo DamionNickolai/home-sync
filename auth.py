@@ -346,6 +346,7 @@ def check_password():
         bootstrap_attempts = st.session_state.get("auth_bootstrap_attempts", 0)
         if bootstrap_attempts < 5:
             st.session_state["auth_bootstrap_attempts"] = bootstrap_attempts + 1
+            st.session_state["pending_rerun_reason"] = "auth_bootstrap"
             st.rerun()
 
     def perform_login(email, password):

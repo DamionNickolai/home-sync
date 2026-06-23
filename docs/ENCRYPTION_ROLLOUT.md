@@ -75,9 +75,9 @@
 - [x] `user_sessions` (Audit only).
 
 ### 🎯 Home Sync Production Smoke Test
-- [ ] Log in as a standard Member; verify budget viewing restrictions and data decryption.
-- [ ] Log in as Admin; verify data renders correctly and Admin panel functions.
-- [ ] Confirm no app slowdowns or `Fernet` decryption errors in the logs.
+- [x] Log in as a standard Member; verify budget viewing restrictions and data decryption.
+- [x] Log in as Admin; verify data renders correctly and Admin panel functions.
+- [x] Confirm no app slowdowns or `Fernet` decryption errors in the logs.
 
 ---
 
@@ -150,5 +150,5 @@
 - [x] Step 3: Verify in app.
 
 ### 🎯 Full Ecosystem Production Smoke Test
-- [ ] Ensure seamless navigation between Home Sync and Get Fit Together apps.
-- [ ] Database is fully blinded; a compromised Supabase account yields only structural IDs and `gAAAA...` ciphertext.
+- [x] Ensure seamless navigation between Home Sync and Get Fit Together apps.
+- [x] Database is fully blinded; a compromised Supabase account yields only structural IDs and `gAAAA...` ciphertext.
