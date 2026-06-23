@@ -29,6 +29,7 @@ from zoneinfo import ZoneInfo
 SESSION_COOKIE_NAME = "home_sync_session_v2"
 LEGACY_SESSION_COOKIE_NAME = "home_sync_session"
 APP_TIMEZONE = ZoneInfo("America/Chicago")
+AUTH_BOOTSTRAP_MAX_ATTEMPTS = 2
 
 
 def get_auth_client():
@@ -292,6 +293,7 @@ def check_password():
     user_data_client = get_user_data_client()
     had_cookie_cache = "home_sync_cookie_cache" in st.session_state
     controller = get_cookie_controller()
+    stored_session_id = None
 
     if had_cookie_cache:
         try:
@@ -344,7 +346,10 @@ def check_password():
         and not st.session_state.get("password_correct", False)
     ):
         bootstrap_attempts = st.session_state.get("auth_bootstrap_attempts", 0)
-        if bootstrap_attempts < 5:
+        # Limit warm-up reruns to reduce mobile refresh churn while still
+        # allowing a short window for cookie state to hydrate.
+        should_warmup_bootstrap = (not had_cookie_cache) or bool(stored_session_id)
+        if should_warmup_bootstrap and bootstrap_attempts < AUTH_BOOTSTRAP_MAX_ATTEMPTS:
             st.session_state["auth_bootstrap_attempts"] = bootstrap_attempts + 1
             st.session_state["pending_rerun_reason"] = "auth_bootstrap"
             st.rerun()
