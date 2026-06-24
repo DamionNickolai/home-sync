@@ -89,14 +89,37 @@ def render_main_dashboard_selector(options: list[str]) -> None:
 
     current_view = st.session_state.get("main_dashboard_view", options[0])
 
-    for idx, option in enumerate(options):
-        if st.button(
-            option,
-            key=f"main_dash_btn_{idx}",
-            type="primary" if current_view == option else "secondary",
-            width="stretch",
-        ):
-            set_main_dashboard_view(option)
+    for idx in range(0, len(options), 2):
+        row_options = options[idx:idx + 2]
+
+        if len(row_options) == 2:
+            left_opt, right_opt = row_options
+            col_left, col_right = st.columns(2)
+
+            if col_left.button(
+                left_opt,
+                key=f"main_dash_btn_{idx}_left",
+                type="primary" if current_view == left_opt else "secondary",
+                width="stretch",
+            ):
+                set_main_dashboard_view(left_opt)
+
+            if col_right.button(
+                right_opt,
+                key=f"main_dash_btn_{idx}_right",
+                type="primary" if current_view == right_opt else "secondary",
+                width="stretch",
+            ):
+                set_main_dashboard_view(right_opt)
+        else:
+            only_opt = row_options[0]
+            if st.button(
+                only_opt,
+                key=f"main_dash_btn_{idx}_full",
+                type="primary" if current_view == only_opt else "secondary",
+                width="stretch",
+            ):
+                set_main_dashboard_view(only_opt)
 
 
 def render_two_col_selector(key: str, options: list, format_func=None):
@@ -108,17 +131,46 @@ def render_two_col_selector(key: str, options: list, format_func=None):
 
     selected_value = st.session_state.get(key)
 
-    for idx, option in enumerate(options):
-        label = format_func(option) if format_func else str(option)
-        if st.button(
-            label,
-            key=f"{key}_btn_{idx}",
-            type="primary" if selected_value == option else "secondary",
-            width="stretch",
-        ):
-            if selected_value != option:
-                st.session_state[key] = option
-                rerun_with_reason("selector_change")
+    for idx in range(0, len(options), 2):
+        row_options = options[idx:idx + 2]
+
+        if len(row_options) == 2:
+            left_opt, right_opt = row_options
+            left_label = format_func(left_opt) if format_func else str(left_opt)
+            right_label = format_func(right_opt) if format_func else str(right_opt)
+            col_left, col_right = st.columns(2)
+
+            if col_left.button(
+                left_label,
+                key=f"{key}_btn_{idx}_left",
+                type="primary" if selected_value == left_opt else "secondary",
+                width="stretch",
+            ):
+                if selected_value != left_opt:
+                    st.session_state[key] = left_opt
+                    rerun_with_reason("selector_change")
+
+            if col_right.button(
+                right_label,
+                key=f"{key}_btn_{idx}_right",
+                type="primary" if selected_value == right_opt else "secondary",
+                width="stretch",
+            ):
+                if selected_value != right_opt:
+                    st.session_state[key] = right_opt
+                    rerun_with_reason("selector_change")
+        else:
+            only_opt = row_options[0]
+            only_label = format_func(only_opt) if format_func else str(only_opt)
+            if st.button(
+                only_label,
+                key=f"{key}_btn_{idx}_full",
+                type="primary" if selected_value == only_opt else "secondary",
+                width="stretch",
+            ):
+                if selected_value != only_opt:
+                    st.session_state[key] = only_opt
+                    rerun_with_reason("selector_change")
 
     return st.session_state.get(key)
 
@@ -230,7 +282,7 @@ st.markdown("""
         font-size: calc(1em + 2px);
     }
 
-    /* Mobile polish: readable tap targets without forcing radio layout internals. */
+    /* Mobile polish: readable tap targets for any remaining radio controls. */
     @media (max-width: 768px) {
         div[data-testid="stRadio"] [role="radiogroup"] > label {
             min-height: 2.05rem;

@@ -150,17 +150,46 @@ def _render_two_col_selector(key: str, options: list, format_func=None):
 
     selected_value = st.session_state.get(key)
 
-    for idx, option in enumerate(options):
-        label = format_func(option) if format_func else str(option)
-        if st.button(
-            label,
-            key=f"{key}_btn_{idx}",
-            type="primary" if selected_value == option else "secondary",
-            width="stretch",
-        ):
-            if selected_value != option:
-                st.session_state[key] = option
-                st.rerun()
+    for idx in range(0, len(options), 2):
+        row_options = options[idx:idx + 2]
+
+        if len(row_options) == 2:
+            left_opt, right_opt = row_options
+            left_label = format_func(left_opt) if format_func else str(left_opt)
+            right_label = format_func(right_opt) if format_func else str(right_opt)
+            col_left, col_right = st.columns(2)
+
+            if col_left.button(
+                left_label,
+                key=f"{key}_btn_{idx}_left",
+                type="primary" if selected_value == left_opt else "secondary",
+                width="stretch",
+            ):
+                if selected_value != left_opt:
+                    st.session_state[key] = left_opt
+                    st.rerun()
+
+            if col_right.button(
+                right_label,
+                key=f"{key}_btn_{idx}_right",
+                type="primary" if selected_value == right_opt else "secondary",
+                width="stretch",
+            ):
+                if selected_value != right_opt:
+                    st.session_state[key] = right_opt
+                    st.rerun()
+        else:
+            only_opt = row_options[0]
+            only_label = format_func(only_opt) if format_func else str(only_opt)
+            if st.button(
+                only_label,
+                key=f"{key}_btn_{idx}_full",
+                type="primary" if selected_value == only_opt else "secondary",
+                width="stretch",
+            ):
+                if selected_value != only_opt:
+                    st.session_state[key] = only_opt
+                    st.rerun()
 
     return st.session_state.get(key)
 
