@@ -66,5 +66,8 @@ BACKFILL ENCRYPTED SESSION TOKENS:
 ENCRYPTION KEY NOTE:
 Home Sync and Get Fit Together must use the same ENCRYPTION_KEY in production because they share the user_sessions table.
 
+ENTER VIRTUAL ENV:
+.\venv\Scripts\activate
+
 RUN APP:
 python -m streamlit run home_sync.py

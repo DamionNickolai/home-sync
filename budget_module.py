@@ -141,6 +141,30 @@ def _plotly_chart_locked(fig, **kwargs):
     st.plotly_chart(fig, config=config, **kwargs)
 
 
+def _render_two_col_selector(key: str, options: list, format_func=None):
+    if not options:
+        return None
+
+    if st.session_state.get(key) not in options:
+        st.session_state[key] = options[0]
+
+    selected_value = st.session_state.get(key)
+
+    for idx, option in enumerate(options):
+        label = format_func(option) if format_func else str(option)
+        if st.button(
+            label,
+            key=f"{key}_btn_{idx}",
+            type="primary" if selected_value == option else "secondary",
+            width="stretch",
+        ):
+            if selected_value != option:
+                st.session_state[key] = option
+                st.rerun()
+
+    return st.session_state.get(key)
+
+
 def _extract_project_year(row, fallback_year):
     app_tz_name = st.session_state.get("user_timezone", FALLBACK_TIMEZONE)
     try:
@@ -370,12 +394,9 @@ def render_budget_module(show_back_to_hub=False):
         if st.session_state.get("wishlist_active_owner") not in available_owner_names:
             st.session_state["wishlist_active_owner"] = active_username if active_username in available_owner_names else available_owner_names[0]
 
-        selected_owner = st.radio(
-            "Wish List Owner",
-            options=available_owner_names,
+        selected_owner = _render_two_col_selector(
             key="wishlist_active_owner",
-            horizontal=True,
-            label_visibility="collapsed",
+            options=available_owner_names,
             format_func=lambda owner: f"👤 {owner}",
         )
 
@@ -644,11 +665,9 @@ def render_budget_module(show_back_to_hub=False):
         total_expenses = expenses_df["amount"].sum() if not expenses_df.empty else 0.0
         net_cash_flow = total_take_home - total_expenses
         
-        household_view_mode = st.radio(
-            "Household View Mode",
-            ["📊 Master Ledger", "🔄 Cash Flow & Treasury", "⚙️ Settings & Setup"],
-            horizontal=True,
-            label_visibility="collapsed"
+        household_view_mode = _render_two_col_selector(
+            key="household_view_mode",
+            options=["📊 Master Ledger", "🔄 Cash Flow & Treasury", "⚙️ Settings & Setup"],
         )
         
         if household_view_mode == "📊 Master Ledger":
@@ -972,12 +991,9 @@ def render_budget_module(show_back_to_hub=False):
             return "🧭 Projects Workspace"
         return "✅ Completed Projects"
 
-    selected_projects_section = st.radio(
-        "Projects Section",
-        options=projects_section_keys,
+    selected_projects_section = _render_two_col_selector(
         key="projects_active_section",
-        horizontal=True,
-        label_visibility="collapsed",
+        options=projects_section_keys,
         format_func=projects_section_label,
     )
 
@@ -1490,12 +1506,9 @@ def render_budget_module(show_back_to_hub=False):
                 category_name = section_key.split("::", 1)[1]
                 return f"📁 {category_name} ({len(grouped_active.get(category_name, []))})"
 
-            selected_workspace_section = st.radio(
-                "Project Workspace Section",
-                options=workspace_section_keys,
+            selected_workspace_section = _render_two_col_selector(
                 key="projects_workspace_active_category",
-                horizontal=True,
-                label_visibility="collapsed",
+                options=workspace_section_keys,
                 format_func=workspace_section_label,
             )
 

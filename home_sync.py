@@ -75,6 +75,54 @@ def mark_top_nav_change() -> None:
     queue_rerun_reason("top_nav")
 
 
+def set_main_dashboard_view(view_name: str) -> None:
+    if st.session_state.get("main_dashboard_view") == view_name:
+        return
+    st.session_state["main_dashboard_view"] = view_name
+    mark_top_nav_change()
+    rerun_with_reason("top_nav")
+
+
+def render_main_dashboard_selector(options: list[str]) -> None:
+    if not options:
+        return
+
+    current_view = st.session_state.get("main_dashboard_view", options[0])
+
+    for idx, option in enumerate(options):
+        if st.button(
+            option,
+            key=f"main_dash_btn_{idx}",
+            type="primary" if current_view == option else "secondary",
+            width="stretch",
+        ):
+            set_main_dashboard_view(option)
+
+
+def render_two_col_selector(key: str, options: list, format_func=None):
+    if not options:
+        return None
+
+    if st.session_state.get(key) not in options:
+        st.session_state[key] = options[0]
+
+    selected_value = st.session_state.get(key)
+
+    for idx, option in enumerate(options):
+        label = format_func(option) if format_func else str(option)
+        if st.button(
+            label,
+            key=f"{key}_btn_{idx}",
+            type="primary" if selected_value == option else "secondary",
+            width="stretch",
+        ):
+            if selected_value != option:
+                st.session_state[key] = option
+                rerun_with_reason("selector_change")
+
+    return st.session_state.get(key)
+
+
 def is_dashboard_drilldown_active(selected_dashboard: str) -> bool:
     if selected_dashboard == "🏠 Household Hub":
         return st.session_state.get("active_hub_view", "main_menu") != "main_menu"
@@ -182,26 +230,18 @@ st.markdown("""
         font-size: calc(1em + 2px);
     }
 
-    /* Mobile polish: compact, consistent-width radio chips with light spacing. */
+    /* Mobile polish: readable tap targets without forcing radio layout internals. */
     @media (max-width: 768px) {
-        div[data-testid="stRadio"] [role="radiogroup"][aria-orientation="horizontal"] {
-            display: flex;
-            flex-wrap: wrap;
-            justify-content: flex-start;
-            gap: 0.25rem 0.45rem;
-            padding: 0.15rem 0;
-        }
-
-        div[data-testid="stRadio"] [role="radiogroup"][aria-orientation="horizontal"] > label {
-            flex: 0 0 9.25rem;
-            min-width: 9.25rem;
-            max-width: 9.25rem;
+        div[data-testid="stRadio"] [role="radiogroup"] > label {
             min-height: 2.05rem;
-            padding: 0.16rem 0.3rem;
+            padding: 0.12rem 0.28rem;
             border: 1px solid rgba(148, 163, 184, 0.35);
             border-radius: 0.5rem;
-            margin: 0;
+            margin: 0.08rem 0;
+            background: rgba(15, 23, 42, 0.08);
+            box-sizing: border-box;
         }
+
     }
     </style>
 """, unsafe_allow_html=True
@@ -407,14 +447,8 @@ hide_main_dashboard_selector = is_dashboard_drilldown_active(current_main_view)
 if hide_main_dashboard_selector:
     selected_dashboard_view = st.session_state.get("main_dashboard_view", dashboard_sections[0])
 else:
-    selected_dashboard_view = st.radio(
-        "Main Dashboard View",
-        options=dashboard_sections,
-        key="main_dashboard_view",
-        horizontal=True,
-        label_visibility="collapsed",
-        on_change=mark_top_nav_change,
-    )
+    render_main_dashboard_selector(dashboard_sections)
+    selected_dashboard_view = st.session_state.get("main_dashboard_view", dashboard_sections[0])
 
 show_app_header = not is_dashboard_drilldown_active(selected_dashboard_view)
 
@@ -709,12 +743,9 @@ if selected_dashboard_view == "🏠 Household Hub":
                         bucket_user = bucket_key.split("::", 1)[1]
                         return f"👤 {bucket_user} ({len(single_user_tasks.get(bucket_user, []))})"
 
-                    selected_task_bucket = st.radio(
-                        "Task Buckets",
-                        options=task_bucket_keys,
+                    selected_task_bucket = render_two_col_selector(
                         key="todo_active_bucket",
-                        horizontal=True,
-                        label_visibility="collapsed",
+                        options=task_bucket_keys,
                         format_func=task_bucket_label,
                     )
 
@@ -1638,12 +1669,9 @@ if user_role == "developer" and selected_dashboard_view == "🛠️ Developer Da
                     app_name = section_key.split("::", 1)[1]
                     return f"📱 {str(app_name).replace('_', ' ').title()}"
 
-                selected_backlog_section = st.radio(
-                    "Backlog Section",
-                    options=backlog_section_keys,
+                selected_backlog_section = render_two_col_selector(
                     key="backlog_active_section",
-                    horizontal=True,
-                    label_visibility="collapsed",
+                    options=backlog_section_keys,
                     format_func=backlog_section_label,
                 )
 
