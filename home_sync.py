@@ -204,7 +204,25 @@ def refresh_permissions_from_db() -> bool:
     return True
 
 
-refresh_permissions_from_db()
+def maybe_refresh_permissions(min_interval_seconds: int = 90) -> bool:
+    now_ts = int(time.time())
+    last_refresh_ts = int(st.session_state.get("permissions_refreshed_ts", 0))
+    should_refresh = (
+        "permissions_refreshed_ts" not in st.session_state
+        or now_ts - last_refresh_ts >= min_interval_seconds
+        or "user_role" not in st.session_state
+    )
+
+    if not should_refresh:
+        return False
+
+    refreshed = refresh_permissions_from_db()
+    if refreshed:
+        st.session_state["permissions_refreshed_ts"] = now_ts
+    return refreshed
+
+
+maybe_refresh_permissions()
 
 # ==========================================
 # 🚧 ENVIRONMENT DETECTION & BANNER
@@ -368,14 +386,14 @@ if selected_dashboard_view == "🏠 Household Hub":
                 st.caption("Manage daily chores and household projects.")
                 if st.button("Open To-Do List", type="secondary", width='stretch'):
                     st.session_state["active_hub_view"] = "todo"
-                    rerun_with_reason("hub_nav")
+                    queue_rerun_reason("hub_nav")
                     
             with st.container(border=True):
                 st.markdown("### 💰 Budget")
                 st.caption("Track monthly spending and financial goals.")
                 if st.button("Open Budget", type="secondary", width='stretch'):
                     st.session_state["active_hub_view"] = "budget"
-                    rerun_with_reason("hub_nav")
+                    queue_rerun_reason("hub_nav")
                     
         with col2:
             with st.container(border=True):
@@ -383,14 +401,14 @@ if selected_dashboard_view == "🏠 Household Hub":
                 st.caption("Shared family grocery list and meal prep.")
                 if st.button("Open Groceries", type="secondary", width='stretch'):
                     st.session_state["active_hub_view"] = "groceries"
-                    rerun_with_reason("hub_nav")
+                    queue_rerun_reason("hub_nav")
                     
             with st.container(border=True):
                 st.markdown("### 📅 Calendar")
                 st.caption("Family schedule, appointments, and events.")
                 if st.button("Open Calendar", type="secondary", width='stretch'):
                     st.session_state["active_hub_view"] = "calendar"
-                    rerun_with_reason("hub_nav")
+                    queue_rerun_reason("hub_nav")
 
     # ==========================================
     # VIEW: SUB-MODULES (What happens when you click a card)
@@ -399,7 +417,7 @@ if selected_dashboard_view == "🏠 Household Hub":
         # Universal "Back" button to return to the grid
         if st.button("⬅️ Back to Hub Menu"):
             st.session_state["active_hub_view"] = "main_menu"
-            rerun_with_reason("hub_nav")
+            queue_rerun_reason("hub_nav")
             
         st.divider()
         
@@ -576,7 +594,7 @@ if selected_dashboard_view == "🏠 Household Hub":
                         )
                         if success:
                             st.success("Task added!")
-                            st.rerun()
+                            queue_rerun_reason("task_write")
                         else:
                             st.error("Could not save task.")
                     elif submit and not new_task:
@@ -668,7 +686,7 @@ if selected_dashboard_view == "🏠 Household Hub":
                                 if action_col.button("✏️ Edit", key=f"open_task_{task['id']}_{key_scope}", width='stretch'):
                                     current_editing = st.session_state.get("editing_task_id")
                                     st.session_state["editing_task_id"] = None if current_editing == task['id'] else task['id']
-                                    st.rerun()
+                                    queue_rerun_reason("task_edit_toggle")
 
                             st.caption(" • ".join(detail_parts))
                             if len(assignees) > 1:
@@ -747,25 +765,25 @@ if selected_dashboard_view == "🏠 Household Hub":
                                         if success:
                                             st.session_state["editing_task_id"] = None
                                             st.success("Task updated.")
-                                            st.rerun()
+                                            queue_rerun_reason("task_write")
                                         else:
                                             st.error("Could not update task.")
 
                                 if delete_clicked:
                                     delete_task(task["id"])
                                     st.session_state["editing_task_id"] = None
-                                    st.rerun()
+                                    queue_rerun_reason("task_write")
 
                                 if complete_clicked:
                                     if batch_update_tasks([task["id"]], True):
                                         st.session_state["editing_task_id"] = None
-                                        st.rerun()
+                                        queue_rerun_reason("task_write")
                                     else:
                                         st.error("Could not complete task.")
 
                                 if cancel_clicked:
                                     st.session_state["editing_task_id"] = None
-                                    st.rerun()
+                                    queue_rerun_reason("task_edit_cancel")
 
                     if selected_task_bucket == "multi":
                         tasks_in_bucket = [x[0] for x in multi_assigned_tasks]
@@ -840,7 +858,7 @@ if selected_dashboard_view == "🏠 Household Hub":
                         if user_role in ["developer", "admin"] or current_user in assignees:
                             if col_recall.button("🔄 Recall", key=f"recall_{task['id']}"):
                                 batch_update_tasks([task['id']], False) 
-                                st.rerun()
+                                queue_rerun_reason("task_write")
                 else:
                     st.caption("No recently completed tasks in the last 14 days.")
                     
@@ -1245,7 +1263,7 @@ if user_role == "developer" and selected_dashboard_view == "🛠️ Developer Da
                     st.caption("System health, technical debt, analytics, and migration posture.")
                     if st.button("Open Developer Overview", key="open_dev_overview", width='stretch'):
                         st.session_state["developer_dashboard_view"] = "overview"
-                        st.rerun()
+                        queue_rerun_reason("dev_nav")
 
             with card_col2:
                 with st.container(border=True):
@@ -1253,12 +1271,12 @@ if user_role == "developer" and selected_dashboard_view == "🛠️ Developer Da
                     st.caption("Create/edit backlog items, review staged work, and cut releases.")
                     if st.button("Open Backlog & Release", key="open_dev_backlog", width='stretch'):
                         st.session_state["developer_dashboard_view"] = "backlog_release"
-                        st.rerun()
+                        queue_rerun_reason("dev_nav")
 
         else:
             if st.button("⬅️ Back to Developer Modules", key="back_dev_modules"):
                 st.session_state["developer_dashboard_view"] = "menu"
-                st.rerun()
+                queue_rerun_reason("dev_nav")
 
             st.divider()
 
@@ -1350,7 +1368,7 @@ if user_role == "developer" and selected_dashboard_view == "🛠️ Developer Da
                                         "level": "success",
                                         "message": f"Ticket created successfully in {target_app}.",
                                     }
-                                    st.rerun()
+                                    queue_rerun_reason("backlog_write")
                                 else:
                                     st.error("Failed to create ticket. Check logs and try again.")
 
@@ -1435,7 +1453,7 @@ if user_role == "developer" and selected_dashboard_view == "🛠️ Developer Da
                                             "level": "error",
                                             "message": "Failed to update ticket. Check logs and try again.",
                                         }
-                                st.rerun()
+                                queue_rerun_reason("backlog_write")
 
                             if col_del.form_submit_button("🗑️ Delete", width='stretch'):
                                 deleted = delete_backlog_item(item["id"])
@@ -1450,11 +1468,11 @@ if user_role == "developer" and selected_dashboard_view == "🛠️ Developer Da
                                         "level": "error",
                                         "message": "Failed to delete ticket. Check logs and try again.",
                                     }
-                                st.rerun()
+                                queue_rerun_reason("backlog_write")
 
                             if col_cancel.form_submit_button("❌ Cancel", width='stretch'):
                                 st.session_state["editing_backlog_id"] = None
-                                st.rerun()
+                                queue_rerun_reason("backlog_edit_cancel")
 
                 def begin_backlog_edit(item_id, app_name, is_staged=False):
                     current_id = st.session_state.get("editing_backlog_id")
@@ -1614,7 +1632,7 @@ if user_role == "developer" and selected_dashboard_view == "🛠️ Developer Da
                                     st.success(message)
                                     st.session_state["APP_VERSION"] = versions.get("home_sync", current_home_sync_version)
                                     st.info(f"📝 Next step: Use Home Sync v{versions.get('home_sync', current_home_sync_version)} for deployment.")
-                                    st.rerun()
+                                    queue_rerun_reason("release_cut")
                                 else:
                                     st.error(message)
 
@@ -1628,7 +1646,7 @@ if user_role == "developer" and selected_dashboard_view == "🛠️ Developer Da
                                 if success:
                                     st.success(message)
                                     st.info(f"📝 Next step: Use Get Fit Together v{versions.get('get_fit', current_get_fit_version)} for deployment.")
-                                    st.rerun()
+                                    queue_rerun_reason("release_cut")
                                 else:
                                     st.error(message)
 
@@ -1654,7 +1672,7 @@ if user_role == "developer" and selected_dashboard_view == "🛠️ Developer Da
                                         f"📝 Next step: Use Home Sync v{versions.get('home_sync', current_home_sync_version)} "
                                         f"and Get Fit Together v{versions.get('get_fit', current_get_fit_version)} in deployment scripts."
                                     )
-                                    st.rerun()
+                                    queue_rerun_reason("release_cut")
                                 else:
                                     st.error(message)
                     else:
