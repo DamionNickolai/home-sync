@@ -70,6 +70,10 @@ def render_rerun_debug_panel() -> None:
     st.sidebar.caption(f"Rerun buckets: {reason_text}")
 
 
+def mark_top_nav_change() -> None:
+    queue_rerun_reason("top_nav")
+
+
 def get_app_timezone() -> ZoneInfo:
     tz_name = st.session_state.get("user_timezone", FALLBACK_TIMEZONE)
     try:
@@ -309,7 +313,7 @@ st.sidebar.caption(f"<div style='text-align: center; color: gray; padding-top: 1
 # 📋 MAIN DASHBOARD TABS
 # ==========================================
 if user_role == "developer":
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    dashboard_sections = [
         "🏠 Household Hub",
         "☀️ Solar Production",
         "🛡️ Security",
@@ -317,18 +321,30 @@ if user_role == "developer":
         "⚙️ System Logs",
         "🆕 What's New",
         "🛠️ Developer Dashboard"
-    ])
+    ]
 else:
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    dashboard_sections = [
         "🏠 Household Hub",
         "☀️ Solar Production",
         "🛡️ Security",
         "🚗 Garage",        
         "⚙️ System Logs",
         "🆕 What's New"
-    ])
+    ]
 
-with tab1:
+if st.session_state.get("main_dashboard_view") not in dashboard_sections:
+    st.session_state["main_dashboard_view"] = dashboard_sections[0]
+
+selected_dashboard_view = st.radio(
+    "Main Dashboard View",
+    options=dashboard_sections,
+    key="main_dashboard_view",
+    horizontal=True,
+    label_visibility="collapsed",
+    on_change=mark_top_nav_change,
+)
+
+if selected_dashboard_view == "🏠 Household Hub":
     # 1. Initialize the session state for this tab
     if "active_hub_view" not in st.session_state:
         st.session_state["active_hub_view"] = "main_menu"
@@ -842,9 +858,9 @@ with tab1:
             st.subheader("📅 Family Calendar")
             st.info("Upcoming events will render here...")
 
-with tab2:
+if selected_dashboard_view == "☀️ Solar Production":
     if st.button("🔄 Refresh Telemetry", type="primary", width='stretch'):
-        st.rerun()
+        queue_rerun_reason("telemetry_refresh")
 
     st.subheader("☀️ Live Energy Flow")
     
@@ -906,11 +922,11 @@ with tab2:
         else:
             st.warning("Panel data currently unavailable.")
     
-with tab3:
+if selected_dashboard_view == "🛡️ Security":
     st.subheader("Security Overview")
     st.write("Camera and sensor feeds will render here...")
 
-with tab4:
+if selected_dashboard_view == "🚗 Garage":
     st.subheader("🚗 Garage Access")
     
     # 1. Establish the "Fake" Garage State in memory
@@ -951,11 +967,11 @@ with tab4:
                 # Rerun the app to show the new state
                 st.rerun()
 
-with tab5:
+if selected_dashboard_view == "⚙️ System Logs":
     st.subheader("Event History")
     st.write("Supabase database logs will render here...")
 
-with tab6:
+if selected_dashboard_view == "🆕 What's New":
     st.subheader("🆕 What's New")
     st.caption("Release notes for Home Sync and Global items only.")
 
@@ -1161,8 +1177,7 @@ with tab6:
     except Exception as e:
         st.error(f"Could not load the changelog: {e}")
 
-if user_role == "developer":
-    with tab7:
+if user_role == "developer" and selected_dashboard_view == "🛠️ Developer Dashboard":
         st.subheader("🛠️ Developer Dashboard")
         st.caption("Backlog management plus future-facing operational tooling for your app ecosystem.")
 
