@@ -167,6 +167,24 @@ st.markdown("""
     [data-testid="stAppViewContainer"] [data-testid="stMarkdownContainer"] {
         font-size: calc(1em + 2px);
     }
+
+    /* Mobile polish: make radio selectors easier to tap and less cramped. */
+    @media (max-width: 768px) {
+        div[data-testid="stRadio"] [role="radiogroup"] {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.35rem 0.5rem;
+        }
+
+        div[data-testid="stRadio"] [role="radiogroup"] > label {
+            flex: 1 1 calc(50% - 0.5rem);
+            min-height: 2.15rem;
+            padding: 0.2rem 0.35rem;
+            border: 1px solid rgba(148, 163, 184, 0.35);
+            border-radius: 0.5rem;
+            margin: 0;
+        }
+    }
     </style>
 """, unsafe_allow_html=True
 )
@@ -1336,41 +1354,76 @@ if user_role == "developer" and selected_dashboard_view == "🛠️ Developer Da
                         st.info(message)
                     st.session_state["backlog_flash"] = None
 
-                with st.expander("➕ Add New Backlog Ticket", expanded=False):
-                    with st.form("add_master_backlog_form", clear_on_submit=True):
-                        c1, c2, c3, c4 = st.columns(4)
-                        new_status = c1.selectbox("Status", backlog_status_options, index=2)
-                        new_category = c2.selectbox("Category", backlog_category_options, index=1)
-                        new_priority = c3.selectbox("Priority", backlog_priority_options, index=2)
-                        target_app = c4.selectbox("Target App", ["home_sync", "get_fit", "Global"])
+                def render_add_backlog_ticket_form(default_target_app):
+                    app_labels = {
+                        "home_sync": "Home Sync",
+                        "get_fit": "Get Fit Together",
+                        "Global": "Global",
+                    }
+                    app_label = app_labels.get(default_target_app, default_target_app)
 
-                        st.caption("Fields marked with * are required.")
+                    with st.expander(f"➕ Add New {app_label} Ticket", expanded=False):
+                        with st.form(f"add_backlog_form_{default_target_app}", clear_on_submit=True):
+                            c1, c2, c3 = st.columns(3)
+                            new_status = c1.selectbox(
+                                "Status",
+                                backlog_status_options,
+                                index=2,
+                                key=f"add_status_{default_target_app}",
+                            )
+                            new_category = c2.selectbox(
+                                "Category",
+                                backlog_category_options,
+                                index=1,
+                                key=f"add_category_{default_target_app}",
+                            )
+                            new_priority = c3.selectbox(
+                                "Priority",
+                                backlog_priority_options,
+                                index=2,
+                                key=f"add_priority_{default_target_app}",
+                            )
 
-                        new_feature = st.text_input("Feature or Bug Name *")
-                        new_notes = st.text_area("Description", help="External-facing description of the feature")
-                        new_work_notes = st.text_area("Work Notes", help="Internal notes about implementation")
+                            st.caption(f"Target App: {app_label}")
+                            st.caption("Fields marked with * are required.")
 
-                        if st.form_submit_button("Save Ticket", type="primary"):
-                            if not new_feature.strip():
-                                st.warning("Create blocked: Feature or Bug Name is required.")
-                            else:
-                                created = add_backlog_item(
-                                    new_feature,
-                                    new_notes,
-                                    new_status,
-                                    target_app,
-                                    new_category,
-                                    new_priority,
-                                    new_work_notes,
-                                )
-                                if created:
-                                    st.session_state["backlog_flash"] = {
-                                        "level": "success",
-                                        "message": f"Ticket created successfully in {target_app}.",
-                                    }
-                                    queue_rerun_reason("backlog_write")
+                            new_feature = st.text_input(
+                                "Feature or Bug Name *",
+                                key=f"add_feature_{default_target_app}",
+                            )
+                            new_notes = st.text_area(
+                                "Description",
+                                help="External-facing description of the feature",
+                                key=f"add_desc_{default_target_app}",
+                            )
+                            new_work_notes = st.text_area(
+                                "Work Notes",
+                                help="Internal notes about implementation",
+                                key=f"add_work_{default_target_app}",
+                            )
+
+                            submit_label = f"Save {app_label} Ticket"
+                            if st.form_submit_button(submit_label, type="primary"):
+                                if not new_feature.strip():
+                                    st.warning("Create blocked: Feature or Bug Name is required.")
                                 else:
-                                    st.error("Failed to create ticket. Check logs and try again.")
+                                    created = add_backlog_item(
+                                        new_feature,
+                                        new_notes,
+                                        new_status,
+                                        default_target_app,
+                                        new_category,
+                                        new_priority,
+                                        new_work_notes,
+                                    )
+                                    if created:
+                                        st.session_state["backlog_flash"] = {
+                                            "level": "success",
+                                            "message": f"Ticket created successfully in {app_label}.",
+                                        }
+                                        queue_rerun_reason("backlog_write")
+                                    else:
+                                        st.error("Failed to create ticket. Check logs and try again.")
 
                 raw_items = get_all_backlog_items()
                 if raw_items:
@@ -1548,6 +1601,10 @@ if user_role == "developer" and selected_dashboard_view == "🛠️ Developer Da
 
                 if selected_backlog_section.startswith("app::"):
                     app = selected_backlog_section.split("::", 1)[1]
+
+                    if app in ["home_sync", "get_fit", "Global"]:
+                        render_add_backlog_ticket_form(app)
+
                     app_items = [
                         i for i in items
                         if (i.get("app_name") == app or (not i.get("app_name") and app == "unassigned"))
