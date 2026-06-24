@@ -185,10 +185,8 @@ def _can_access_monthly_module():
     return bool(st.session_state.get("can_view_monthly_budget", st.session_state.get("can_view_budget", False)))
 
 
-def render_budget_module():
+def render_budget_module(show_back_to_hub=False):
     ensure_household_initialized(st.session_state["household_id"])
-    st.title("Financial Hub 💰")
-    st.caption("Manage household finances with quick cards and project-level visibility.")
 
     if "budget_view" not in st.session_state:
         st.session_state["budget_view"] = "menu"
@@ -217,6 +215,13 @@ def render_budget_module():
     can_access_monthly = _can_access_monthly_module()
 
     if view == "menu":
+        if show_back_to_hub:
+            if st.button("⬅️ Back to Hub Menu", width="content"):
+                st.session_state["active_hub_view"] = "main_menu"
+                st.rerun()
+
+        st.title("Financial Hub 💰")
+        st.caption("Manage household finances with quick cards and project-level visibility.")
         st.subheader("Budget Modules")
         st.caption("Pick a budget module to open.")
 

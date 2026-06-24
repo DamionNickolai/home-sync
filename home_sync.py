@@ -71,7 +71,21 @@ def render_rerun_debug_panel() -> None:
 
 
 def mark_top_nav_change() -> None:
+    st.session_state.pop("main_dashboard_lock", None)
     queue_rerun_reason("top_nav")
+
+
+def is_dashboard_drilldown_active(selected_dashboard: str) -> bool:
+    if selected_dashboard == "🏠 Household Hub":
+        return st.session_state.get("active_hub_view", "main_menu") != "main_menu"
+    if selected_dashboard == "🛠️ Developer Dashboard":
+        return st.session_state.get("developer_dashboard_view", "menu") != "menu"
+    return False
+
+
+def request_main_dashboard_view(view_name: str) -> None:
+    st.session_state["main_dashboard_lock"] = view_name
+    st.session_state["pending_main_dashboard_view"] = view_name
 
 
 def get_app_timezone() -> ZoneInfo:
@@ -168,18 +182,22 @@ st.markdown("""
         font-size: calc(1em + 2px);
     }
 
-    /* Mobile polish: make radio selectors easier to tap and less cramped. */
+    /* Mobile polish: compact, consistent-width radio chips with light spacing. */
     @media (max-width: 768px) {
-        div[data-testid="stRadio"] [role="radiogroup"] {
+        div[data-testid="stRadio"] [role="radiogroup"][aria-orientation="horizontal"] {
             display: flex;
             flex-wrap: wrap;
-            gap: 0.35rem 0.5rem;
+            justify-content: flex-start;
+            gap: 0.25rem 0.45rem;
+            padding: 0.15rem 0;
         }
 
-        div[data-testid="stRadio"] [role="radiogroup"] > label {
-            flex: 1 1 calc(50% - 0.5rem);
-            min-height: 2.15rem;
-            padding: 0.2rem 0.35rem;
+        div[data-testid="stRadio"] [role="radiogroup"][aria-orientation="horizontal"] > label {
+            flex: 0 0 9.25rem;
+            min-width: 9.25rem;
+            max-width: 9.25rem;
+            min-height: 2.05rem;
+            padding: 0.16rem 0.3rem;
             border: 1px solid rgba(148, 163, 184, 0.35);
             border-radius: 0.5rem;
             margin: 0;
@@ -260,8 +278,6 @@ if is_local_env:
         """, 
         unsafe_allow_html=True
     )
-
-st.title("🏠 Home Sync Dashboard")
 
 # ==========================================
 #  SIDEBAR COMMAND CENTER
@@ -368,17 +384,42 @@ else:
         "🆕 What's New"
     ]
 
+pending_main_dashboard_view = st.session_state.pop("pending_main_dashboard_view", None)
+locked_main_dashboard_view = st.session_state.get("main_dashboard_lock")
+
+if locked_main_dashboard_view and locked_main_dashboard_view not in dashboard_sections:
+    st.session_state.pop("main_dashboard_lock", None)
+    locked_main_dashboard_view = None
+
+if locked_main_dashboard_view in dashboard_sections:
+    st.session_state["main_dashboard_view"] = locked_main_dashboard_view
+
+if pending_main_dashboard_view in dashboard_sections:
+    st.session_state["main_dashboard_view"] = pending_main_dashboard_view
+
 if st.session_state.get("main_dashboard_view") not in dashboard_sections:
     st.session_state["main_dashboard_view"] = dashboard_sections[0]
 
-selected_dashboard_view = st.radio(
-    "Main Dashboard View",
-    options=dashboard_sections,
-    key="main_dashboard_view",
-    horizontal=True,
-    label_visibility="collapsed",
-    on_change=mark_top_nav_change,
-)
+active_hub_view = st.session_state.get("active_hub_view", "main_menu")
+current_main_view = st.session_state.get("main_dashboard_view", dashboard_sections[0])
+hide_main_dashboard_selector = is_dashboard_drilldown_active(current_main_view)
+
+if hide_main_dashboard_selector:
+    selected_dashboard_view = st.session_state.get("main_dashboard_view", dashboard_sections[0])
+else:
+    selected_dashboard_view = st.radio(
+        "Main Dashboard View",
+        options=dashboard_sections,
+        key="main_dashboard_view",
+        horizontal=True,
+        label_visibility="collapsed",
+        on_change=mark_top_nav_change,
+    )
+
+show_app_header = not is_dashboard_drilldown_active(selected_dashboard_view)
+
+if show_app_header:
+    st.title("🏠 Home Sync Dashboard")
 
 if selected_dashboard_view == "🏠 Household Hub":
     # 1. Initialize the session state for this tab
@@ -432,12 +473,13 @@ if selected_dashboard_view == "🏠 Household Hub":
     # VIEW: SUB-MODULES (What happens when you click a card)
     # ==========================================
     else:
-        # Universal "Back" button to return to the grid
-        if st.button("⬅️ Back to Hub Menu"):
-            st.session_state["active_hub_view"] = "main_menu"
-            rerun_with_reason("hub_nav")
-            
-        st.divider()
+        show_hub_back = current_view != "budget"
+        if show_hub_back:
+            # Universal "Back" button to return to the grid
+            if st.button("⬅️ Back to Hub Menu"):
+                st.session_state["active_hub_view"] = "main_menu"
+                rerun_with_reason("hub_nav")
+            st.divider()
         
         if current_view == "todo":
             st.subheader("📋 Active To-Do List")
@@ -888,7 +930,7 @@ if selected_dashboard_view == "🏠 Household Hub":
             
         elif current_view == "budget":
             # 💰 Financial Overview is now entirely handled by new module!
-            render_budget_module()
+            render_budget_module(show_back_to_hub=True)
             
         elif current_view == "calendar":
             st.subheader("📅 Family Calendar")
@@ -1214,9 +1256,6 @@ if selected_dashboard_view == "🆕 What's New":
         st.error(f"Could not load the changelog: {e}")
 
 if user_role == "developer" and selected_dashboard_view == "🛠️ Developer Dashboard":
-        st.subheader("🛠️ Developer Dashboard")
-        st.caption("Backlog management plus future-facing operational tooling for your app ecosystem.")
-
         if "developer_dashboard_view" not in st.session_state:
             st.session_state["developer_dashboard_view"] = "menu"
         if "backlog_flash" not in st.session_state:
@@ -1229,6 +1268,9 @@ if user_role == "developer" and selected_dashboard_view == "🛠️ Developer Da
         dev_view = st.session_state.get("developer_dashboard_view", "menu")
 
         if dev_view == "menu":
+            st.subheader("🛠️ Developer Dashboard")
+            st.caption("Backlog management plus future-facing operational tooling for your app ecosystem.")
+
             try:
                 radar_response = (
                     get_supabase_client()
@@ -1280,6 +1322,8 @@ if user_role == "developer" and selected_dashboard_view == "🛠️ Developer Da
                     st.markdown("### 🧭 Developer Overview")
                     st.caption("System health, technical debt, analytics, and migration posture.")
                     if st.button("Open Developer Overview", key="open_dev_overview", width='stretch'):
+                        request_main_dashboard_view("🛠️ Developer Dashboard")
+                        st.session_state["active_hub_view"] = "main_menu"
                         st.session_state["developer_dashboard_view"] = "overview"
                         rerun_with_reason("dev_nav")
 
@@ -1288,11 +1332,15 @@ if user_role == "developer" and selected_dashboard_view == "🛠️ Developer Da
                     st.markdown("### 🎟️ Backlog & Release Management")
                     st.caption("Create/edit backlog items, review staged work, and cut releases.")
                     if st.button("Open Backlog & Release", key="open_dev_backlog", width='stretch'):
+                        request_main_dashboard_view("🛠️ Developer Dashboard")
+                        st.session_state["active_hub_view"] = "main_menu"
                         st.session_state["developer_dashboard_view"] = "backlog_release"
                         rerun_with_reason("dev_nav")
 
         else:
             if st.button("⬅️ Back to Developer Modules", key="back_dev_modules"):
+                request_main_dashboard_view("🛠️ Developer Dashboard")
+                st.session_state["active_hub_view"] = "main_menu"
                 st.session_state["developer_dashboard_view"] = "menu"
                 rerun_with_reason("dev_nav")
 
