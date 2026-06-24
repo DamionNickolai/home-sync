@@ -386,14 +386,14 @@ if selected_dashboard_view == "🏠 Household Hub":
                 st.caption("Manage daily chores and household projects.")
                 if st.button("Open To-Do List", type="secondary", width='stretch'):
                     st.session_state["active_hub_view"] = "todo"
-                    queue_rerun_reason("hub_nav")
+                    rerun_with_reason("hub_nav")
                     
             with st.container(border=True):
                 st.markdown("### 💰 Budget")
                 st.caption("Track monthly spending and financial goals.")
                 if st.button("Open Budget", type="secondary", width='stretch'):
                     st.session_state["active_hub_view"] = "budget"
-                    queue_rerun_reason("hub_nav")
+                    rerun_with_reason("hub_nav")
                     
         with col2:
             with st.container(border=True):
@@ -401,14 +401,14 @@ if selected_dashboard_view == "🏠 Household Hub":
                 st.caption("Shared family grocery list and meal prep.")
                 if st.button("Open Groceries", type="secondary", width='stretch'):
                     st.session_state["active_hub_view"] = "groceries"
-                    queue_rerun_reason("hub_nav")
+                    rerun_with_reason("hub_nav")
                     
             with st.container(border=True):
                 st.markdown("### 📅 Calendar")
                 st.caption("Family schedule, appointments, and events.")
                 if st.button("Open Calendar", type="secondary", width='stretch'):
                     st.session_state["active_hub_view"] = "calendar"
-                    queue_rerun_reason("hub_nav")
+                    rerun_with_reason("hub_nav")
 
     # ==========================================
     # VIEW: SUB-MODULES (What happens when you click a card)
@@ -417,7 +417,7 @@ if selected_dashboard_view == "🏠 Household Hub":
         # Universal "Back" button to return to the grid
         if st.button("⬅️ Back to Hub Menu"):
             st.session_state["active_hub_view"] = "main_menu"
-            queue_rerun_reason("hub_nav")
+            rerun_with_reason("hub_nav")
             
         st.divider()
         
@@ -1263,7 +1263,7 @@ if user_role == "developer" and selected_dashboard_view == "🛠️ Developer Da
                     st.caption("System health, technical debt, analytics, and migration posture.")
                     if st.button("Open Developer Overview", key="open_dev_overview", width='stretch'):
                         st.session_state["developer_dashboard_view"] = "overview"
-                        queue_rerun_reason("dev_nav")
+                        rerun_with_reason("dev_nav")
 
             with card_col2:
                 with st.container(border=True):
@@ -1271,12 +1271,12 @@ if user_role == "developer" and selected_dashboard_view == "🛠️ Developer Da
                     st.caption("Create/edit backlog items, review staged work, and cut releases.")
                     if st.button("Open Backlog & Release", key="open_dev_backlog", width='stretch'):
                         st.session_state["developer_dashboard_view"] = "backlog_release"
-                        queue_rerun_reason("dev_nav")
+                        rerun_with_reason("dev_nav")
 
         else:
             if st.button("⬅️ Back to Developer Modules", key="back_dev_modules"):
                 st.session_state["developer_dashboard_view"] = "menu"
-                queue_rerun_reason("dev_nav")
+                rerun_with_reason("dev_nav")
 
             st.divider()
 
