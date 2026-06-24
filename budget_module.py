@@ -24,6 +24,7 @@ from database import (
     calculate_spend_money,
     get_user_finance_settings,
     log_expense_and_check_project,
+    get_shared_member_expenses,
     get_budget_categories,
     insert_budget_category,
     insert_household_income,
@@ -32,7 +33,9 @@ from database import (
     delete_budget_category,
     delete_household_income,
     initialize_default_categories,
-    ensure_household_initialized
+    ensure_household_initialized,
+    auto_rollover_recurring_incomes,
+    auto_rollover_recurring_expenses
 )
 
 def _to_number(value, default=0.0):
@@ -261,6 +264,8 @@ def render_budget_module(show_back_to_hub=False):
         st.session_state["wishlist_active_owner"] = None
     if "wishlist_pending_owner" not in st.session_state:
         st.session_state["wishlist_pending_owner"] = None
+    if "wishlist_active_section" not in st.session_state:
+        st.session_state["wishlist_active_section"] = "active"
 
     view = st.session_state["budget_view"]
     can_access_projects = _can_access_projects_module()
@@ -294,23 +299,20 @@ def render_budget_module(show_back_to_hub=False):
 
         with r1c2:
             with st.container(border=True):
-                st.markdown("### 👤 Personal Budget")
+                # Safely grab the username, defaulting to 'User' just in case
+                username = st.session_state.get("username", "User")
+                
+                # 🟢 DYNAMIC HEADER INJECTED HERE
+                st.markdown(f"### 👤 {username.title()}'s Personal Ledger")
                 st.caption("Your private dashboard for personal 'spend money'.")
+                
                 if st.button("Open Personal", key="btn_personal", type="secondary", width="stretch"):
                     st.session_state["budget_view"] = "personal"
                     st.rerun()
 
-        # --- ROW 2: Event Logging & Projects ---
-        r2c1, r2c2 = st.columns(2)
+        # --- ROW 2: Projects & Wish List ---
+        r2c1, r2c2 = st.columns(2)                  
         with r2c1:
-            with st.container(border=True):
-                st.markdown("### 💳 Expense Tracker")
-                st.caption("Log a purchase to automatically update ledgers.")
-                if st.button("Log Expense", key="btn_expense", type="primary", width="stretch"):
-                    st.session_state["budget_view"] = "expense_tracker"
-                    st.rerun()
-                    
-        with r2c2:
             with st.container(border=True):
                 st.markdown("### 🛠️ Projects")
                 if can_access_projects:
@@ -322,9 +324,7 @@ def render_budget_module(show_back_to_hub=False):
                     st.caption("Projects access is restricted.")
                     st.button("Projects Locked", disabled=True, width="stretch")
 
-        # --- ROW 3: Wish List ---
-        r3c1, r3c2 = st.columns(2)
-        with r3c1:
+        with r2c2:
             with st.container(border=True):
                 st.markdown("### 💝 Wish List")
                 st.caption("Track purchase ideas in a shared household list.")
@@ -432,7 +432,23 @@ def render_budget_module(show_back_to_hub=False):
         active_rows = [r for r in visible_rows if not bool(r.get("is_completed", False))]
         completed_rows = [r for r in visible_rows if bool(r.get("is_completed", False))]
 
-        filtered_rows = [r for r in active_rows if get_row_owner_username(r) == selected_owner]
+        filtered_active_rows = [r for r in active_rows if get_row_owner_username(r) == selected_owner]
+        filtered_completed_rows = [r for r in completed_rows if get_row_owner_username(r) == selected_owner]
+
+        wishlist_section_keys = ["active", "completed"]
+        if st.session_state.get("wishlist_active_section") not in wishlist_section_keys:
+            st.session_state["wishlist_active_section"] = "active"
+
+        def wishlist_section_label(section_key):
+            if section_key == "active":
+                return f"🛍️ Active ({len(filtered_active_rows)})"
+            return f"✅ Completed ({len(filtered_completed_rows)})"
+
+        selected_wishlist_section = _render_two_col_selector(
+            key="wishlist_active_section",
+            options=wishlist_section_keys,
+            format_func=wishlist_section_label,
+        )
 
         with st.expander("➕ Add Wish List Item", expanded=False):
             with st.form("add_wishlist_item_form", clear_on_submit=True):
@@ -481,137 +497,140 @@ def render_budget_module(show_back_to_hub=False):
                         else:
                             st.error("Could not add wish list item.")
 
-        if not filtered_rows:
-            st.info(f"No wish list items for {selected_owner} yet.")
-            return
+        if selected_wishlist_section == "active":
+            if not filtered_active_rows:
+                st.info(f"No active wish list items for {selected_owner} yet.")
+                return
 
-        for row in filtered_rows:
-            row_id = row.get("id")
-            if row_id is None:
-                continue
+            for row in filtered_active_rows:
+                row_id = row.get("id")
+                if row_id is None:
+                    continue
 
-            item_name = row.get("item") or "Unnamed Item"
-            description = _clean_text(row.get("description"))
-            est_price = row.get("estimated_price")
-            actual_cost = row.get("actual_cost")
-            vendor = _clean_text(row.get("vendor"))
-            notes = _clean_text(row.get("notes"))
-            veteran_discount = bool(row.get("veteran_discount", False))
-            owner_name = get_row_owner_username(row)
+                item_name = row.get("item") or "Unnamed Item"
+                description = _clean_text(row.get("description"))
+                est_price = row.get("estimated_price")
+                actual_cost = row.get("actual_cost")
+                vendor = _clean_text(row.get("vendor"))
+                notes = _clean_text(row.get("notes"))
+                veteran_discount = bool(row.get("veteran_discount", False))
+                owner_name = get_row_owner_username(row)
 
-            editable = can_edit_wish_row(row)
+                editable = can_edit_wish_row(row)
 
-            with st.container(border=True):
-                left, right = st.columns([6, 1])
-                left.markdown(f"**{item_name}**")
-                if description:
-                    left.markdown(f"**Description:** {description}")
-                if vendor:
-                    left.markdown(f"**Brand or Vendor:** {vendor}")
-                if est_price is not None:
-                    left.markdown(
-                        f"**Estimated:** <span style='color: #16A34A; font-weight: 700;'>{_format_money(est_price)}</span>",
-                        unsafe_allow_html=True,
-                    )
-                if notes:
-                    left.markdown(f"**Notes:** {notes}")
-                if veteran_discount:
-                    left.caption("Eligible for veteran discount.")
-
-                if editable:
-                    if right.button("✏️ Edit", key=f"edit_wishlist_{row_id}", width="stretch"):
-                        current_edit = st.session_state.get("editing_wishlist_id")
-                        st.session_state["editing_wishlist_id"] = None if current_edit == row_id else row_id
-                        st.rerun()
-
-            if editable and st.session_state.get("editing_wishlist_id") == row_id:
                 with st.container(border=True):
-                    st.markdown("### ✏️ Edit Wish Item")
-                    with st.form(f"edit_wishlist_form_{row_id}"):
-                        e1, e2 = st.columns([2, 1])
-                        e_item = e1.text_input("Item *", value=item_name)
-                        e_est_raw = e2.text_input("Estimated Price", value=_format_currency_for_input(est_price))
+                    left, right = st.columns([6, 1])
+                    left.markdown(f"**{item_name}**")
+                    if description:
+                        left.markdown(f"**Description:** {description}")
+                    if vendor:
+                        left.markdown(f"**Brand or Vendor:** {vendor}")
+                    if est_price is not None:
+                        left.markdown(
+                            f"**Estimated:** <span style='color: #16A34A; font-weight: 700;'>{_format_money(est_price)}</span>",
+                            unsafe_allow_html=True,
+                        )
+                    if notes:
+                        left.markdown(f"**Notes:** {notes}")
+                    if veteran_discount:
+                        left.caption("Eligible for veteran discount.")
 
-                        e_description = st.text_area("Description", value=description)
+                    if editable:
+                        if right.button("✏️ Edit", key=f"edit_wishlist_{row_id}", width="stretch"):
+                            current_edit = st.session_state.get("editing_wishlist_id")
+                            st.session_state["editing_wishlist_id"] = None if current_edit == row_id else row_id
+                            st.rerun()
 
-                        f1, f2, f3 = st.columns([1, 1, 2])
-                        e_actual_raw = f1.text_input("Actual Cost", value=_format_currency_for_input(actual_cost))
-                        e_vet_discount = f2.checkbox("Veteran Discount", value=veteran_discount)
-                        e_vendor = f3.text_input("Vendor", value=vendor)
+                if editable and st.session_state.get("editing_wishlist_id") == row_id:
+                    with st.container(border=True):
+                        st.markdown("### ✏️ Edit Wish Item")
+                        with st.form(f"edit_wishlist_form_{row_id}"):
+                            e1, e2 = st.columns([2, 1])
+                            e_item = e1.text_input("Item *", value=item_name)
+                            e_est_raw = e2.text_input("Estimated Price", value=_format_currency_for_input(est_price))
 
-                        e_notes = st.text_area("Notes", value=notes)
+                            e_description = st.text_area("Description", value=description)
 
-                        save_col, complete_col, delete_col, cancel_col = st.columns([2, 1, 1, 1])
-                        save_clicked = save_col.form_submit_button("💾 Save", type="primary", width="stretch")
-                        complete_clicked = complete_col.form_submit_button("✅ Complete", width="stretch")
-                        delete_clicked = delete_col.form_submit_button("🗑️ Delete", width="stretch")
-                        cancel_clicked = cancel_col.form_submit_button("❌ Cancel", width="stretch")
+                            f1, f2, f3 = st.columns([1, 1, 2])
+                            e_actual_raw = f1.text_input("Actual Cost", value=_format_currency_for_input(actual_cost))
+                            e_vet_discount = f2.checkbox("Veteran Discount", value=veteran_discount)
+                            e_vendor = f3.text_input("Vendor", value=vendor)
 
-                    if save_clicked:
-                        parsed_est = _parse_currency_input(e_est_raw)
-                        parsed_actual = _parse_currency_input(e_actual_raw)
+                            e_notes = st.text_area("Notes", value=notes)
 
-                        if not e_item.strip():
-                            st.warning("Item is required.")
-                        elif "invalid" in [parsed_est, parsed_actual]:
-                            st.warning("Estimated Price and Actual Cost must be valid numbers.")
-                        else:
-                            update_payload = {
-                                "item": e_item.strip(),
-                                "description": _clean_text(e_description) or None,
-                                "estimated_price": float(parsed_est) if parsed_est is not None else None,
-                                "actual_cost": float(parsed_actual) if parsed_actual is not None else None,
-                                "veteran_discount": bool(e_vet_discount),
-                                "vendor": _clean_text(e_vendor) or None,
-                                "notes": _clean_text(e_notes) or None,
-                            }
-                            if update_wish_list_item(str(row_id), update_payload):
-                                st.session_state["wishlist_pending_owner"] = owner_name
+                            save_col, complete_col, delete_col, cancel_col = st.columns([2, 1, 1, 1])
+                            save_clicked = save_col.form_submit_button("💾 Save", type="primary", width="stretch")
+                            complete_clicked = complete_col.form_submit_button("✅ Complete", width="stretch")
+                            delete_clicked = delete_col.form_submit_button("🗑️ Delete", width="stretch")
+                            cancel_clicked = cancel_col.form_submit_button("❌ Cancel", width="stretch")
+
+                        if save_clicked:
+                            parsed_est = _parse_currency_input(e_est_raw)
+                            parsed_actual = _parse_currency_input(e_actual_raw)
+
+                            if not e_item.strip():
+                                st.warning("Item is required.")
+                            elif "invalid" in [parsed_est, parsed_actual]:
+                                st.warning("Estimated Price and Actual Cost must be valid numbers.")
+                            else:
+                                update_payload = {
+                                    "item": e_item.strip(),
+                                    "description": _clean_text(e_description) or None,
+                                    "estimated_price": float(parsed_est) if parsed_est is not None else None,
+                                    "actual_cost": float(parsed_actual) if parsed_actual is not None else None,
+                                    "veteran_discount": bool(e_vet_discount),
+                                    "vendor": _clean_text(e_vendor) or None,
+                                    "notes": _clean_text(e_notes) or None,
+                                }
+                                if update_wish_list_item(str(row_id), update_payload):
+                                    st.session_state["wishlist_pending_owner"] = owner_name
+                                    st.session_state["editing_wishlist_id"] = None
+                                    st.success("Wish list item updated.")
+                                    st.rerun()
+                                else:
+                                    st.error("Could not update this wish list item.")
+
+                        if complete_clicked:
+                            if complete_wish_list_item(str(row_id)):
                                 st.session_state["editing_wishlist_id"] = None
-                                st.success("Wish list item updated.")
+                                st.success("Wish list item completed.")
                                 st.rerun()
                             else:
-                                st.error("Could not update this wish list item.")
+                                st.error("Could not complete this wish list item.")
 
-                    if complete_clicked:
-                        if complete_wish_list_item(str(row_id)):
-                            st.session_state["editing_wishlist_id"] = None
-                            st.success("Wish list item completed.")
-                            st.rerun()
-                        else:
-                            st.error("Could not complete this wish list item.")
-
-                    if delete_clicked:
-                        if delete_wish_list_item(str(row_id)):
-                            st.session_state["editing_wishlist_id"] = None
-                            st.success("Wish list item deleted.")
-                            st.rerun()
-                        else:
-                            st.error("Could not delete this wish list item.")
-
-                    if cancel_clicked:
-                        st.session_state["editing_wishlist_id"] = None
-                        st.rerun()
-
-            st.divider()
-
-        if completed_rows:
-            with st.expander("✅ Completed Items", expanded=False):
-                for row in completed_rows:
-                    completed_name = row.get("item") or "Unnamed Item"
-                    completed_actual = row.get("actual_cost")
-                    completed_editable = can_edit_wish_row(row)
-                    col_text, col_action = st.columns([6, 1])
-                    col_text.caption(f"{completed_name}")
-                    if completed_actual is not None:
-                        col_text.caption(f"Actual: {_format_money(completed_actual)}")
-                    if completed_editable:
-                        if col_action.button("↩️ Restore", key=f"restore_wishlist_{row.get('id')}", width="stretch"):
-                            if restore_wish_list_item(str(row.get("id"))):
-                                st.success("Wish list item restored.")
+                        if delete_clicked:
+                            if delete_wish_list_item(str(row_id)):
+                                st.session_state["editing_wishlist_id"] = None
+                                st.success("Wish list item deleted.")
                                 st.rerun()
                             else:
-                                st.error("Could not restore this wish list item.")
+                                st.error("Could not delete this wish list item.")
+
+                        if cancel_clicked:
+                            st.session_state["editing_wishlist_id"] = None
+                            st.rerun()
+
+                st.divider()
+        else:
+            if not filtered_completed_rows:
+                st.info(f"No completed wish list items for {selected_owner} yet.")
+                return
+
+            for row in filtered_completed_rows:
+                completed_name = row.get("item") or "Unnamed Item"
+                completed_actual = row.get("actual_cost")
+                completed_editable = can_edit_wish_row(row)
+                col_text, col_action = st.columns([6, 1])
+                col_text.caption(f"{completed_name}")
+                if completed_actual is not None:
+                    col_text.caption(f"Actual: {_format_money(completed_actual)}")
+                if completed_editable:
+                    if col_action.button("↩️ Restore", key=f"restore_wishlist_{row.get('id')}", width="stretch"):
+                        if restore_wish_list_item(str(row.get("id"))):
+                            st.success("Wish list item restored.")
+                            st.rerun()
+                        else:
+                            st.error("Could not restore this wish list item.")
 
         return
 
@@ -681,227 +700,421 @@ def render_budget_module(show_back_to_hub=False):
             
         st.subheader("🏦 Household Budget")
         household_id = st.session_state.get("household_id")
+        auth_user_id = st.session_state.get("auth_user_id")
+        username = st.session_state.get("username")
         
         current_month = datetime.now().strftime("%Y-%m")
         selected_month = st.selectbox("Select Month", [current_month, "2026-05", "2026-04"], index=0)
         
+        # 🟢 THE DUAL ROLLOVER ENGINE HOOK
+        incomes_rolled = auto_rollover_recurring_incomes(household_id, selected_month)
+        expenses_rolled = auto_rollover_recurring_expenses(household_id, selected_month)
+        
+        if incomes_rolled or expenses_rolled:
+            st.rerun() # Refresh instantly to show the new data!
+            
         incomes_df = get_household_incomes(household_id, selected_month)
         expenses_df = get_monthly_expenses(household_id, selected_month, include_private_members=True)
         routing_df = get_cash_flow_routing(household_id)
         
         total_take_home = incomes_df["take_home_amount"].sum() if not incomes_df.empty else 0.0
         taxable_income = incomes_df.loc[incomes_df["is_taxable"] == True, "gross_amount"].sum() if not incomes_df.empty else 0.0
-        total_expenses = expenses_df["amount"].sum() if not expenses_df.empty else 0.0
+        
+        if not expenses_df.empty and "is_personal_spend" in expenses_df.columns:
+            hh_expenses_df = expenses_df[expenses_df["is_personal_spend"] == False]
+        else:
+            hh_expenses_df = expenses_df
+            
+        total_expenses = hh_expenses_df["amount"].sum() if not hh_expenses_df.empty else 0.0
         net_cash_flow = total_take_home - total_expenses
         
         household_view_mode = _render_two_col_selector(
             key="household_view_mode",
-            options=["📊 Master Ledger", "🔄 Cash Flow & Treasury", "⚙️ Settings & Setup"],
+            options=["📊 Master Ledger", "💳 Log Expense", "🔄 Cash Flow & Treasury", "👥 Member Budgets"]
         )
         
+        # --- TAB 1: MASTER LEDGER ---
         if household_view_mode == "📊 Master Ledger":
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("Total Take-Home", f"${total_take_home:,.2f}")
-            col2.metric("Total Expenses", f"${total_expenses:,.2f}")
+            col2.metric("Total Shared Expenses", f"${total_expenses:,.2f}")
             col3.metric("Net Cash Flow", f"${net_cash_flow:,.2f}", delta=f"${net_cash_flow:,.2f}", delta_color="normal")
             col4.metric("Annual Taxable Pace", f"${(taxable_income * 12):,.2f}")
             st.divider()
             
-            st.markdown("#### Income Streams")
-            if not incomes_df.empty:
-                display_inc = incomes_df[["source_name", "take_home_amount", "gross_amount", "is_taxable", "is_windfall", "is_recurring"]].copy()
-                display_inc.columns = ["Source", "Take-Home", "Gross", "Taxable?", "Windfall?", "Recurring?"]
-                st.dataframe(display_inc, hide_index=True)
-            else:
-                st.info("No income logged for this month yet.")
-        
-            st.markdown("#### Household Expenses")
-            if not expenses_df.empty:
-                display_exp = expenses_df[["date_logged", "amount", "details"]].copy()
+            st.markdown("#### Household Shared Ledger")
+            if not hh_expenses_df.empty:
+                display_exp = hh_expenses_df[["date_logged", "amount", "details"]].copy()
                 display_exp.columns = ["Date", "Amount", "Details"]
                 st.dataframe(display_exp, hide_index=True)
             else:
-                st.info("No expenses logged for this month yet.")
+                st.info("No shared household expenses logged for this month yet.")
                 
-        elif household_view_mode == "🔄 Cash Flow & Treasury":
-            st.caption("Algorithms powered by legacy Excel routing.")
-            if not routing_df.empty:
-                st.markdown("#### Personal Spend Allocation")
-                if not incomes_df.empty:
-                    selected_paycheck = st.selectbox("Select Funding Source", incomes_df["source_name"].tolist())
-                    paycheck_val = incomes_df.loc[incomes_df["source_name"] == selected_paycheck, "take_home_amount"].values[0]
-                    spend_money = calculate_spend_money(paycheck_val, routing_df)
-                    st.metric(f"Spend Money per Person (from {selected_paycheck})", f"${spend_money:,.2f}")
-                else:
-                    st.warning("Please add income to calculate Spend Money.")
-                    
-                st.divider()
-                st.markdown("#### Destination Routing Targets")
-                display_route = routing_df[["destination_account", "line_item", "annual_goal", "monthly_target"]].copy()
-                display_route.columns = ["Destination Account", "Line Item", "Annual Goal", "Monthly Target"]
-                display_route["Target (÷2)"] = display_route["Monthly Target"] / 2
-                st.dataframe(display_route, hide_index=True)
+        # --- TAB 2: LOG EXPENSE (HOUSEHOLD) ---
+        elif household_view_mode == "💳 Log Expense":
+            st.markdown("#### Log a Shared Household Bill/Expense")
+            
+            # 🟢 Explicitly request Household categories
+            categories_df = get_budget_categories(household_id, is_personal=False) 
+            
+            if categories_df.empty:
+                st.warning("No active categories found. Please add one below.")
             else:
-                st.info("No routing targets configured yet.")
-
-        elif household_view_mode == "⚙️ Settings & Setup":
-            st.caption("Manage encrypted budget categories and monthly income streams.")
-            
-            # Fetch active household users for the dropdown
-            household_users = get_household_users_for_admin()
-            user_options = [_clean_text(u.get("username")) for u in household_users if _clean_text(u.get("username"))]
-            if not user_options:
-                user_options = ["unassigned"]
-            
-            set_col1, set_col2 = st.columns(2)
-            
-            # --- ADD CATEGORY ---
-            with set_col1:
-                with st.container(border=True):
-                    st.markdown("#### 🏷️ Add New Category")
-                    with st.form("add_category_form", clear_on_submit=True):
-                        new_cat_name = st.text_input("Category Name *", placeholder="e.g., Auto, Home")
-                        new_sub_cat = st.text_input("Sub-Category (Optional)", placeholder="e.g., Fuel, Groceries")
-                        new_cat_type = st.selectbox("Type", ["Fixed Expense", "Variable Expense", "Project", "Income"])
-                        
-                        if st.form_submit_button("💾 Save Category", type="primary", width="stretch"):
-                            if not new_cat_name.strip():
-                                st.error("Category name is required.")
-                            else:
-                                if insert_budget_category(household_id, new_cat_name, new_cat_type, new_sub_cat):
-                                    st.success(f"Added {new_cat_name}!")
-                                    st.rerun()
-
-                # --- INITIALIZE DEFAULTS ---
-                with st.expander("🚀 Quick Setup: Load Default Categories"):
-                    st.caption("Load a standard set of encrypted budget categories to get started quickly.")
-                    if st.button("Load System Defaults", type="primary", width="stretch"):
-                        if initialize_default_categories(household_id):
-                            st.success("Default categories securely generated and encrypted!")
-                            st.rerun()
+                categories_df["display_name"] = categories_df.apply(lambda row: f"{row['category_name']} - {row['sub_category_name']}" if pd.notnull(row.get('sub_category_name')) else row['category_name'], axis=1)
+                display_list = categories_df["display_name"].tolist()
+                
+                with st.form("hh_expense_entry", clear_on_submit=True):
+                    a1, a2 = st.columns([1, 1])
+                    date_logged = a1.date_input("Date")
+                    amount_raw = a2.text_input("Amount ($) *")
+                    
+                    # Category is now INSIDE the form
+                    selected_display_name = st.selectbox("Category", display_list)
+                    
+                    details = st.text_input("Details & Vendor *")
+                    is_recurring = st.checkbox("🔄 Make this a recurring monthly bill", value=False)
+                    
+                    if st.form_submit_button("💾 Save Shared Expense", type="primary", width="stretch"):
+                        parsed_amount = _parse_currency_input(amount_raw)
+                        if "invalid" == parsed_amount or parsed_amount is None or not details.strip():
+                            st.error("Valid amount and details required.")
                         else:
-                            st.error("Failed to load defaults.")
-
-                # Manage Existing Categories
-                with st.expander("🛠️ Manage Categories"):
-                    categories_df = get_budget_categories(household_id)
-                    if not categories_df.empty:
-                        for _, row in categories_df.iterrows():
-                            cat_id = row["id"]
-                            cat_name = row["category_name"]
-                            sub_cat = row.get("sub_category_name")
-                            display_name = f"{cat_name} - {sub_cat}" if pd.notnull(sub_cat) else cat_name
+                            cat_row = categories_df[categories_df["display_name"] == selected_display_name].iloc[0]
                             
-                            c1, c2 = st.columns([4, 1])
-                            c1.caption(f"{display_name} ({row['category_type']})")
-                            if c2.button("❌", key=f"del_cat_{cat_id}"):
-                                if delete_budget_category(cat_id):
-                                    st.rerun()
-                    else:
-                        st.caption("No categories found.")
-            
-            # --- ADD INCOME ---
-            with set_col2:
-                with st.container(border=True):
-                    st.markdown(f"#### 💵 Add Income ({selected_month})")
-                    with st.form("add_income_form", clear_on_submit=True):
-                        source_name = st.text_input("Source Name", placeholder="e.g., Paycheck, Other Income")
-                        
-                        # 🟢 Assign Ownership Dropdown
-                        owner_username = st.selectbox("Assign to Earner", user_options)
-                        
-                        inc1, inc2 = st.columns(2)
-                        take_home = inc1.text_input("Take-Home (Net) $")
-                        gross = inc2.text_input("Gross $")
-                        
-                        tax1, tax2 = st.columns(2)
-                        is_taxable = tax1.checkbox("Is Taxable?", value=True)
-                        is_windfall = tax2.checkbox("Ad-hoc/Windfall?", value=False)
-                        is_recurring = st.checkbox("🔄 Recurring Income? (Auto-roll to next month)", value=True)
-                        
-                        if st.form_submit_button("💾 Save Income", type="primary", width="stretch"):
-                            th_val = _parse_currency_input(take_home)
-                            g_val = _parse_currency_input(gross)
-                            if not source_name.strip() or th_val == "invalid" or g_val == "invalid":
-                                st.error("Please provide a valid source name and dollar amounts.")
+                            success = log_expense_and_check_project(
+                                auth_user_id=auth_user_id, username=username, household_id=household_id,
+                                month_year=date_logged.strftime("%Y-%m"), date_logged=date_logged,
+                                category_id=cat_row["id"], amount=parsed_amount, details=details, 
+                                is_personal_spend=False, is_recurring=is_recurring
+                            )
+                            if success:
+                                st.success(f"Logged ${_format_money(parsed_amount)} to Household Ledger.")
+                                st.rerun()
                             else:
-                                if insert_household_income(household_id, selected_month, source_name, th_val, g_val, is_taxable, owner_username, is_windfall, is_recurring):
-                                    st.success(f"Added {source_name}!")
-                                    st.rerun()
-                                    
-                # Manage Existing Income
-                with st.expander(f"🛠️ Manage Income ({selected_month})"):
-                    if not incomes_df.empty:
-                        for _, row in incomes_df.iterrows():
-                            inc_id = row["id"]
-                            inc_name = row["source_name"]
-                            inc_owner = row.get("owner_username", "unassigned")
-                            
-                            c1, c2 = st.columns([4, 1])
-                            c1.caption(f"{inc_name} ({inc_owner}) - ${_to_number(row['take_home_amount']):,.2f}")
-                            if c2.button("❌", key=f"del_inc_{inc_id}"):
-                                if delete_household_income(inc_id):
-                                    st.rerun()
-                    else:
-                        st.caption("No income found for this month.")
-                                    
+                                st.error("Failed to log expense.")
+            
+            st.divider()
+            
+            # 🟢 CONTEXTUAL SETTINGS: Manage Categories
+            with st.expander("⚙️ Manage Expense Categories"):
+                st.markdown("**🏷️ Add New Category**")
+                with st.form("add_cat_hh_form", clear_on_submit=True):
+                    new_cat_name = st.text_input("Category Name *", placeholder="e.g., Auto, Home")
+                    new_sub_cat = st.text_input("Sub-Category (Optional)", placeholder="e.g., Fuel, Groceries")
+                    new_cat_type = st.selectbox("Type", ["Fixed Expense", "Variable Expense", "Project"])
+                    
+                    if st.form_submit_button("💾 Save Category", type="primary", width="stretch"):
+                        if not new_cat_name.strip():
+                            st.error("Category name is required.")
+                        else:
+                            if insert_budget_category(household_id, new_cat_name, new_cat_type, new_sub_cat):
+                                st.success(f"Added {new_cat_name}!")
+                                st.rerun()
+                                
+                st.markdown("**🛠️ Existing Categories**")
+                if not categories_df.empty:
+                    for _, row in categories_df.iterrows():
+                        cat_id = row["id"]
+                        cat_name = row["category_name"]
+                        sub_cat = row.get("sub_category_name")
+                        display_name = f"{cat_name} - {sub_cat}" if pd.notnull(sub_cat) and sub_cat else cat_name
+                        
+                        c1, c2 = st.columns([4, 1])
+                        c1.caption(f"{display_name} ({row['category_type']})")
+                        if c2.button("❌", key=f"del_cat_hh_{cat_id}"):
+                            if delete_budget_category(cat_id):
+                                st.rerun()
+                else:
+                    st.caption("No categories found.")
+                                
+        # --- TAB 3: CASH FLOW & TREASURY ---
+        elif household_view_mode == "🔄 Cash Flow & Treasury":
+            st.markdown("#### 💵 Cash Flow & Income Tracking")
+            
+            if not incomes_df.empty:
+                st.markdown("**Current Month Income Streams**")
+                display_inc = incomes_df[["source_name", "owner_username", "take_home_amount", "gross_amount", "is_recurring"]].copy()
+                display_inc.columns = ["Source", "Earner", "Net (Take-Home)", "Gross", "Recurring?"]
+                st.dataframe(display_inc, hide_index=True)
+                st.metric("Total Household Net Income", f"${total_take_home:,.2f}")
+            else:
+                st.info("No income logged for this month.")
+                
+            st.divider()
+            
+            with st.expander("➕ Add New Income Stream"):
+                household_users = get_household_users_for_admin()
+                user_options = [_clean_text(u.get("username")) for u in household_users if _clean_text(u.get("username"))]
+                if not user_options:
+                    user_options = ["unassigned"]
+                    
+                with st.form("add_income_form", clear_on_submit=True):
+                    source_name = st.text_input("Source Name", placeholder="e.g., NFCU Pay, VA")
+                    owner_username = st.selectbox("Assign to Earner", user_options)
+                    
+                    inc1, inc2 = st.columns(2)
+                    take_home = inc1.text_input("Take-Home (Net) $")
+                    gross = inc2.text_input("Gross $")
+                    
+                    tax1, tax2 = st.columns(2)
+                    is_taxable = tax1.checkbox("Is Taxable?", value=True)
+                    is_windfall = tax2.checkbox("Ad-hoc/Windfall?", value=False)
+                    is_recurring = st.checkbox("🔄 Recurring Income? (Auto-roll to next month)", value=True)
+                    
+                    if st.form_submit_button("💾 Save Income", type="primary", width="stretch"):
+                        th_val = _parse_currency_input(take_home)
+                        g_val = _parse_currency_input(gross)
+                        if not source_name.strip() or th_val == "invalid" or g_val == "invalid":
+                            st.error("Please provide a valid source name and dollar amounts.")
+                        else:
+                            if insert_household_income(household_id, selected_month, source_name, th_val, g_val, is_taxable, owner_username, is_windfall, is_recurring, is_personal_income=False):
+                                st.success(f"Added {source_name}!")
+                                st.rerun()
+                                
+            with st.expander(f"🛠️ Manage Income ({selected_month})"):
+                if not incomes_df.empty:
+                    for _, row in incomes_df.iterrows():
+                        inc_id = row["id"]
+                        inc_name = row["source_name"]
+                        inc_owner = row.get("owner_username", "unassigned")
+                        
+                        c1, c2 = st.columns([4, 1])
+                        c1.caption(f"{inc_name} ({inc_owner}) - ${_to_number(row['take_home_amount']):,.2f}")
+                        if c2.button("❌", key=f"del_inc_{inc_id}"):
+                            if delete_household_income(inc_id):
+                                st.rerun()
+                else:
+                    st.caption("No income found for this month.")
+                    
+            st.divider()
+            st.caption("Treasury routing logic goes here.")
+
+        # --- TAB 4: MEMBER BUDGETS (ADMIN REVIEW) ---
+        elif household_view_mode == "👥 Member Budgets":
+            st.markdown("#### 👀 Review Shared Personal Budgets")
+            st.caption("Only members who have toggled 'Share with Admin' will appear here.")
+            
+            shared_df = get_shared_member_expenses(household_id, selected_month)
+            
+            if shared_df.empty:
+                st.info("No shared personal ledgers available for this month.")
+            else:
+                shared_users = shared_df["username"].dropna().unique().tolist()
+                if not shared_users:
+                    st.warning("Shared expenses found, but they were logged before usernames were tracked.")
+                else:
+                    selected_user = st.selectbox("Select Member to Review", shared_users)
+                    user_df = shared_df[shared_df["username"] == selected_user]
+                    total_spent = user_df["amount"].sum() if not user_df.empty else 0.0
+                    
+                    st.metric(f"{selected_user}'s Total Personal Spend", f"${total_spent:,.2f}")
+                    
+                    display_user = user_df[["date_logged", "amount", "details"]].copy()
+                    display_user.columns = ["Date", "Amount", "Details"]
+                    st.dataframe(display_user, hide_index=True)        
+
         return # Hard stop for Household
 
     # ==========================================
     # 👤 TOP-LEVEL: PERSONAL BUDGET (All Users)
     # ==========================================
     if view == "personal":
-        st.subheader("👤 My Personal Budget")
-        st.caption("Your private financial sandbox. Unrelated to master household bills.")
-        
         household_id = st.session_state.get("household_id")
-        username = st.session_state.get("username")
+        username = st.session_state.get("username", "User")
         auth_user_id = st.session_state.get("auth_user_id")
+        role = st.session_state.get("user_role", "member")
+        
+        # 🟢 4. CHANGED: Dynamic User Header
+        st.subheader(f"👤 {username.title()}'s Personal Ledger")
         
         current_month = datetime.now().strftime("%Y-%m")
         selected_month = st.selectbox("Select Month", [current_month, "2026-05", "2026-04"], index=0, key="personal_month")
         
+        # 🟢 THE DUAL ROLLOVER ENGINE HOOK
+        incomes_rolled = auto_rollover_recurring_incomes(household_id, selected_month)
+        expenses_rolled = auto_rollover_recurring_expenses(household_id, selected_month)
+        
+        if incomes_rolled or expenses_rolled:
+            st.rerun()
         settings = get_user_finance_settings(household_id, username)
-        incomes_df = get_household_incomes(household_id, selected_month)
-        routing_df = get_cash_flow_routing(household_id)
         indiv_expenses_df = get_individual_expenses(household_id, auth_user_id, selected_month)
         
-        # The Privacy Toggle
+        # 🟢 5. FETCH PERSONAL INCOME
+        personal_incomes_df = get_household_incomes(household_id, selected_month, is_personal_income=True, username=username)
+        total_personal_income = personal_incomes_df["take_home_amount"].sum() if not personal_incomes_df.empty else 0.0
+        
+        if not indiv_expenses_df.empty and "is_personal_spend" in indiv_expenses_df.columns:
+            my_personal_df = indiv_expenses_df[indiv_expenses_df["is_personal_spend"] == True]
+        else:
+            my_personal_df = pd.DataFrame()
+            
+        total_personal_spend = my_personal_df["amount"].sum() if not my_personal_df.empty else 0.0
+
+        toggle_text = "🔒 Keep my personal ledger private (Hide from Admins)" if role == "member" else "🔒 Keep my personal ledger private (Hide from other Admins)"
         current_share_status = settings.get("share_budget_with_admin", True)
-        is_private = st.toggle(
-            "🔒 Keep my personal ledger private (Hide from Household Rollup)", 
-            value=not current_share_status
-        )
+        is_private = st.toggle(toggle_text, value=not current_share_status)
+        
         if (not is_private) != current_share_status:
             if update_user_privacy_toggle(household_id, username, not is_private):
                 st.rerun()
                 
+        # 🟢 APPLIED YOUR CUSTOM SELECTOR
+        personal_view_mode = _render_two_col_selector(
+            key="personal_view_mode",
+            options=[f"📊 {username.title()}'s Ledger", "💳 Log Expense", "🔄 Cash Flow & Treasury"]
+        )
         st.divider()
-        
-        if not incomes_df.empty and not routing_df.empty:
-            selected_paycheck = st.selectbox("Select Funding Source", incomes_df["source_name"].tolist(), key="personal_fund_source")
-            paycheck_val = incomes_df.loc[incomes_df["source_name"] == selected_paycheck, "take_home_amount"].values[0]
+
+        # --- TAB 1: MASTER LEDGER ---
+        if personal_view_mode == f"📊 {username.title()}'s Ledger":
             
-            total_spend_money = calculate_spend_money(paycheck_val, routing_df)
-            indiv_spent = indiv_expenses_df["amount"].sum() if not indiv_expenses_df.empty else 0.0
-            remaining = total_spend_money - indiv_spent
-            
+            # Show top level metrics including the new separate income
             p_col1, p_col2, p_col3 = st.columns(3)
-            p_col1.metric(f"Total Allowance (from {selected_paycheck})", f"${total_spend_money:,.2f}")
-            p_col2.metric("Personal Spend", f"${indiv_spent:,.2f}")
-            p_col3.metric("Remaining Balance", f"${remaining:,.2f}", delta=f"${remaining:,.2f}", delta_color="normal" if remaining >= 0 else "inverse")
-        else:
-            st.info("Waiting on household admin to add income and routing targets to calculate your allowance.")
+            p_col1.metric("Total Personal Income", f"${total_personal_income:,.2f}")
+            p_col2.metric("Total Personal Spend", f"${total_personal_spend:,.2f}")
             
-        st.divider()
-        st.markdown("#### My Personal Ledger")
-        if not indiv_expenses_df.empty:
-            display_indiv = indiv_expenses_df[["date_logged", "amount", "details"]].copy()
-            display_indiv.columns = ["Date", "Amount", "Details"]
-            st.dataframe(display_indiv, hide_index=True)
-        else:
-            st.info("You haven't logged any personal expenses this month.")
+            net_personal_cash = total_personal_income - total_personal_spend
+            p_col3.metric("Net Personal Cash Flow", f"${net_personal_cash:,.2f}", delta=f"${net_personal_cash:,.2f}", delta_color="normal")
             
+            st.markdown("#### Personal Expense History")
+            if not my_personal_df.empty:
+                display_indiv = my_personal_df[["date_logged", "amount", "details"]].copy()
+                display_indiv.columns = ["Date", "Amount", "Details"]
+                st.dataframe(display_indiv, hide_index=True)
+            else:
+                st.info("You haven't logged any personal expenses this month.")
+                
+            st.info("ℹ️ Household routing and personal allowance calculations coming soon.")
+            
+        # --- TAB 2: LOG EXPENSE (PERSONAL) ---
+        elif personal_view_mode == "💳 Log Expense":
+            st.markdown("#### Log a Personal Expense")
+            categories_df = get_budget_categories(household_id, is_personal=True, username=username)
+            
+            if categories_df.empty:
+                st.info("You have no personal categories yet. Add your first one below to start logging!")
+            else:
+                categories_df["display_name"] = categories_df.apply(lambda row: f"{row['category_name']} - {row['sub_category_name']}" if pd.notnull(row.get('sub_category_name')) else row['category_name'], axis=1)
+                display_list = categories_df["display_name"].tolist()
+                
+                with st.form("pers_expense_entry", clear_on_submit=True):
+                    a1, a2 = st.columns([1, 1])
+                    date_logged = a1.date_input("Date")
+                    amount_raw = a2.text_input("Amount ($) *")
+                    
+                    # 🟢 Category is now INSIDE the form (Note the unique key)
+                    selected_display_name = st.selectbox("Category", display_list, key="pers_cat_form")
+                    
+                    details = st.text_input("Details & Vendor *")
+                    is_recurring = st.checkbox("🔄 Make this a recurring monthly expense", value=False)
+                    
+                    if st.form_submit_button("💾 Save Personal Expense", type="primary", width="stretch"):
+                        parsed_amount = _parse_currency_input(amount_raw)
+                        if "invalid" == parsed_amount or parsed_amount is None or not details.strip():
+                            st.error("Valid amount and details required.")
+                        else:
+                            cat_row = categories_df[categories_df["display_name"] == selected_display_name].iloc[0]
+                            
+                            success = log_expense_and_check_project(
+                                auth_user_id=auth_user_id, username=username, household_id=household_id,
+                                month_year=date_logged.strftime("%Y-%m"), date_logged=date_logged,
+                                category_id=cat_row["id"], amount=parsed_amount, details=details, 
+                                is_personal_spend=True, is_recurring=is_recurring # 🟢 Passed flag
+                            )
+                            if success:
+                                st.success(f"Logged ${_format_money(parsed_amount)} to Personal Ledger.")
+                                st.rerun()
+                            else:
+                                st.error("Failed to log expense.")
+                                
+            st.divider()
+            
+            # 🟢 CONTEXTUAL SETTINGS: Manage PERSONAL Categories
+            with st.expander("⚙️ Manage Personal Categories"):
+                st.markdown("**🏷️ Add New Personal Category**")
+                with st.form("add_cat_pers_form", clear_on_submit=True):
+                    new_cat_name = st.text_input("Category Name *", placeholder="e.g., Gaming, Coffee")
+                    new_sub_cat = st.text_input("Sub-Category (Optional)", placeholder="e.g., Subscriptions")
+                    new_cat_type = st.selectbox("Type", ["Fixed Expense", "Variable Expense", "Project"])
+                    
+                    if st.form_submit_button("💾 Save Personal Category", type="primary", width="stretch"):
+                        if not new_cat_name.strip():
+                            st.error("Category name is required.")
+                        else:
+                            # 🟢 Pass the personal flags to the database insert
+                            if insert_budget_category(household_id, new_cat_name, new_cat_type, new_sub_cat, is_personal=True, username=username):
+                                st.success(f"Added {new_cat_name} to your private list!")
+                                st.rerun()
+                                
+                st.markdown("**🛠️ Existing Personal Categories**")
+                if not categories_df.empty:
+                    for _, row in categories_df.iterrows():
+                        cat_id = row["id"]
+                        cat_name = row["category_name"]
+                        sub_cat = row.get("sub_category_name")
+                        display_name = f"{cat_name} - {sub_cat}" if pd.notnull(sub_cat) and sub_cat else cat_name
+                        
+                        c1, c2 = st.columns([4, 1])
+                        c1.caption(f"{display_name} ({row['category_type']})")
+                        if c2.button("❌", key=f"del_cat_pers_{cat_id}"):
+                            if delete_budget_category(cat_id):
+                                st.rerun()
+                else:
+                    st.caption("No personal categories found. Build your blank slate above!")
+                                
+        # --- TAB 3: PERSONAL CASH FLOW & TREASURY ---
+        elif personal_view_mode == "🔄 Cash Flow & Treasury":
+            st.markdown(f"#### 💵 {username.title()}'s Income Tracking")
+            
+            if not personal_incomes_df.empty:
+                st.markdown("**Current Month Personal Income**")
+                display_inc = personal_incomes_df[["source_name", "take_home_amount", "gross_amount", "is_recurring"]].copy()
+                display_inc.columns = ["Source", "Net (Take-Home)", "Gross", "Recurring?"]
+                st.dataframe(display_inc, hide_index=True)
+            else:
+                st.info("No personal income streams logged for this month.")
+                
+            st.divider()
+            
+            with st.expander("➕ Add New Personal Income"):
+                with st.form("add_pers_income_form", clear_on_submit=True):
+                    source_name = st.text_input("Source Name", placeholder="e.g., Side Hustle, Dividends")
+                    
+                    inc1, inc2 = st.columns(2)
+                    take_home = inc1.text_input("Take-Home (Net) $")
+                    gross = inc2.text_input("Gross $")
+                    
+                    tax1, tax2 = st.columns(2)
+                    is_taxable = tax1.checkbox("Is Taxable?", value=True)
+                    is_windfall = tax2.checkbox("Ad-hoc/Windfall?", value=False)
+                    is_recurring = st.checkbox("🔄 Recurring Income? (Auto-roll to next month)", value=True)
+                    
+                    if st.form_submit_button("💾 Save Personal Income", type="primary", width="stretch"):
+                        th_val = _parse_currency_input(take_home)
+                        g_val = _parse_currency_input(gross)
+                        if not source_name.strip() or th_val == "invalid" or g_val == "invalid":
+                            st.error("Please provide a valid source name and dollar amounts.")
+                        else:
+                            # 🟢 SAVES DIRECTLY AS A PERSONAL INCOME STREAM
+                            if insert_household_income(household_id, selected_month, source_name, th_val, g_val, is_taxable, username, is_windfall, is_recurring, is_personal_income=True):
+                                st.success(f"Added {source_name}!")
+                                st.rerun()
+                                
+            # Manage Existing Personal Income
+            with st.expander(f"🛠️ Manage Personal Income ({selected_month})"):
+                if not personal_incomes_df.empty:
+                    for _, row in personal_incomes_df.iterrows():
+                        inc_id = row["id"]
+                        inc_name = row["source_name"]
+                        
+                        c1, c2 = st.columns([4, 1])
+                        c1.caption(f"{inc_name} - ${_to_number(row['take_home_amount']):,.2f}")
+                        if c2.button("❌", key=f"del_pers_inc_{inc_id}"):
+                            if delete_household_income(inc_id):
+                                st.rerun()
+                else:
+                    st.caption("No personal income found for this month.")
+                    
         return # Hard stop for Personal
 
     # ==========================================
@@ -1028,12 +1241,11 @@ def render_budget_module(show_back_to_hub=False):
 
     if selected_projects_section == "overview":
         with st.expander("🎛️ Overview Filters", expanded=False):
-            selected_year = st.selectbox(
-                "Overview Year",
-                options=available_years,
-                index=available_years.index(st.session_state.get("projects_overview_year", current_year)),
+            st.caption("Overview Year")
+            selected_year = _render_two_col_selector(
                 key="projects_overview_year",
-                width="stretch",
+                options=available_years,
+                format_func=lambda year_value: f"🗓️ {year_value}",
             )
 
             yearly_projects = [r for r in normalized if r.get("_year") == selected_year]
