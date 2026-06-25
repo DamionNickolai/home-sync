@@ -34,7 +34,9 @@ from database import (
     delete_household_income,
     initialize_default_categories,
     ensure_household_initialized,
-    auto_rollover_recurring_incomes,
+    delete_expense,
+    update_expense,
+    update_budget_category,
     auto_rollover_recurring_expenses
 )
 
@@ -242,7 +244,8 @@ def _can_access_monthly_module():
 
 
 def render_budget_module(show_back_to_hub=False):
-    ensure_household_initialized(st.session_state["household_id"])
+    # DISABLED: contsants.py is null for now as we do not need a default category init at this time.
+    #ensure_household_initialized(st.session_state["household_id"])
 
     if "budget_view" not in st.session_state:
         st.session_state["budget_view"] = "menu"
@@ -705,13 +708,9 @@ def render_budget_module(show_back_to_hub=False):
         
         current_month = datetime.now().strftime("%Y-%m")
         selected_month = st.selectbox("Select Month", [current_month, "2026-05", "2026-04"], index=0)
-        
-        # 🟢 THE DUAL ROLLOVER ENGINE HOOK
-        incomes_rolled = auto_rollover_recurring_incomes(household_id, selected_month)
-        expenses_rolled = auto_rollover_recurring_expenses(household_id, selected_month)
-        
-        if incomes_rolled or expenses_rolled:
-            st.rerun() # Refresh instantly to show the new data!
+        # 🟢 EXPENSE AUTOMATION HOOK
+        if auto_rollover_recurring_expenses(household_id, selected_month):
+            st.rerun()
             
         incomes_df = get_household_incomes(household_id, selected_month)
         expenses_df = get_monthly_expenses(household_id, selected_month, include_private_members=True)
@@ -730,7 +729,7 @@ def render_budget_module(show_back_to_hub=False):
         
         household_view_mode = _render_two_col_selector(
             key="household_view_mode",
-            options=["📊 Master Ledger", "💳 Log Expense", "🔄 Cash Flow & Treasury", "👥 Member Budgets"]
+            options=["📊 Master Ledger", "💳 Expenses", "🔄 Cash Flow & Treasury", "👥 Member Budgets"]
         )
         
         # --- TAB 1: MASTER LEDGER ---
@@ -742,6 +741,79 @@ def render_budget_module(show_back_to_hub=False):
             col4.metric("Annual Taxable Pace", f"${(taxable_income * 12):,.2f}")
             st.divider()
             
+            st.markdown("#### Household Budget Breakdown")
+            
+            # 1. Fetch categories (Projected Costs)
+            categories_df = get_budget_categories(household_id, is_personal=False)
+            
+            if categories_df.empty:
+                st.info("No categories setup yet. Add some to build your ledger!")
+            else:
+                # 2. Sum actual expenses by Category ID
+                if not hh_expenses_df.empty:
+                    exp_summary = hh_expenses_df.groupby("category_id")["amount"].sum().reset_index()
+                else:
+                    exp_summary = pd.DataFrame(columns=["category_id", "amount"])
+                
+                # 3. Merge Projected vs Actual
+                merged_df = pd.merge(categories_df, exp_summary, left_on="id", right_on="category_id", how="left")
+                merged_df["actual_amount"] = merged_df["amount"].fillna(0.0)
+                
+                # 4. Build the Hierarchical Matrix
+                display_rows = []
+                for parent in merged_df["category_name"].unique():
+                    parent_mask = merged_df["category_name"] == parent
+                    parent_target = merged_df.loc[parent_mask, "target_budget"].sum()
+                    parent_actual = merged_df.loc[parent_mask, "actual_amount"].sum()
+                    diff = parent_target - parent_actual
+                    
+                    # 🟢 Visual Status: Green for under budget, Red for over budget
+                    if diff > 0:
+                        diff_str = f"🟢 +${diff:,.2f}"
+                    elif diff < 0:
+                        diff_str = f"🔴 -${abs(diff):,.2f}"
+                    else:
+                        diff_str = "➖ $0.00"
+                        
+                    # Add Parent Row (Bolded, with totals)
+                    display_rows.append({
+                        "Category": f"📂 {parent}",
+                        "Projected": parent_target,
+                        "Actual": parent_actual,
+                        "Difference": diff_str
+                    })
+                    
+                    # Add Sub-category Rows (Indented, no difference calculated)
+                    for _, row in merged_df[parent_mask].iterrows():
+                        sub_name = row["sub_category_name"] if pd.notnull(row["sub_category_name"]) and str(row["sub_category_name"]).strip() != "" else "(General)"
+                        display_rows.append({
+                            "Category": f"      ↳ {sub_name}",
+                            "Projected": row["target_budget"],
+                            "Actual": row["actual_amount"],
+                            "Difference": "" 
+                        })
+                
+                final_df = pd.DataFrame(display_rows)
+                
+                # 5. Render the styled table
+                st.dataframe(
+                    final_df, 
+                    hide_index=True, 
+                    width='stretch',
+                    column_config={
+                        "Projected": st.column_config.NumberColumn(format="$%.2f"),
+                        "Actual": st.column_config.NumberColumn(format="$%.2f")
+                    }
+                )
+
+            st.divider()
+            
+            # 🟢 NEW: Annual Reports Footer
+            with st.expander("📈 Annual Reports & YTD Summary"):
+                st.markdown("##### Year-to-Date Performance")
+                st.caption("YTD aggregations and charting logic will go here.")
+                # We will write the complex SQL lookbacks for this next!
+            
             st.markdown("#### Household Shared Ledger")
             if not hh_expenses_df.empty:
                 display_exp = hh_expenses_df[["date_logged", "amount", "details"]].copy()
@@ -751,7 +823,7 @@ def render_budget_module(show_back_to_hub=False):
                 st.info("No shared household expenses logged for this month yet.")
                 
         # --- TAB 2: LOG EXPENSE (HOUSEHOLD) ---
-        elif household_view_mode == "💳 Log Expense":
+        elif household_view_mode == "💳 Expenses":
             st.markdown("#### Log a Shared Household Bill/Expense")
             
             # 🟢 Explicitly request Household categories
@@ -795,37 +867,118 @@ def render_budget_module(show_back_to_hub=False):
             
             st.divider()
             
-            # 🟢 CONTEXTUAL SETTINGS: Manage Categories
-            with st.expander("⚙️ Manage Expense Categories"):
-                st.markdown("**🏷️ Add New Category**")
-                with st.form("add_cat_hh_form", clear_on_submit=True):
-                    new_cat_name = st.text_input("Category Name *", placeholder="e.g., Auto, Home")
-                    new_sub_cat = st.text_input("Sub-Category (Optional)", placeholder="e.g., Fuel, Groceries")
-                    new_cat_type = st.selectbox("Type", ["Fixed Expense", "Variable Expense", "Project"])
-                    
-                    if st.form_submit_button("💾 Save Category", type="primary", width="stretch"):
-                        if not new_cat_name.strip():
-                            st.error("Category name is required.")
-                        else:
-                            if insert_budget_category(household_id, new_cat_name, new_cat_type, new_sub_cat):
-                                st.success(f"Added {new_cat_name}!")
-                                st.rerun()
-                                
-                st.markdown("**🛠️ Existing Categories**")
-                if not categories_df.empty:
-                    for _, row in categories_df.iterrows():
-                        cat_id = row["id"]
-                        cat_name = row["category_name"]
-                        sub_cat = row.get("sub_category_name")
-                        display_name = f"{cat_name} - {sub_cat}" if pd.notnull(sub_cat) and sub_cat else cat_name
-                        
-                        c1, c2 = st.columns([4, 1])
-                        c1.caption(f"{display_name} ({row['category_type']})")
-                        if c2.button("❌", key=f"del_cat_hh_{cat_id}"):
-                            if delete_budget_category(cat_id):
-                                st.rerun()
+            # 🟢 NEW: Manage Logged Expenses (Edit/Delete)
+            with st.expander("✏️ Edit or Delete Recent Expenses"):
+                if hh_expenses_df.empty:
+                    st.caption("No expenses logged for this month yet.")
                 else:
-                    st.caption("No categories found.")
+                    # Format a list of expenses for the user to pick from
+                    expense_options = hh_expenses_df.apply(
+                        lambda row: f"{row['date_logged']} - {row['details']} (${row['amount']:.2f})", axis=1
+                    ).tolist()
+                    
+                    selected_expense_str = st.selectbox("Select Expense to Manage", expense_options, key="hh_edit_exp_select")
+                    
+                    # Extract the ID of the chosen expense
+                    selected_idx = expense_options.index(selected_expense_str)
+                    target_exp_row = hh_expenses_df.iloc[selected_idx]
+                    target_exp_id = target_exp_row["id"]
+                    
+                    st.markdown("**Update Details**")
+                    with st.form("edit_expense_form", clear_on_submit=True):
+                        e_col1, e_col2 = st.columns(2)
+                        new_amt = e_col1.text_input("Amount ($)", value=str(target_exp_row["amount"]))
+                        new_det = e_col2.text_input("Details", value=target_exp_row["details"])
+                        new_recur = st.checkbox("🔄 Is Recurring?", value=target_exp_row.get("is_recurring", False))
+                        
+                        u1, u2 = st.columns(2)
+                        if u1.form_submit_button("💾 Update Expense", type="primary", width="stretch"):
+                            parsed_amt = _parse_currency_input(new_amt)
+                            if parsed_amt != "invalid" and new_det.strip():
+                                if update_expense(target_exp_id, parsed_amt, new_det, new_recur):
+                                    st.success("Expense updated successfully!")
+                                    st.rerun()
+                            else:
+                                st.error("Valid amount and details required.")
+                                
+                        if u2.form_submit_button("🗑️ Delete Expense", type="secondary", width="stretch"):
+                            if delete_expense(target_exp_id):
+                                st.error("Expense deleted.")
+                                st.rerun()
+
+            # 🟢 STREAMLINED SETTINGS: Manage Expense Categories
+            with st.expander("⚙️ Manage Expense Categories"):
+                
+                tab_add, tab_edit = st.tabs(["➕ Add New", "✏️ Edit Existing"])
+                
+                with tab_add:
+                    st.markdown("**🏷️ Add New Category**")
+                    parent_options = ["➕ Create New Parent Category"]
+                    if not categories_df.empty:
+                        existing_parents = sorted(categories_df["category_name"].unique().tolist())
+                        parent_options.extend(existing_parents)
+                        
+                    # 🟢 FORM REMOVED: This dropdown is now "live"
+                    selected_parent = st.selectbox("Parent Category", parent_options, key="hh_parent_sel")
+                    
+                    # 🟢 DYNAMIC UX: The text box only appears if they ask to create a new parent
+                    if selected_parent == "➕ Create New Parent Category":
+                        final_parent_input = st.text_input("New Parent Name *", placeholder="e.g., Auto, Home", key="hh_new_parent_input")
+                    else:
+                        final_parent_input = selected_parent
+                        
+                    new_sub_cat = st.text_input("Sub-Category (Optional)", placeholder="e.g., Fuel, Groceries", key="hh_new_sub_input")
+                    target_budget_raw = st.text_input("Projected Monthly Budget ($)", placeholder="e.g., 300", key="hh_new_target_input")
+                    
+                    if st.button("💾 Save Category", type="primary", width='stretch', key="hh_save_cat_btn"):
+                        final_parent = final_parent_input.strip() if isinstance(final_parent_input, str) else final_parent_input
+                        parsed_target = _parse_currency_input(target_budget_raw) if target_budget_raw else 0.0
+                        
+                        if not final_parent or parsed_target == "invalid":
+                            st.error("Valid category name and numeric budget required.")
+                        else:
+                            if insert_budget_category(household_id, final_parent, new_sub_cat, target_budget=parsed_target):
+                                st.success(f"Added {final_parent}!")
+                                st.rerun()
+                                    
+                with tab_edit:
+                    st.markdown("**✏️ Edit or Delete Categories**")
+                    if not categories_df.empty:
+                        # Create a clean display list for the dropdown
+                        edit_cat_options = categories_df.apply(
+                            lambda row: f"{row['category_name']} - {row.get('sub_category_name', '')} (${row.get('target_budget', 0):.2f})", axis=1
+                        ).tolist()
+                        
+                        selected_edit_str = st.selectbox("Select Category to Edit", edit_cat_options, key="edit_cat_hh_select")
+                        selected_edit_idx = edit_cat_options.index(selected_edit_str)
+                        target_cat_row = categories_df.iloc[selected_edit_idx]
+                        target_cat_id = target_cat_row["id"]
+                        
+                        with st.form("edit_cat_hh_form", clear_on_submit=True):
+                            edit_parent = st.text_input("Parent Category", value=target_cat_row["category_name"])
+                            
+                            # Handle empty sub-categories safely
+                            safe_sub = target_cat_row.get("sub_category_name")
+                            edit_sub = st.text_input("Sub-Category", value=safe_sub if pd.notnull(safe_sub) else "")
+                            
+                            edit_target = st.text_input("Projected Monthly Budget ($)", value=str(target_cat_row.get("target_budget", 0.0)))
+                            
+                            u1, u2 = st.columns(2)
+                            if u1.form_submit_button("💾 Update Category", type="primary", width="stretch"):
+                                parsed_target = _parse_currency_input(edit_target)
+                                if not edit_parent.strip() or parsed_target == "invalid":
+                                    st.error("Valid category name and numeric budget required.")
+                                else:
+                                    if update_budget_category(target_cat_id, edit_parent, edit_sub, parsed_target):
+                                        st.success("Category updated!")
+                                        st.rerun()
+                                        
+                            if u2.form_submit_button("🗑️ Delete Category", type="secondary", width="stretch"):
+                                if delete_budget_category(target_cat_id):
+                                    st.error("Category deleted.")
+                                    st.rerun()
+                    else:
+                        st.caption("No categories found to edit.")
                                 
         # --- TAB 3: CASH FLOW & TREASURY ---
         elif household_view_mode == "🔄 Cash Flow & Treasury":
@@ -849,7 +1002,7 @@ def render_budget_module(show_back_to_hub=False):
                     user_options = ["unassigned"]
                     
                 with st.form("add_income_form", clear_on_submit=True):
-                    source_name = st.text_input("Source Name", placeholder="e.g., NFCU Pay, VA")
+                    source_name = st.text_input("Source Name", placeholder="e.g., Paycheck, Side Gig, Bonus")
                     owner_username = st.selectbox("Assign to Earner", user_options)
                     
                     inc1, inc2 = st.columns(2)
@@ -929,12 +1082,8 @@ def render_budget_module(show_back_to_hub=False):
         
         current_month = datetime.now().strftime("%Y-%m")
         selected_month = st.selectbox("Select Month", [current_month, "2026-05", "2026-04"], index=0, key="personal_month")
-        
-        # 🟢 THE DUAL ROLLOVER ENGINE HOOK
-        incomes_rolled = auto_rollover_recurring_incomes(household_id, selected_month)
-        expenses_rolled = auto_rollover_recurring_expenses(household_id, selected_month)
-        
-        if incomes_rolled or expenses_rolled:
+        # 🟢 EXPENSE AUTOMATION HOOK
+        if auto_rollover_recurring_expenses(household_id, selected_month):
             st.rerun()
         settings = get_user_finance_settings(household_id, username)
         indiv_expenses_df = get_individual_expenses(household_id, auth_user_id, selected_month)
@@ -961,38 +1110,97 @@ def render_budget_module(show_back_to_hub=False):
         # 🟢 APPLIED YOUR CUSTOM SELECTOR
         personal_view_mode = _render_two_col_selector(
             key="personal_view_mode",
-            options=[f"📊 {username.title()}'s Ledger", "💳 Log Expense", "🔄 Cash Flow & Treasury"]
+            options=[f"📊 {username.title()}'s Ledger", "💳 Expenses", "🔄 Cash Flow & Treasury"]
         )
         st.divider()
 
-        # --- TAB 1: MASTER LEDGER ---
+        # --- TAB 1: MASTER LEDGER (PERSONAL) ---
         if personal_view_mode == f"📊 {username.title()}'s Ledger":
             
-            # Show top level metrics including the new separate income
             p_col1, p_col2, p_col3 = st.columns(3)
             p_col1.metric("Total Personal Income", f"${total_personal_income:,.2f}")
             p_col2.metric("Total Personal Spend", f"${total_personal_spend:,.2f}")
             
             net_personal_cash = total_personal_income - total_personal_spend
             p_col3.metric("Net Personal Cash Flow", f"${net_personal_cash:,.2f}", delta=f"${net_personal_cash:,.2f}", delta_color="normal")
+            st.divider()
             
-            st.markdown("#### Personal Expense History")
-            if not my_personal_df.empty:
-                display_indiv = my_personal_df[["date_logged", "amount", "details"]].copy()
-                display_indiv.columns = ["Date", "Amount", "Details"]
-                st.dataframe(display_indiv, hide_index=True)
+            st.markdown(f"#### {username.title()}'s Budget Breakdown")
+            
+            # 1. Fetch personal categories (Projected Costs)
+            categories_df = get_budget_categories(household_id, is_personal=True, username=username)
+            
+            if categories_df.empty:
+                st.info("No personal categories setup yet. Build your blank slate below!")
             else:
-                st.info("You haven't logged any personal expenses this month.")
+                # 2. Sum actual expenses by Category ID
+                if not my_personal_df.empty:
+                    exp_summary = my_personal_df.groupby("category_id")["amount"].sum().reset_index()
+                else:
+                    exp_summary = pd.DataFrame(columns=["category_id", "amount"])
                 
-            st.info("ℹ️ Household routing and personal allowance calculations coming soon.")
+                # 3. Merge Projected vs Actual
+                merged_df = pd.merge(categories_df, exp_summary, left_on="id", right_on="category_id", how="left")
+                merged_df["actual_amount"] = merged_df["amount"].fillna(0.0)
+                
+                # 4. Build the Hierarchical Matrix
+                display_rows = []
+                for parent in merged_df["category_name"].unique():
+                    parent_mask = merged_df["category_name"] == parent
+                    parent_target = merged_df.loc[parent_mask, "target_budget"].sum()
+                    parent_actual = merged_df.loc[parent_mask, "actual_amount"].sum()
+                    diff = parent_target - parent_actual
+                    
+                    if diff > 0:
+                        diff_str = f"🟢 +${diff:,.2f}"
+                    elif diff < 0:
+                        diff_str = f"🔴 -${abs(diff):,.2f}"
+                    else:
+                        diff_str = "➖ $0.00"
+                        
+                    # Add Parent Row
+                    display_rows.append({
+                        "Category": f"📂 {parent}",
+                        "Projected": parent_target,
+                        "Actual": parent_actual,
+                        "Difference": diff_str
+                    })
+                    
+                    # Add Sub-category Rows
+                    for _, row in merged_df[parent_mask].iterrows():
+                        sub_name = row["sub_category_name"] if pd.notnull(row["sub_category_name"]) and str(row["sub_category_name"]).strip() != "" else "(General)"
+                        display_rows.append({
+                            "Category": f"      ↳ {sub_name}",
+                            "Projected": row["target_budget"],
+                            "Actual": row["actual_amount"],
+                            "Difference": "" 
+                        })
+                
+                final_df = pd.DataFrame(display_rows)
+                
+                st.dataframe(
+                    final_df, 
+                    hide_index=True, 
+                    width='stretch',
+                    column_config={
+                        "Projected": st.column_config.NumberColumn(format="$%.2f"),
+                        "Actual": st.column_config.NumberColumn(format="$%.2f")
+                    }
+                )
+
+            st.divider()
             
+            with st.expander("📈 Annual Reports & YTD Summary"):
+                st.markdown("##### Year-to-Date Performance")
+                st.caption("YTD aggregations and charting logic will go here.")
+                
         # --- TAB 2: LOG EXPENSE (PERSONAL) ---
-        elif personal_view_mode == "💳 Log Expense":
+        elif personal_view_mode == "💳 Expenses":
             st.markdown("#### Log a Personal Expense")
             categories_df = get_budget_categories(household_id, is_personal=True, username=username)
             
             if categories_df.empty:
-                st.info("You have no personal categories yet. Add your first one below to start logging!")
+                st.warning("No personal categories found. Please add one below.")
             else:
                 categories_df["display_name"] = categories_df.apply(lambda row: f"{row['category_name']} - {row['sub_category_name']}" if pd.notnull(row.get('sub_category_name')) else row['category_name'], axis=1)
                 display_list = categories_df["display_name"].tolist()
@@ -1002,7 +1210,6 @@ def render_budget_module(show_back_to_hub=False):
                     date_logged = a1.date_input("Date")
                     amount_raw = a2.text_input("Amount ($) *")
                     
-                    # 🟢 Category is now INSIDE the form (Note the unique key)
                     selected_display_name = st.selectbox("Category", display_list, key="pers_cat_form")
                     
                     details = st.text_input("Details & Vendor *")
@@ -1019,7 +1226,7 @@ def render_budget_module(show_back_to_hub=False):
                                 auth_user_id=auth_user_id, username=username, household_id=household_id,
                                 month_year=date_logged.strftime("%Y-%m"), date_logged=date_logged,
                                 category_id=cat_row["id"], amount=parsed_amount, details=details, 
-                                is_personal_spend=True, is_recurring=is_recurring # 🟢 Passed flag
+                                is_personal_spend=True, is_recurring=is_recurring
                             )
                             if success:
                                 st.success(f"Logged ${_format_money(parsed_amount)} to Personal Ledger.")
@@ -1029,38 +1236,110 @@ def render_budget_module(show_back_to_hub=False):
                                 
             st.divider()
             
-            # 🟢 CONTEXTUAL SETTINGS: Manage PERSONAL Categories
-            with st.expander("⚙️ Manage Personal Categories"):
-                st.markdown("**🏷️ Add New Personal Category**")
-                with st.form("add_cat_pers_form", clear_on_submit=True):
-                    new_cat_name = st.text_input("Category Name *", placeholder="e.g., Gaming, Coffee")
-                    new_sub_cat = st.text_input("Sub-Category (Optional)", placeholder="e.g., Subscriptions")
-                    new_cat_type = st.selectbox("Type", ["Fixed Expense", "Variable Expense", "Project"])
-                    
-                    if st.form_submit_button("💾 Save Personal Category", type="primary", width="stretch"):
-                        if not new_cat_name.strip():
-                            st.error("Category name is required.")
-                        else:
-                            # 🟢 Pass the personal flags to the database insert
-                            if insert_budget_category(household_id, new_cat_name, new_cat_type, new_sub_cat, is_personal=True, username=username):
-                                st.success(f"Added {new_cat_name} to your private list!")
-                                st.rerun()
-                                
-                st.markdown("**🛠️ Existing Personal Categories**")
-                if not categories_df.empty:
-                    for _, row in categories_df.iterrows():
-                        cat_id = row["id"]
-                        cat_name = row["category_name"]
-                        sub_cat = row.get("sub_category_name")
-                        display_name = f"{cat_name} - {sub_cat}" if pd.notnull(sub_cat) and sub_cat else cat_name
-                        
-                        c1, c2 = st.columns([4, 1])
-                        c1.caption(f"{display_name} ({row['category_type']})")
-                        if c2.button("❌", key=f"del_cat_pers_{cat_id}"):
-                            if delete_budget_category(cat_id):
-                                st.rerun()
+            # 🟢 Edit/Delete Personal Expenses
+            with st.expander("✏️ Edit or Delete Recent Personal Expenses"):
+                if my_personal_df.empty:
+                    st.caption("No personal expenses logged for this month yet.")
                 else:
-                    st.caption("No personal categories found. Build your blank slate above!")
+                    expense_options = my_personal_df.apply(
+                        lambda row: f"{row['date_logged']} - {row['details']} (${row['amount']:.2f})", axis=1
+                    ).tolist()
+                    
+                    selected_expense_str = st.selectbox("Select Expense to Manage", expense_options, key="pers_edit_exp_select")
+                    selected_idx = expense_options.index(selected_expense_str)
+                    target_exp_row = my_personal_df.iloc[selected_idx]
+                    target_exp_id = target_exp_row["id"]
+                    
+                    st.markdown("**Update Details**")
+                    with st.form("edit_pers_expense_form", clear_on_submit=True):
+                        e_col1, e_col2 = st.columns(2)
+                        new_amt = e_col1.text_input("Amount ($)", value=str(target_exp_row["amount"]))
+                        new_det = e_col2.text_input("Details", value=target_exp_row["details"])
+                        new_recur = st.checkbox("🔄 Is Recurring?", value=target_exp_row.get("is_recurring", False))
+                        
+                        u1, u2 = st.columns(2)
+                        if u1.form_submit_button("💾 Update Expense", type="primary", width="stretch"):
+                            parsed_amt = _parse_currency_input(new_amt)
+                            if parsed_amt != "invalid" and new_det.strip():
+                                if update_expense(target_exp_id, parsed_amt, new_det, new_recur):
+                                    st.success("Expense updated successfully!")
+                                    st.rerun()
+                            else:
+                                st.error("Valid amount and details required.")
+                                
+                        if u2.form_submit_button("🗑️ Delete Expense", type="secondary", width="stretch"):
+                            if delete_expense(target_exp_id):
+                                st.error("Expense deleted.")
+                                st.rerun()
+
+            # 🟢 STREAMLINED SETTINGS: Manage Personal Categories
+            with st.expander("⚙️ Manage Personal Categories"):
+                tab_add, tab_edit = st.tabs(["➕ Add New", "✏️ Edit Existing"])
+                
+                with tab_add:
+                    st.markdown("**🏷️ Add New Personal Category**")
+                    parent_options = ["➕ Create New Parent Category"]
+                    if not categories_df.empty:
+                        existing_parents = sorted(categories_df["category_name"].unique().tolist())
+                        parent_options.extend(existing_parents)
+                        
+                    # 🟢 FORM REMOVED: This dropdown is now "live"
+                    selected_parent = st.selectbox("Parent Category", parent_options, key="pers_parent_sel")
+                    
+                    # 🟢 DYNAMIC UX: The text box only appears if they ask to create a new parent
+                    if selected_parent == "➕ Create New Parent Category":
+                        final_parent_input = st.text_input("New Parent Name *", placeholder="e.g., Gaming, Coffee", key="pers_new_parent_input")
+                    else:
+                        final_parent_input = selected_parent
+                        
+                    new_sub_cat = st.text_input("Sub-Category (Optional)", placeholder="e.g., Subscriptions", key="pers_new_sub_input")
+                    target_budget_raw = st.text_input("Projected Monthly Budget ($)", placeholder="e.g., 50", key="pers_new_target_input")
+                    
+                    if st.button("💾 Save Personal Category", type="primary", width='stretch', key="pers_save_cat_btn"):
+                        final_parent = final_parent_input.strip() if isinstance(final_parent_input, str) else final_parent_input
+                        parsed_target = _parse_currency_input(target_budget_raw) if target_budget_raw else 0.0
+                        
+                        if not final_parent or parsed_target == "invalid":
+                            st.error("Valid category name and numeric budget required.")
+                        else:
+                            if insert_budget_category(household_id, final_parent, new_sub_cat, is_personal=True, username=username, target_budget=parsed_target):
+                                st.success(f"Added {final_parent} to your private list!")
+                                st.rerun()
+                                    
+                with tab_edit:
+                    st.markdown("**✏️ Edit or Delete Personal Categories**")
+                    if not categories_df.empty:
+                        edit_cat_options = categories_df.apply(
+                            lambda row: f"{row['category_name']} - {row.get('sub_category_name', '')} (${row.get('target_budget', 0):.2f})", axis=1
+                        ).tolist()
+                        
+                        selected_edit_str = st.selectbox("Select Category to Edit", edit_cat_options, key="edit_cat_pers_select")
+                        selected_edit_idx = edit_cat_options.index(selected_edit_str)
+                        target_cat_row = categories_df.iloc[selected_edit_idx]
+                        target_cat_id = target_cat_row["id"]
+                        
+                        with st.form("edit_cat_pers_form", clear_on_submit=True):
+                            edit_parent = st.text_input("Parent Category", value=target_cat_row["category_name"])
+                            safe_sub = target_cat_row.get("sub_category_name")
+                            edit_sub = st.text_input("Sub-Category", value=safe_sub if pd.notnull(safe_sub) else "")
+                            edit_target = st.text_input("Projected Monthly Budget ($)", value=str(target_cat_row.get("target_budget", 0.0)))
+                            
+                            u1, u2 = st.columns(2)
+                            if u1.form_submit_button("💾 Update Category", type="primary", width="stretch"):
+                                parsed_target = _parse_currency_input(edit_target)
+                                if not edit_parent.strip() or parsed_target == "invalid":
+                                    st.error("Valid category name and numeric budget required.")
+                                else:
+                                    if update_budget_category(target_cat_id, edit_parent, edit_sub, parsed_target):
+                                        st.success("Category updated!")
+                                        st.rerun()
+                                        
+                            if u2.form_submit_button("🗑️ Delete Category", type="secondary", width="stretch"):
+                                if delete_budget_category(target_cat_id):
+                                    st.error("Category deleted.")
+                                    st.rerun()
+                    else:
+                        st.caption("No personal categories found. Build your blank slate above!")                    
                                 
         # --- TAB 3: PERSONAL CASH FLOW & TREASURY ---
         elif personal_view_mode == "🔄 Cash Flow & Treasury":

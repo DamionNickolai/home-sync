@@ -2,6 +2,8 @@ import streamlit as st
 from supabase import create_client, Client
 import pandas as pd
 from security import encrypt_data, decrypt_text, decrypt_float
+import calendar
+from datetime import datetime, date
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from utils import calculate_next_version
@@ -525,13 +527,11 @@ def ensure_household_initialized(household_id):
         print(f"Initialization silent check failed: {e}")
 
 def get_budget_categories(household_id, is_personal=False, username=None):
-    """Fetches active budget categories, strictly separated by Household vs Personal."""
+    """Fetches categories and decrypts their target budgets."""
     target_table = get_budget_table("budget_categories")
     try:
-        # Base query: active items for this household, filtered by the personal flag
         query = supabase.table(target_table).select("*").eq("household_id", household_id).eq("is_active", True).eq("is_personal", is_personal)
         
-        # If looking for personal categories, strictly filter by the owner's username
         if is_personal and username:
             query = query.eq("username", username)
             
@@ -543,6 +543,12 @@ def get_budget_categories(household_id, is_personal=False, username=None):
                     row["category_name"] = decrypt_text(row.get("category_name"))
                 if row.get("sub_category_name"):
                     row["sub_category_name"] = decrypt_text(row.get("sub_category_name"))
+                # 🟢 NEW: Decrypt the target budget
+                if row.get("target_budget") is not None:
+                    row["target_budget"] = decrypt_float(row.get("target_budget"))
+                else:
+                    row["target_budget"] = 0.0
+                    
             return pd.DataFrame(response.data)
             
         return pd.DataFrame()
@@ -690,18 +696,19 @@ def calculate_spend_money(paycheck_amount, routing_df):
         print(f"Error calculating spend money: {e}")
         return 0.0
 
-def insert_budget_category(household_id, category_name, category_type, sub_category_name=None, is_personal=False, username=None):
-    """Inserts a new budget category, routing it to either Household or Personal."""
+def insert_budget_category(household_id, category_name, sub_category_name=None, is_personal=False, username=None, target_budget=0.0):
+    """Inserts a category, now streamlined without 'Type'."""
     target_table = get_budget_table("budget_categories")
     try:
+        safe_target = float(target_budget) if target_budget not in [None, ""] else 0.0
         payload = {
             "household_id": household_id,
             "category_name": encrypt_data(category_name),
-            "category_type": category_type,
             "sub_category_name": encrypt_data(sub_category_name) if sub_category_name else None,
             "is_active": True,
-            "is_personal": is_personal,  # 🟢 NEW: Routing flag
-            "username": username         # 🟢 NEW: Owner assignment
+            "is_personal": is_personal,
+            "username": username,
+            "target_budget": encrypt_data(safe_target)
         }
         supabase.table(target_table).insert(payload).execute()
         return True
@@ -733,138 +740,6 @@ def insert_household_income(household_id, month_year, source_name, take_home, gr
         return True
     except Exception as e:
         print(f"Error inserting income: {e}")
-        return False
-
-def auto_rollover_recurring_incomes(household_id, selected_month):
-    """Silently rolls over recurring incomes from the previous month to the current month."""
-    target_table = get_budget_table("household_incomes")
-    
-    # 1. Calculate the exact previous month (handles Jan -> Dec rollover perfectly)
-    year, month = map(int, selected_month.split('-'))
-    if month == 1:
-        prev_year = year - 1
-        prev_month = 12
-    else:
-        prev_year = year
-        prev_month = month - 1
-    prev_month_str = f"{prev_year}-{prev_month:02d}"
-    
-    try:
-        # 2. Fetch last month's recurring incomes (both household and personal)
-        prev_res = supabase.table(target_table).select("*").eq("household_id", household_id).eq("month_year", prev_month_str).eq("is_recurring", True).execute()
-        
-        if not prev_res.data:
-            return False # Nothing to roll over
-            
-        # 3. Fetch this month's recurring incomes to check for duplicates
-        curr_res = supabase.table(target_table).select("id, source_name, owner_username").eq("household_id", household_id).eq("month_year", selected_month).eq("is_recurring", True).execute()
-        
-        # Decrypt current month's source names to build a strict "signature" list
-        existing_signatures = []
-        if curr_res.data:
-            for row in curr_res.data:
-                decrypted_source = decrypt_text(row.get("source_name")) if row.get("source_name") else ""
-                existing_signatures.append(f"{decrypted_source}_{row.get('owner_username')}")
-        
-        # 4. Inject missing incomes
-        injected_any = False
-        for row in prev_res.data:
-            source = decrypt_text(row.get("source_name")) if row.get("source_name") else ""
-            owner = row.get("owner_username")
-            signature = f"{source}_{owner}"
-            
-            # If this specific income stream isn't in this month yet, inject it!
-            if signature not in existing_signatures:
-                # Decrypt amounts from the old month...
-                take_home = decrypt_float(row.get("take_home_amount")) if row.get("take_home_amount") is not None else 0.0
-                gross = decrypt_float(row.get("gross_amount")) if row.get("gross_amount") is not None else 0.0
-                
-                # ...and pass them to our secure insert function so they are re-encrypted!
-                insert_household_income(
-                    household_id=household_id,
-                    month_year=selected_month,
-                    source_name=source,
-                    take_home=take_home,
-                    gross=gross,
-                    is_taxable=row.get("is_taxable", True),
-                    owner_username=owner,
-                    is_windfall=row.get("is_windfall", False),
-                    is_recurring=True,
-                    is_personal_income=row.get("is_personal_income", False)
-                )
-                injected_any = True
-                
-        return injected_any
-    except Exception as e:
-        print(f"Error rolling over incomes: {e}")
-        return False
-
-def auto_rollover_recurring_expenses(household_id, selected_month):
-    """Silently rolls over recurring expenses from the previous month to the current month."""
-    target_table = get_budget_table("expenses")
-    
-    # 1. Calculate the exact previous month
-    year, month = map(int, selected_month.split('-'))
-    if month == 1:
-        prev_year = year - 1
-        prev_month = 12
-    else:
-        prev_year = year
-        prev_month = month - 1
-    prev_month_str = f"{prev_year}-{prev_month:02d}"
-    
-    try:
-        # 2. Fetch last month's recurring expenses
-        prev_res = supabase.table(target_table).select("*").eq("household_id", household_id).eq("month_year", prev_month_str).eq("is_recurring", True).execute()
-        
-        if not prev_res.data:
-            return False # Nothing to roll over
-            
-        # 3. Fetch this month's recurring expenses to check for duplicates
-        curr_res = supabase.table(target_table).select("id, details, username, category_id").eq("household_id", household_id).eq("month_year", selected_month).eq("is_recurring", True).execute()
-        
-        # Build the signature list (Decrypted Details + Username + Category ID)
-        existing_signatures = []
-        if curr_res.data:
-            for row in curr_res.data:
-                decrypted_details = decrypt_text(row.get("details")) if row.get("details") else ""
-                existing_signatures.append(f"{decrypted_details}_{row.get('username')}_{row.get('category_id')}")
-                
-        # 4. Inject missing expenses
-        injected_any = False
-        
-        # Default date for rollover items: the 1st of the new month
-        rollover_date = datetime.strptime(f"{selected_month}-01", "%Y-%m-%d").date()
-        
-        for row in prev_res.data:
-            details = decrypt_text(row.get("details")) if row.get("details") else ""
-            username = row.get("username")
-            category_id = row.get("category_id")
-            
-            signature = f"{details}_{username}_{category_id}"
-            
-            # If this specific bill isn't in this month yet, inject it!
-            if signature not in existing_signatures:
-                amount = decrypt_float(row.get("amount")) if row.get("amount") is not None else 0.0
-                
-                # Pass it back through our standard logging function so it re-encrypts safely
-                log_expense_and_check_project(
-                    auth_user_id=row.get("auth_user_id"),
-                    username=username,
-                    household_id=household_id,
-                    month_year=selected_month,
-                    date_logged=rollover_date,
-                    category_id=category_id,
-                    amount=amount,
-                    details=details,
-                    is_personal_spend=row.get("is_personal_spend", False),
-                    is_recurring=True
-                )
-                injected_any = True
-                
-        return injected_any
-    except Exception as e:
-        print(f"Error rolling over expenses: {e}")
         return False
 
 def delete_budget_category(category_id):
@@ -1495,4 +1370,124 @@ def update_user_module_permissions(auth_user_id: str, updates: dict):
         return True
     except Exception as e:
         print(f"Error updating module permissions: {e}")
+        return False
+    
+def delete_expense(expense_id):
+    """Safely removes an expense from the ledger."""
+    target_table = get_budget_table("expenses")
+    try:
+        supabase.table(target_table).delete().eq("id", expense_id).execute()
+        return True
+    except Exception as e:
+        print(f"Error deleting expense: {e}")
+        return False
+
+def update_expense(expense_id, amount, details, is_recurring):
+    """Updates an existing expense amount, details, or recurring status."""
+    target_table = get_budget_table("expenses")
+    try:
+        payload = {
+            "amount": encrypt_data(float(amount)),
+            "details": encrypt_data(details),
+            "is_recurring": is_recurring
+        }
+        supabase.table(target_table).update(payload).eq("id", expense_id).execute()
+        return True
+    except Exception as e:
+        print(f"Error updating expense: {e}")
+        return False
+    
+def update_budget_category(category_id, category_name, sub_category_name, target_budget):
+    """Updates an existing category's names and target budget."""
+    target_table = get_budget_table("budget_categories")
+    try:
+        safe_target = float(target_budget) if target_budget not in [None, ""] else 0.0
+        payload = {
+            "category_name": encrypt_data(category_name),
+            "sub_category_name": encrypt_data(sub_category_name) if sub_category_name else None,
+            "target_budget": encrypt_data(safe_target)
+        }
+        supabase.table(target_table).update(payload).eq("id", category_id).execute()
+        return True
+    except Exception as e:
+        print(f"Error updating category: {e}")
+        return False
+    
+def auto_rollover_recurring_expenses(household_id, selected_month):
+    """Silently rolls over recurring expenses, keeping their exact day of the month, ONLY if the day has arrived."""
+    target_table = get_budget_table("expenses")
+    
+    # 1. Calculate the exact previous month
+    year, month = map(int, selected_month.split('-'))
+    if month == 1:
+        prev_year = year - 1
+        prev_month = 12
+    else:
+        prev_year = year
+        prev_month = month - 1
+    prev_month_str = f"{prev_year}-{prev_month:02d}"
+    
+    try:
+        # 2. Fetch last month's recurring expenses
+        prev_res = supabase.table(target_table).select("*").eq("household_id", household_id).eq("month_year", prev_month_str).eq("is_recurring", True).execute()
+        
+        if not prev_res.data:
+            return False 
+            
+        # 3. Fetch this month's to check for duplicates
+        curr_res = supabase.table(target_table).select("id, details, username, category_id").eq("household_id", household_id).eq("month_year", selected_month).eq("is_recurring", True).execute()
+        
+        existing_signatures = []
+        if curr_res.data:
+            for row in curr_res.data:
+                decrypted_details = decrypt_text(row.get("details")) if row.get("details") else ""
+                existing_signatures.append(f"{decrypted_details}_{row.get('username')}_{row.get('category_id')}")
+                
+        injected_any = False
+        
+        # 🟢 TIME GATE 1: Grab today's exact date
+        today = datetime.now().date()
+        
+        for row in prev_res.data:
+            details = decrypt_text(row.get("details")) if row.get("details") else ""
+            username = row.get("username")
+            category_id = row.get("category_id")
+            
+            signature = f"{details}_{username}_{category_id}"
+            
+            # If it hasn't been rolled over yet, evaluate it
+            if signature not in existing_signatures:
+                amount = decrypt_float(row.get("amount")) if row.get("amount") is not None else 0.0
+                
+                prev_date_str = row.get("date_logged")
+                if prev_date_str:
+                    prev_date = datetime.strptime(prev_date_str, "%Y-%m-%d").date()
+                    target_day = prev_date.day
+                else:
+                    target_day = 1 
+                    
+                _, last_day_of_new_month = calendar.monthrange(year, month)
+                new_day = min(target_day, last_day_of_new_month)
+                
+                new_date_logged = date(year, month, new_day)
+                
+                # 🟢 TIME GATE 2: Only inject if the target date is TODAY or in the PAST
+                if new_date_logged <= today:
+                    log_expense_and_check_project(
+                        auth_user_id=row.get("auth_user_id"),
+                        username=username,
+                        household_id=household_id,
+                        month_year=selected_month,
+                        date_logged=new_date_logged,
+                        category_id=category_id,
+                        amount=amount,
+                        details=details,
+                        is_personal_spend=row.get("is_personal_spend", False),
+                        is_recurring=True
+                    )
+                    injected_any = True
+                
+        return injected_any
+    except Exception as e:
+        print(f"Error rolling over expenses: {e}")
         return False
