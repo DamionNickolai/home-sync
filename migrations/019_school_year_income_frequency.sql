@@ -1,0 +1,9 @@
+-- ==========================================
+-- 019: School-year income pay frequency
+-- Purpose:
+-- Documents the school_year_monthly pay_frequency value for household_incomes.
+-- No schema change required — pay_frequency is unconstrained TEXT (see 016).
+--
+-- school_year_monthly: regular paychecks Sep–Jun on payment_date;
+-- use one_time rows in July/August for summer checks.
+-- ==========================================

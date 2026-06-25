@@ -6,7 +6,15 @@ import calendar
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
 from utils import calculate_next_version
-from constants import DEFAULT_BUDGET_CATEGORIES
+from constants import (
+    ALLOWANCE_CATEGORY_NAME,
+    DEFAULT_BUDGET_CATEGORIES,
+    PROJECT_EXPENSE_CATEGORY,
+    is_allowance_category,
+    is_allowance_subcategory,
+    is_system_managed_allowance_category,
+    is_system_project_expense_category,
+)
 
 # 🟢 DYNAMIC ENVIRONMENT ROUTING
 env = st.secrets.get("app_config", {}).get("environment", "production")
@@ -20,6 +28,7 @@ INCOME_PAY_FREQUENCIES = (
     "bi_weekly",
     "semi_monthly",
     "monthly",
+    "school_year_monthly",
     "quarterly",
     "annually",
     "one_time",
@@ -30,10 +39,27 @@ INCOME_PAY_FREQUENCY_LABELS = {
     "bi_weekly": "Bi-weekly",
     "semi_monthly": "Semi-monthly",
     "monthly": "Monthly",
+    "school_year_monthly": "School year (monthly)",
     "quarterly": "Quarterly",
     "annually": "Annually",
     "one_time": "One-time",
 }
+
+SCHOOL_YEAR_ACTIVE_MONTHS = frozenset({9, 10, 11, 12, 1, 2, 3, 4, 5, 6})
+
+
+def school_year_active_month(month: int) -> bool:
+    """Sep–Jun are active pay months for school-year income."""
+    return month in SCHOOL_YEAR_ACTIVE_MONTHS
+
+
+def school_year_rollover_source_month(year: int, month: int) -> str:
+    """Month to copy school-year income from when rolling into an active month."""
+    if month == 9:
+        return f"{year}-06"
+    if month == 1:
+        return f"{year - 1}-12"
+    return f"{year}-{month - 1:02d}"
 
 
 def normalize_income_pay_frequency(value) -> str:
@@ -51,10 +77,16 @@ def income_is_recurring_frequency(pay_frequency) -> bool:
     return normalize_income_pay_frequency(pay_frequency) != "one_time"
 
 
-def normalize_income_amount_for_month(amount, pay_frequency) -> float:
+def normalize_income_amount_for_month(amount, pay_frequency, month_year=None) -> float:
     """Convert a per-payment income amount into an estimated monthly total."""
     freq = normalize_income_pay_frequency(pay_frequency)
     safe_amount = float(amount or 0)
+    if freq == "school_year_monthly":
+        if month_year:
+            _, month = map(int, str(month_year).split("-"))
+            if not school_year_active_month(month):
+                return 0.0
+        return safe_amount
     if freq == "weekly":
         return safe_amount * 52 / 12
     if freq == "bi_weekly":
@@ -70,7 +102,34 @@ def normalize_income_amount_for_month(amount, pay_frequency) -> float:
     return safe_amount
 
 
-def sum_income_for_month(incomes_df) -> float:
+def _row_month_year(row, default=None):
+    return row.get("month_year") or default
+
+
+def annualize_income_amount(amount, pay_frequency) -> float:
+    """Project a per-payment amount to an estimated annual total."""
+    freq = normalize_income_pay_frequency(pay_frequency)
+    safe_amount = float(amount or 0)
+    if freq == "one_time":
+        return safe_amount
+    if freq == "school_year_monthly":
+        return safe_amount * 10
+    if freq == "weekly":
+        return safe_amount * 52
+    if freq == "bi_weekly":
+        return safe_amount * 26
+    if freq == "semi_monthly":
+        return safe_amount * 24
+    if freq == "monthly":
+        return safe_amount * 12
+    if freq == "quarterly":
+        return safe_amount * 4
+    if freq == "annually":
+        return safe_amount
+    return safe_amount
+
+
+def sum_income_for_month(incomes_df, selected_month=None) -> float:
     if incomes_df is None or incomes_df.empty:
         return 0.0
     total = 0.0
@@ -78,7 +137,10 @@ def sum_income_for_month(incomes_df) -> float:
         freq = row.get("pay_frequency")
         if not freq:
             freq = "monthly" if row.get("is_recurring") else "one_time"
-        total += normalize_income_amount_for_month(row.get("take_home_amount"), freq)
+        month_year = _row_month_year(row, selected_month)
+        total += normalize_income_amount_for_month(
+            row.get("take_home_amount"), freq, month_year=month_year
+        )
     return total
 
 
@@ -89,48 +151,73 @@ def _income_row_frequency(row) -> str:
     return normalize_income_pay_frequency(freq)
 
 
-def sum_gross_for_month(incomes_df) -> float:
+def sum_gross_for_month(incomes_df, selected_month=None) -> float:
     if incomes_df is None or incomes_df.empty:
         return 0.0
     total = 0.0
     for _, row in incomes_df.iterrows():
-        total += normalize_income_amount_for_month(row.get("gross_amount"), _income_row_frequency(row))
+        month_year = _row_month_year(row, selected_month)
+        total += normalize_income_amount_for_month(
+            row.get("gross_amount"), _income_row_frequency(row), month_year=month_year
+        )
     return total
 
 
-def sum_taxable_gross_for_month(incomes_df) -> float:
+def sum_taxable_gross_for_month(incomes_df, selected_month=None) -> float:
     if incomes_df is None or incomes_df.empty:
         return 0.0
     total = 0.0
     for _, row in incomes_df.iterrows():
         if not bool(row.get("is_taxable", False)):
             continue
-        total += normalize_income_amount_for_month(row.get("gross_amount"), _income_row_frequency(row))
+        month_year = _row_month_year(row, selected_month)
+        total += normalize_income_amount_for_month(
+            row.get("gross_amount"), _income_row_frequency(row), month_year=month_year
+        )
     return total
 
 
-def sum_nontaxable_gross_for_month(incomes_df) -> float:
+def sum_nontaxable_gross_for_month(incomes_df, selected_month=None) -> float:
     if incomes_df is None or incomes_df.empty:
         return 0.0
     total = 0.0
     for _, row in incomes_df.iterrows():
         if bool(row.get("is_taxable", False)):
             continue
-        total += normalize_income_amount_for_month(row.get("gross_amount"), _income_row_frequency(row))
+        month_year = _row_month_year(row, selected_month)
+        total += normalize_income_amount_for_month(
+            row.get("gross_amount"), _income_row_frequency(row), month_year=month_year
+        )
     return total
 
 
 def compute_annual_income_totals(incomes_df) -> dict:
-    """Estimated annual income figures from month-normalized streams."""
-    monthly_takehome = sum_income_for_month(incomes_df)
-    monthly_gross = sum_gross_for_month(incomes_df)
-    monthly_taxable = sum_taxable_gross_for_month(incomes_df)
-    monthly_nontaxable = sum_nontaxable_gross_for_month(incomes_df)
+    """Estimated annual income figures from frequency-aware streams."""
+    if incomes_df is None or incomes_df.empty:
+        return {
+            "annual_takehome": 0.0,
+            "annual_gross": 0.0,
+            "annual_taxable": 0.0,
+            "annual_non_taxable": 0.0,
+        }
+    annual_takehome = 0.0
+    annual_gross = 0.0
+    annual_taxable = 0.0
+    annual_nontaxable = 0.0
+    for _, row in incomes_df.iterrows():
+        freq = _income_row_frequency(row)
+        annual_takehome += annualize_income_amount(row.get("take_home_amount"), freq)
+        gross_annual = annualize_income_amount(row.get("gross_amount"), freq)
+        annual_gross += gross_annual
+        if bool(row.get("is_taxable", False)):
+            annual_taxable += gross_annual
+        else:
+            annual_nontaxable += gross_annual
     return {
-        "annual_takehome": monthly_takehome * 12,
-        "annual_gross": monthly_gross * 12,
-        "annual_taxable": monthly_taxable * 12,
-        "annual_non_taxable": monthly_nontaxable * 12,
+        "annual_takehome": annual_takehome,
+        "annual_gross": annual_gross,
+        "annual_taxable": annual_taxable,
+        "annual_non_taxable": annual_nontaxable,
     }
 
 @st.cache_resource
@@ -826,7 +913,26 @@ def log_expense_and_check_project(auth_user_id, username, household_id, month_ye
             "is_personal_spend": is_personal_spend,
             "is_recurring": is_recurring  # 🟢 NEW: Recurring flag added to payload
         }
-        supabase.table(target_table).insert(payload).execute()
+        response = supabase.table(target_table).insert(payload).execute()
+        if not response.data:
+            return False
+
+        expense_id = response.data[0].get("id")
+        if (
+            expense_id
+            and not is_personal_spend
+            and is_allowance_subcategory_id(category_id)
+        ):
+            recipient = get_allowance_recipient_username(category_id)
+            if recipient:
+                _insert_allowance_personal_income(
+                    household_id=household_id,
+                    expense_id=expense_id,
+                    recipient_username=recipient,
+                    amount=float(amount),
+                    payment_date=date_logged,
+                    month_year=month_year,
+                )
         return True
     except Exception as e:
         print(f"Error logging expense: {e}")
@@ -947,6 +1053,11 @@ def insert_budget_category(household_id, category_name, sub_category_name=None, 
     elif not _can_edit_monthly_budget_server_side():
         return False
 
+    if is_system_project_expense_category(category_name, sub_category_name):
+        return False
+    if is_system_managed_allowance_category(category_name, sub_category_name):
+        return False
+
     target_table = get_budget_table("budget_categories")
     try:
         safe_target = float(target_budget) if target_budget not in [None, ""] else 0.0
@@ -1026,6 +1137,10 @@ def insert_household_income(
 
 def delete_budget_category(category_id):
     """Soft-deletes a category by setting is_active to False."""
+    if is_system_project_expense_category_id(category_id):
+        return False
+    if is_allowance_subcategory_id(category_id):
+        return False
     if not _can_edit_category_server_side(category_id):
         return False
     target_table = get_budget_table("budget_categories")
@@ -1039,6 +1154,8 @@ def delete_budget_category(category_id):
 
 def delete_household_income(income_id):
     """Deletes an income stream from the database."""
+    if _household_income_is_allowance_linked(income_id):
+        return False
     if not _can_edit_household_income_server_side(income_id):
         return False
     target_table = get_budget_table("household_incomes")
@@ -1063,6 +1180,8 @@ def update_household_income(
     is_recurring=None,
 ):
     """Updates an existing income stream."""
+    if _household_income_is_allowance_linked(income_id):
+        return False
     if not _can_edit_household_income_server_side(income_id):
         return False
     if pay_frequency:
@@ -1191,7 +1310,7 @@ def _fetch_expense_flags(expense_id):
     try:
         response = (
             supabase.table(target_table)
-            .select("is_personal_spend, auth_user_id, household_id")
+            .select("is_personal_spend, auth_user_id, household_id, category_id, date_logged, month_year")
             .eq("id", expense_id)
             .limit(1)
             .execute()
@@ -1219,7 +1338,7 @@ def _fetch_category_flags(category_id):
     try:
         response = (
             supabase.table(target_table)
-            .select("is_personal, username, household_id")
+            .select("is_personal, username, household_id, category_name, sub_category_name")
             .eq("id", category_id)
             .limit(1)
             .execute()
@@ -1227,6 +1346,39 @@ def _fetch_category_flags(category_id):
         return response.data[0] if response.data else None
     except Exception:
         return None
+
+
+def is_system_project_expense_category_id(category_id) -> bool:
+    record = _fetch_category_flags(category_id)
+    if not record:
+        return False
+    if record.get("household_id") != get_current_household_id():
+        return False
+    category_name = decrypt_text(record.get("category_name"))
+    sub_category_name = decrypt_text(record.get("sub_category_name"))
+    return is_system_project_expense_category(category_name, sub_category_name)
+
+
+def is_allowance_subcategory_id(category_id) -> bool:
+    record = _fetch_category_flags(category_id)
+    if not record:
+        return False
+    if record.get("household_id") != get_current_household_id():
+        return False
+    category_name = decrypt_text(record.get("category_name"))
+    sub_category_name = decrypt_text(record.get("sub_category_name"))
+    return is_allowance_subcategory(category_name, sub_category_name) and bool(record.get("username"))
+
+
+def get_allowance_recipient_username(category_id):
+    record = _fetch_category_flags(category_id)
+    if not record:
+        return None
+    category_name = decrypt_text(record.get("category_name"))
+    sub_category_name = decrypt_text(record.get("sub_category_name"))
+    if not is_allowance_subcategory(category_name, sub_category_name):
+        return None
+    return record.get("username") or None
 
 
 def _can_edit_category_server_side(category_id, *, is_personal=None, username=None) -> bool:
@@ -1267,6 +1419,80 @@ def _can_edit_household_income_server_side(income_id) -> bool:
     except Exception:
         return False
 
+
+def _household_income_is_allowance_linked(income_id) -> bool:
+    target_table = get_budget_table("household_incomes")
+    try:
+        response = (
+            supabase.table(target_table)
+            .select("source_expense_id")
+            .eq("id", income_id)
+            .limit(1)
+            .execute()
+        )
+        if not response.data:
+            return False
+        return response.data[0].get("source_expense_id") is not None
+    except Exception:
+        return False
+
+
+def _insert_allowance_personal_income(
+    *,
+    household_id,
+    expense_id,
+    recipient_username,
+    amount,
+    payment_date,
+    month_year,
+):
+    """Create personal income for an allowance household expense (internal sync)."""
+    target_table = get_budget_table("household_incomes")
+    if isinstance(payment_date, str):
+        payment_date = datetime.strptime(payment_date[:10], "%Y-%m-%d").date()
+    safe_amount = float(amount)
+    payload = {
+        "household_id": household_id,
+        "month_year": month_year,
+        "source_name": encrypt_data("Allowance"),
+        "take_home_amount": encrypt_data(safe_amount),
+        "gross_amount": encrypt_data(safe_amount),
+        "is_taxable": False,
+        "owner_username": recipient_username,
+        "is_windfall": False,
+        "is_recurring": False,
+        "pay_frequency": "one_time",
+        "is_personal_income": True,
+        "payment_date": payment_date.isoformat(),
+        "source_expense_id": str(expense_id) if expense_id is not None else None,
+    }
+    supabase.table(target_table).insert(payload).execute()
+
+
+def _delete_allowance_income_for_expense(expense_id):
+    target_table = get_budget_table("household_incomes")
+    try:
+        supabase.table(target_table).delete().eq("source_expense_id", str(expense_id)).execute()
+    except Exception as e:
+        print(f"Error deleting allowance income for expense {expense_id}: {e}")
+
+
+def _update_allowance_income_for_expense(expense_id, amount, payment_date, month_year):
+    target_table = get_budget_table("household_incomes")
+    if isinstance(payment_date, str):
+        payment_date = datetime.strptime(payment_date[:10], "%Y-%m-%d").date()
+    safe_amount = float(amount)
+    payload = {
+        "take_home_amount": encrypt_data(safe_amount),
+        "gross_amount": encrypt_data(safe_amount),
+        "payment_date": payment_date.isoformat(),
+        "month_year": month_year,
+    }
+    try:
+        supabase.table(target_table).update(payload).eq("source_expense_id", str(expense_id)).execute()
+    except Exception as e:
+        print(f"Error updating allowance income for expense {expense_id}: {e}")
+
 def get_project_budgets():
     """
     Fetches and decrypts all project budget items for the active session's household.
@@ -1278,27 +1504,181 @@ def get_project_budgets():
             .eq("household_id", house_id) \
             .order("priority", desc=False) \
             .execute()
-            
+
         data = response.data
-        
-        # 🟢 DECRYPT DATA BEFORE SENDING TO STREAMLIT UI
+
         if data:
             for row in data:
-                # Text fields
                 row["item"] = decrypt_text(row.get("item"))
                 row["description"] = decrypt_text(row.get("description"))
                 row["vendors"] = decrypt_text(row.get("vendors"))
                 row["notes"] = decrypt_text(row.get("notes"))
-                
-                # Financial fields (converted back to floats for math)
                 row["est_low_cost"] = decrypt_float(row.get("est_low_cost"))
                 row["est_high_cost"] = decrypt_float(row.get("est_high_cost"))
                 row["actual_cost"] = decrypt_float(row.get("actual_cost"))
-                
+
         return data
     except Exception as e:
         print(f"Error fetching project budgets: {e}")
         return []
+
+
+def _resolve_project_expense_category_id(household_id):
+    """Find the household budget category used for project-linked expenses."""
+    categories_df = get_budget_categories(household_id, is_personal=False)
+    if categories_df is None or categories_df.empty:
+        return None
+    for _, row in categories_df.iterrows():
+        if is_system_project_expense_category(row.get("category_name"), row.get("sub_category_name")):
+            return row.get("id")
+    return None
+
+
+def ensure_project_expense_category(household_id):
+    """
+    Ensure the household has a Projects budget category for project purchase logging.
+    Creates one automatically if missing (including for households with other categories).
+    Returns the category id, or None on failure.
+    """
+    existing_id = _resolve_project_expense_category_id(household_id)
+    if existing_id:
+        return existing_id
+
+    target_table = get_budget_table("budget_categories")
+    try:
+        payload = {
+            "household_id": household_id,
+            "category_name": encrypt_data(PROJECT_EXPENSE_CATEGORY["name"]),
+            "sub_category_name": encrypt_data(PROJECT_EXPENSE_CATEGORY["sub"]),
+            "is_active": True,
+            "is_personal": False,
+            "target_budget": encrypt_data(0.0),
+        }
+        response = supabase.table(target_table).insert(payload).execute()
+        if response.data:
+            return response.data[0].get("id")
+        return None
+    except Exception as e:
+        print(f"Error ensuring project expense category: {e}")
+        return None
+
+
+def ensure_allowance_categories(household_id):
+    """
+    Ensure each household member has an Allowance sub-category for payout logging.
+    Idempotent — safe to call on every Financial Hub load.
+    """
+    if not household_id:
+        return False
+
+    target_table = get_budget_table("budget_categories")
+    try:
+        users = _fetch_household_users_cached(household_id) or []
+        usernames = [u.get("username") for u in users if u.get("username")]
+        if not usernames:
+            return True
+
+        categories_df = get_budget_categories(household_id, is_personal=False)
+        existing_by_username = {}
+        if categories_df is not None and not categories_df.empty:
+            for _, row in categories_df.iterrows():
+                if not is_allowance_subcategory(
+                    row.get("category_name"), row.get("sub_category_name")
+                ):
+                    continue
+                linked = row.get("username")
+                if linked:
+                    existing_by_username[linked] = row.get("id")
+
+        for member_username in usernames:
+            if member_username in existing_by_username:
+                continue
+            payload = {
+                "household_id": household_id,
+                "category_name": encrypt_data(ALLOWANCE_CATEGORY_NAME),
+                "sub_category_name": encrypt_data(member_username),
+                "is_active": True,
+                "is_personal": False,
+                "username": member_username,
+                "target_budget": encrypt_data(0.0),
+            }
+            supabase.table(target_table).insert(payload).execute()
+        return True
+    except Exception as e:
+        print(f"Error ensuring allowance categories: {e}")
+        return False
+
+
+def add_project_purchase_expense(project_id, purchase_date, amount):
+    """
+    Adds a dated purchase to a project (actual_cost + audit note) and logs a matching
+    household budget expense under the Projects category.
+    """
+    if not _can_edit_projects_server_side():
+        return False
+
+    try:
+        house_id = get_current_household_id()
+        auth_user_id = st.session_state.get("auth_user_id")
+        username = st.session_state.get("username")
+        safe_amount = float(amount)
+
+        project_res = (
+            supabase.table(PROJECT_BUDGETS_TABLE)
+            .select("*")
+            .eq("id", project_id)
+            .eq("household_id", house_id)
+            .limit(1)
+            .execute()
+        )
+        if not project_res.data:
+            return False
+
+        row = project_res.data[0]
+        project_name = decrypt_text(row.get("item")) or "Project"
+        current_actual = decrypt_float(row.get("actual_cost")) or 0.0
+        new_actual = current_actual + safe_amount
+
+        existing_notes = decrypt_text(row.get("notes")) or ""
+        cleaned_notes = existing_notes.replace("[COMPLETED]", "").strip() if existing_notes else ""
+        if isinstance(purchase_date, str):
+            purchase_date = datetime.strptime(purchase_date[:10], "%Y-%m-%d").date()
+        audit_line = f"[{purchase_date.isoformat()}] Expense logged: ${safe_amount:,.2f}"
+        new_notes = f"{cleaned_notes}\n{audit_line}".strip() if cleaned_notes else audit_line
+
+        update_payload = {
+            "actual_cost": new_actual,
+            "notes": new_notes,
+        }
+        if not update_project_budget_item(project_id, update_payload):
+            return False
+
+        category_id = ensure_project_expense_category(house_id)
+        if not category_id:
+            print("Could not resolve Projects budget category; project actual updated but expense not logged.")
+            return True
+
+        month_year = purchase_date.strftime("%Y-%m")
+        details = f"{project_name} — project purchase"
+        expenses_table = get_budget_table("expenses")
+        expense_payload = {
+            "household_id": house_id,
+            "auth_user_id": auth_user_id,
+            "username": username,
+            "month_year": month_year,
+            "date_logged": purchase_date.isoformat(),
+            "category_id": category_id,
+            "amount": encrypt_data(safe_amount),
+            "details": encrypt_data(details),
+            "is_personal_spend": False,
+            "is_recurring": False,
+        }
+        supabase.table(expenses_table).insert(expense_payload).execute()
+        return True
+    except Exception as e:
+        print(f"Error adding project purchase expense: {e}")
+        return False
+
 
 def update_project_budget_item(item_id: str, updated_data: dict):
     """
@@ -1850,6 +2230,7 @@ def update_user_module_permissions(auth_user_id: str, updates: dict):
             )
         clear_household_users_cache()
         clear_home_mgmt_permissions_cache()
+        ensure_allowance_categories(house_id)
         return True
     except Exception as e:
         print(f"Error updating module permissions: {e}")
@@ -1859,6 +2240,9 @@ def delete_expense(expense_id):
     """Safely removes an expense from the ledger."""
     if not _can_edit_expense_server_side(expense_id):
         return False
+    record = _fetch_expense_flags(expense_id)
+    if record and record.get("category_id") and is_allowance_subcategory_id(record["category_id"]):
+        _delete_allowance_income_for_expense(expense_id)
     target_table = get_budget_table("expenses")
     try:
         supabase.table(target_table).delete().eq("id", expense_id).execute()
@@ -1871,15 +2255,31 @@ def update_expense(expense_id, amount, details, is_recurring, date_logged=None):
     """Updates an existing expense amount, details, recurring status, and optionally the date logged."""
     if not _can_edit_expense_server_side(expense_id):
         return False
+    record = _fetch_expense_flags(expense_id)
     target_table = get_budget_table("expenses")
     try:
         payload = {
             "amount": encrypt_data(float(amount)),
             "details": encrypt_data(details),
             "is_recurring": is_recurring,
-            "date_logged": date_logged.strftime("%Y-%m-%d") if date_logged else None
         }
+        if date_logged:
+            payload["date_logged"] = date_logged.strftime("%Y-%m-%d")
+            payload["month_year"] = date_logged.strftime("%Y-%m")
         supabase.table(target_table).update(payload).eq("id", expense_id).execute()
+        if record and record.get("category_id") and is_allowance_subcategory_id(record["category_id"]):
+            effective_date = date_logged
+            if effective_date is None and record.get("date_logged"):
+                effective_date = datetime.strptime(str(record["date_logged"])[:10], "%Y-%m-%d").date()
+            month_year = (
+                date_logged.strftime("%Y-%m")
+                if date_logged
+                else record.get("month_year")
+            )
+            if effective_date and month_year:
+                _update_allowance_income_for_expense(
+                    expense_id, amount, effective_date, month_year
+                )
         return True
     except Exception as e:
         print(f"Error updating expense: {e}")
@@ -1887,6 +2287,10 @@ def update_expense(expense_id, amount, details, is_recurring, date_logged=None):
     
 def update_budget_category(category_id, category_name, sub_category_name, target_budget):
     """Updates an existing category's names and target budget."""
+    if is_system_project_expense_category_id(category_id):
+        return False
+    if is_allowance_subcategory_id(category_id):
+        return False
     if not _can_edit_category_server_side(category_id):
         return False
     target_table = get_budget_table("budget_categories")
@@ -1997,6 +2401,8 @@ def auto_rollover_recurring_incomes(household_id, selected_month):
     prev_month_str = f"{prev_year}-{prev_month:02d}"
 
     try:
+        rows_to_roll = []
+
         prev_res = (
             supabase.table(target_table)
             .select("*")
@@ -2005,7 +2411,27 @@ def auto_rollover_recurring_incomes(household_id, selected_month):
             .eq("is_recurring", True)
             .execute()
         )
-        if not prev_res.data:
+        if prev_res.data:
+            rows_to_roll.extend(prev_res.data)
+
+        if school_year_active_month(month) and prev_month in (7, 8):
+            source_month_str = school_year_rollover_source_month(year, month)
+            if source_month_str != prev_month_str:
+                school_res = (
+                    supabase.table(target_table)
+                    .select("*")
+                    .eq("household_id", household_id)
+                    .eq("month_year", source_month_str)
+                    .eq("is_recurring", True)
+                    .execute()
+                )
+                if school_res.data:
+                    for row in school_res.data:
+                        freq = normalize_income_pay_frequency(row.get("pay_frequency") or "monthly")
+                        if freq == "school_year_monthly":
+                            rows_to_roll.append(row)
+
+        if not rows_to_roll:
             return False
 
         curr_res = (
@@ -2027,14 +2453,20 @@ def auto_rollover_recurring_incomes(household_id, selected_month):
 
         injected_any = False
         today = datetime.now().date()
+        processed_signatures = set()
 
-        for row in prev_res.data:
+        for row in rows_to_roll:
+            freq = normalize_income_pay_frequency(row.get("pay_frequency") or "monthly")
+            if freq == "school_year_monthly" and not school_year_active_month(month):
+                continue
+
             source = decrypt_text(row.get("source_name")) if row.get("source_name") else ""
             owner = row.get("owner_username")
             is_personal = row.get("is_personal_income", False)
             signature = f"{source}_{owner}_{is_personal}"
-            if signature in existing_signatures:
+            if signature in existing_signatures or signature in processed_signatures:
                 continue
+            processed_signatures.add(signature)
 
             prev_date_str = row.get("payment_date")
             if prev_date_str:

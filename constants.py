@@ -19,3 +19,48 @@ DEFAULT_BUDGET_CATEGORIES = [
     {"name": "Income", "sub": "Paycheck", "type": "Income"},
     {"name": "Income", "sub": "Bonus/Windfall", "type": "Income"}
 ]
+
+# Auto-created for project purchase logging when a household has no matching category yet.
+PROJECT_EXPENSE_CATEGORY = {
+    "name": "Projects",
+    "sub": "General Purchases",
+}
+
+
+def normalize_sub_category_name(value) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if text.lower() == "nan":
+        return ""
+    return text
+
+
+def is_system_project_expense_category(category_name, sub_category_name=None) -> bool:
+    return (
+        str(category_name or "").strip() == PROJECT_EXPENSE_CATEGORY["name"]
+        and normalize_sub_category_name(sub_category_name) == PROJECT_EXPENSE_CATEGORY["sub"]
+    )
+
+
+ALLOWANCE_CATEGORY_NAME = "Allowance"
+
+
+def is_allowance_category(category_name, sub_category_name=None) -> bool:
+    return str(category_name or "").strip() == ALLOWANCE_CATEGORY_NAME
+
+
+def is_allowance_subcategory(category_name, sub_category_name) -> bool:
+    return (
+        is_allowance_category(category_name)
+        and bool(normalize_sub_category_name(sub_category_name))
+    )
+
+
+def is_system_managed_allowance_category(category_name, sub_category_name=None) -> bool:
+    """Block manual create/edit/delete of Allowance parent or member sub-categories."""
+    if not is_allowance_category(category_name):
+        return False
+    if sub_category_name is None:
+        return True
+    return is_allowance_subcategory(category_name, sub_category_name)

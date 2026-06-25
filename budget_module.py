@@ -10,6 +10,9 @@ from database import (
     get_project_budgets,
     update_project_budget_item,
     insert_project_budget_item,
+    add_project_purchase_expense,
+    ensure_project_expense_category,
+    ensure_allowance_categories,
     get_household_finance_settings,
     update_household_projects_funds,
     get_household_users_for_admin,
@@ -35,12 +38,11 @@ from database import (
     income_pay_frequency_label,
     INCOME_PAY_FREQUENCY_LABELS,
     normalize_income_pay_frequency,
+    school_year_active_month,
     get_individual_expenses,
     update_user_privacy_toggle,
     delete_budget_category,
     delete_household_income,
-    initialize_default_categories,
-    ensure_household_initialized,
     delete_expense,
     update_expense,
     update_budget_category,
@@ -49,6 +51,7 @@ from database import (
     get_recurring_schedule
 )
 from ui_helpers import rerun_app_with_reason, manage_popover_key, finish_manage_popover
+from constants import is_system_project_expense_category, is_system_managed_allowance_category, is_allowance_subcategory
 
 
 def _maybe_auto_rollover(household_id, selected_month):
@@ -111,6 +114,9 @@ def _income_counts_toward_actual(income_row, selected_month, as_of=None):
     )
     if freq == "one_time":
         return True
+    _, month = map(int, selected_month.split("-"))
+    if freq == "school_year_monthly" and not school_year_active_month(month):
+        return False
     as_of = as_of or date.today()
     return as_of >= _income_due_date_in_month(income_row, selected_month)
 
@@ -136,8 +142,68 @@ def _split_recurring_expenses(expenses_df):
     return expenses_df[is_recurring].copy(), expenses_df[~is_recurring].copy()
 
 
+def _split_project_household_expenses(expenses_df, categories_df):
+    """Split household expenses into shared (non-project) vs system project-category rows."""
+    if expenses_df is None or expenses_df.empty:
+        empty = expenses_df if expenses_df is not None else pd.DataFrame()
+        return empty, empty
+    if categories_df is None or categories_df.empty or "category_id" not in expenses_df.columns:
+        return expenses_df.copy(), pd.DataFrame()
+
+    project_ids = _system_project_category_ids(categories_df)
+    if not project_ids:
+        return expenses_df.copy(), pd.DataFrame()
+
+    project_mask = expenses_df["category_id"].isin(project_ids)
+    return expenses_df[~project_mask].copy(), expenses_df[project_mask].copy()
+
+
+def _system_project_category_ids(categories_df):
+    if categories_df is None or categories_df.empty:
+        return set()
+    ids = set()
+    for _, row in categories_df.iterrows():
+        if is_system_project_expense_category(row.get("category_name"), row.get("sub_category_name")):
+            cat_id = row.get("id")
+            if cat_id is not None:
+                ids.add(cat_id)
+    return ids
+
+
+def _exclude_system_categories(categories_df):
+    if categories_df is None or categories_df.empty:
+        return categories_df
+    mask = ~categories_df.apply(
+        lambda row: is_system_project_expense_category(
+            row.get("category_name"),
+            row.get("sub_category_name"),
+        ),
+        axis=1,
+    )
+    return categories_df[mask].copy()
+
+
+def _exclude_system_category_expenses(expenses_df, categories_df):
+    if expenses_df is None or expenses_df.empty:
+        return expenses_df
+    system_ids = _system_project_category_ids(categories_df)
+    if not system_ids or "category_id" not in expenses_df.columns:
+        return expenses_df
+    return expenses_df[~expenses_df["category_id"].isin(system_ids)].copy()
+
+
 def _is_budget_admin():
     return st.session_state.get("user_role", "member") in ["admin", "developer"]
+
+
+def _is_allowance_linked_income_row(row) -> bool:
+    val = row.get("source_expense_id")
+    if val is None:
+        return False
+    try:
+        return not pd.isna(val)
+    except Exception:
+        return bool(val)
 
 
 def _household_submodule_options():
@@ -192,7 +258,7 @@ def _enrich_expenses_with_categories(expenses_df, categories_df):
     return enriched
 
 
-LEDGER_COL_WIDTHS = [4.0, 1.25, 1.25, 1.35]
+LEDGER_COL_WIDTHS = [3.5, 0.65, 1.25, 1.25, 1.35]
 SINKING_COL_WIDTHS = [2.6, 1.5, 1.5]
 INCOME_COL_WIDTHS = [1.7, 1.0, 1.0, 1.0, 1.0, 1.0]
 INCOME_COL_WIDTHS_PERSONAL = [2.2, 1.1, 1.1, 1.1, 1.1]
@@ -246,14 +312,39 @@ def _compact_divider() -> None:
     )
 
 
+def _format_purchase_count(count) -> str:
+    if count is None or int(count) == 0:
+        return "—"
+    return str(int(count))
+
+
+def _purchase_counts_by_category(expenses_df, selected_month) -> dict:
+    """Number of expense entries per category_id that count toward this month's actuals."""
+    if expenses_df is None or expenses_df.empty or "category_id" not in expenses_df.columns:
+        return {}
+    filtered = _filter_expenses_for_actual_totals(expenses_df, selected_month)
+    if filtered.empty:
+        return {}
+    return filtered.groupby("category_id").size().to_dict()
+
+
 def _render_ledger_column_header() -> None:
-    _render_plain_grid_header(["Category", "Projected", "Actual", "Difference"], LEDGER_COL_WIDTHS)
+    _render_plain_grid_header(
+        ["Category", "Qty", "Projected", "Actual", "Difference"],
+        LEDGER_COL_WIDTHS,
+    )
 
 
-def _render_ledger_line(name, projected, actual, *, indent=False, emphasize=False) -> None:
+def _render_ledger_line(name, projected, actual, *, purchase_count=0, indent=False, emphasize=False) -> None:
     prefix = "↳ " if indent else ""
     _render_plain_grid_row(
-        [f"{prefix}{name}", _format_ledger_amount(projected), _format_ledger_amount(actual), _format_ledger_diff(projected, actual)],
+        [
+            f"{prefix}{name}",
+            _format_purchase_count(purchase_count),
+            _format_ledger_amount(projected),
+            _format_ledger_amount(actual),
+            _format_ledger_diff(projected, actual),
+        ],
         LEDGER_COL_WIDTHS,
         right_from_index=1,
         emphasize=emphasize,
@@ -273,6 +364,7 @@ def _render_household_budget_breakdown(
         return
 
     year, month = map(int, selected_month.split("-"))
+    purchase_counts = _purchase_counts_by_category(hh_expenses_df, selected_month)
 
     parent_groups = []
     for parent in merged_df["category_name"].unique():
@@ -283,11 +375,16 @@ def _render_household_budget_breakdown(
             continue
 
         sub_rows = []
+        parent_purchase_count = 0
         for _, row in merged_df[parent_mask].iterrows():
             target = float(row["target_budget"])
             actual = float(row["actual_amount"])
             if target == 0 and actual == 0:
                 continue
+
+            cat_id = row["id"]
+            sub_purchase_count = int(purchase_counts.get(cat_id, 0))
+            parent_purchase_count += sub_purchase_count
 
             sub_name = row["sub_category_name"]
             if sub_name is None or (isinstance(sub_name, float) and pd.isna(sub_name)) or str(sub_name).strip() == "":
@@ -296,23 +393,31 @@ def _render_household_budget_breakdown(
                 sub_name = str(sub_name)
 
             recurring_items = hh_expenses_df[
-                (hh_expenses_df["category_id"] == row["id"]) & (hh_expenses_df["is_recurring"] == True)
+                (hh_expenses_df["category_id"] == cat_id) & (hh_expenses_df["is_recurring"] == True)
             ]
             recurring_due = _filter_expenses_for_actual_totals(recurring_items, selected_month)
-            if recurring_due.empty and row["id"] in recurring_schedule:
-                target_day = recurring_schedule[row["id"]]
+            if recurring_due.empty and cat_id in recurring_schedule:
+                target_day = recurring_schedule[cat_id]
                 _, last_day = calendar.monthrange(year, month)
                 safe_day = min(target_day, last_day)
                 scheduled_date = date(year, month, safe_day).strftime("%B %d")
                 sub_name = f"{sub_name} · {scheduled_date}"
 
-            sub_rows.append({"name": sub_name, "projected": target, "actual": actual})
+            sub_rows.append(
+                {
+                    "name": sub_name,
+                    "projected": target,
+                    "actual": actual,
+                    "purchase_count": sub_purchase_count,
+                }
+            )
 
         parent_groups.append(
             {
                 "name": parent,
                 "projected": parent_target,
                 "actual": parent_actual,
+                "purchase_count": parent_purchase_count,
                 "subs": sub_rows,
             }
         )
@@ -341,13 +446,32 @@ def _render_household_budget_breakdown(
             group["name"],
             group["projected"],
             group["actual"],
+            purchase_count=group.get("purchase_count", 0),
             emphasize=False,
         )
         for sub in group["subs"]:
-            _render_ledger_line(sub["name"], sub["projected"], sub["actual"], indent=True)
+            _render_ledger_line(
+                sub["name"],
+                sub["projected"],
+                sub["actual"],
+                purchase_count=sub.get("purchase_count", 0),
+                indent=True,
+            )
 
         if index < len(visible_groups) - 1:
             _compact_divider()
+
+    total_projected = sum(float(group["projected"]) for group in visible_groups)
+    total_actual = sum(float(group["actual"]) for group in visible_groups)
+    total_purchases = sum(int(group.get("purchase_count", 0)) for group in visible_groups)
+    _compact_divider()
+    _render_ledger_line(
+        "Total",
+        total_projected,
+        total_actual,
+        purchase_count=total_purchases,
+        emphasize=True,
+    )
 
 
 def _format_payment_date(value) -> str:
@@ -537,10 +661,19 @@ def _render_income_management(
                     format_func=income_pay_frequency_label,
                     index=INCOME_FREQUENCY_OPTIONS.index("monthly"),
                 )
+                if pay_frequency == "school_year_monthly":
+                    st.caption(
+                        "Regular paychecks run Sep–Jun on this day each month. "
+                        "Add two **One-time** incomes in July and August for summer checks."
+                    )
                 payment_date = st.date_input(
                     "Payment / recurrence start date",
                     value=date.today(),
-                    help="Recurring income counts toward the ledger once this day of the month arrives.",
+                    help=(
+                        "Recurring income counts toward the ledger once this day of the month arrives."
+                        if pay_frequency != "school_year_monthly"
+                        else "Day of month for each Sep–Jun paycheck."
+                    ),
                 )
 
                 if st.form_submit_button("💾 Save Income", type="primary", width="stretch"):
@@ -569,6 +702,23 @@ def _render_income_management(
                 st.caption("No income found for this month.")
                 return
 
+            if is_personal and "source_expense_id" in incomes_df.columns:
+                linked = incomes_df[incomes_df.apply(_is_allowance_linked_income_row, axis=1)]
+                if not linked.empty:
+                    st.caption(
+                        "Allowance income is managed via Household Budget expenses "
+                        "(Allowance category). Edit or delete the household expense instead."
+                    )
+
+            editable_df = (
+                incomes_df[~incomes_df.apply(_is_allowance_linked_income_row, axis=1)]
+                if "source_expense_id" in incomes_df.columns
+                else incomes_df
+            )
+            if editable_df.empty:
+                st.caption("No editable income streams for this month.")
+                return
+
             def _income_label(row):
                 owner = row.get("owner_username", "unassigned")
                 amount = _to_number(row.get("take_home_amount"))
@@ -577,14 +727,14 @@ def _render_income_management(
                     return f"{row.get('source_name')} · {freq} · ${_format_money(amount)}"
                 return f"{row.get('source_name')} ({owner}) · {freq} · ${_format_money(amount)}"
 
-            edit_options = incomes_df.apply(_income_label, axis=1).tolist()
+            edit_options = editable_df.apply(_income_label, axis=1).tolist()
             selected_edit_str = st.selectbox(
                 "Select Income Stream to Edit",
                 edit_options,
                 key=f"edit_{form_key_prefix}_income_select",
             )
             selected_edit_idx = edit_options.index(selected_edit_str)
-            target_row = incomes_df.iloc[selected_edit_idx]
+            target_row = editable_df.iloc[selected_edit_idx]
             target_income_id = target_row["id"]
 
             with st.form(f"edit_{form_key_prefix}_income_form", clear_on_submit=True):
@@ -609,6 +759,11 @@ def _render_income_management(
                     index=INCOME_FREQUENCY_OPTIONS.index(current_freq),
                     key=f"edit_pay_freq_{form_key_prefix}_{target_income_id}",
                 )
+                if edit_pay_frequency == "school_year_monthly":
+                    st.caption(
+                        "Regular paychecks run Sep–Jun on this day each month. "
+                        "Add two **One-time** incomes in July and August for summer checks."
+                    )
                 payment_default = date.today()
                 if target_row.get("payment_date"):
                     payment_default = datetime.strptime(str(target_row["payment_date"])[:10], "%Y-%m-%d").date()
@@ -670,7 +825,7 @@ def _render_family_member_budgets(household_id, selected_month, household_users)
         household_id, selected_month, is_personal_income=True, username=selected_member
     )
     member_incomes_actual = _filter_incomes_for_actual_totals(member_incomes, selected_month)
-    total_member_income = sum_income_for_month(member_incomes_actual)
+    total_member_income = sum_income_for_month(member_incomes_actual, selected_month)
     member_annual_income_totals = compute_annual_income_totals(member_incomes_actual)
 
     member_expenses = get_individual_expenses(household_id, member_auth_id, selected_month)
@@ -952,8 +1107,13 @@ def render_budget_module(show_back_to_hub=False):
 
 
 def _render_budget_fragment(show_back_to_hub=False):
-    # DISABLED: contsants.py is null for now as we do not need a default category init at this time.
-    #ensure_household_initialized(st.session_state["household_id"])
+    household_id = st.session_state.get("household_id")
+    if household_id:
+        guard_key = f"project_category_ready_{household_id}"
+        if not st.session_state.get(guard_key):
+            ensure_project_expense_category(household_id)
+            st.session_state[guard_key] = True
+        ensure_allowance_categories(household_id)
 
     if "budget_view" not in st.session_state:
         st.session_state["budget_view"] = "menu"
@@ -1406,16 +1566,23 @@ def _render_budget_fragment(show_back_to_hub=False):
         expenses_df = get_monthly_expenses(household_id, selected_month, include_private_members=True)
         routing_df = get_cash_flow_routing(household_id)
         
-        total_take_home = sum_income_for_month(incomes_actual_df)
+        total_take_home = sum_income_for_month(incomes_actual_df, selected_month)
         annual_income_totals = compute_annual_income_totals(incomes_actual_df)
         
-        if not expenses_df.empty and "is_personal_spend" in expenses_df.columns:
-            hh_expenses_df = expenses_df[expenses_df["is_personal_spend"] == False]
-        else:
-            hh_expenses_df = expenses_df
-            
-        hh_actual_df = _filter_expenses_for_actual_totals(hh_expenses_df, selected_month)
-        total_expenses = hh_actual_df["amount"].sum() if not hh_actual_df.empty else 0.0
+        hh_expenses_df = (
+            expenses_df[expenses_df["is_personal_spend"] == False]
+            if not expenses_df.empty and "is_personal_spend" in expenses_df.columns
+            else expenses_df
+        )
+
+        categories_df = get_budget_categories(household_id, is_personal=False)
+        hh_expenses_no_project = _exclude_system_category_expenses(hh_expenses_df, categories_df)
+        hh_actual_shared = _filter_expenses_for_actual_totals(hh_expenses_no_project, selected_month)
+        total_expenses = hh_actual_shared["amount"].sum() if not hh_actual_shared.empty else 0.0
+
+        hh_actual_all = _filter_expenses_for_actual_totals(hh_expenses_df, selected_month)
+        _, project_expenses_df = _split_project_household_expenses(hh_actual_all, categories_df)
+        project_spending = project_expenses_df["amount"].sum() if not project_expenses_df.empty else 0.0
         net_cash_flow = total_take_home - total_expenses
 
         household_options = _household_submodule_options()
@@ -1431,24 +1598,22 @@ def _render_budget_fragment(show_back_to_hub=False):
             col1.metric("Est. Monthly Take-Home", f"${total_take_home:,.2f}")
             col2.metric("Total Shared Expenses", f"${total_expenses:,.2f}")
             _render_signed_currency_metric(col3, "Net Cash Flow", net_cash_flow)
-            col4.metric("Annual Taxable Pace", f"${annual_income_totals['annual_taxable']:,.2f}")
+            col4.metric("Project Spending", f"${project_spending:,.2f}", help="Informational only — not included in shared expenses or net cash flow.")
             st.divider()
             
-            # 🟢 Cleaned: Household Shared Ledger removed entirely. Breakdown only.
             st.markdown("#### Household Budget Breakdown")
-            
-            categories_df = get_budget_categories(household_id, is_personal=False)
             
             if categories_df.empty:
                 st.info("No categories setup yet. Add some to build your ledger!")
             else:
-                if not hh_actual_df.empty:
-                    exp_summary = hh_actual_df.groupby("category_id")["amount"].sum().reset_index()
+                if not hh_actual_shared.empty:
+                    exp_summary = hh_actual_shared.groupby("category_id")["amount"].sum().reset_index()
                 else:
                     exp_summary = pd.DataFrame(columns=["category_id", "amount"])
                 
                 merged_df = pd.merge(categories_df, exp_summary, left_on="id", right_on="category_id", how="left")
                 merged_df["actual_amount"] = merged_df["amount"].fillna(0.0)
+                merged_df = _exclude_system_categories(merged_df)
 
                 year, month = map(int, selected_month.split("-"))
                 prev_month = month - 1 if month > 1 else 12
@@ -1458,7 +1623,7 @@ def _render_budget_fragment(show_back_to_hub=False):
 
                 _render_household_budget_breakdown(
                     merged_df,
-                    hh_expenses_df,
+                    hh_expenses_no_project,
                     recurring_schedule,
                     selected_month,
                     filter_key="hh_breakdown_category",
@@ -1488,37 +1653,61 @@ def _render_budget_fragment(show_back_to_hub=False):
         elif household_view_mode == "💳 Expenses":
             st.markdown("#### Log a Shared Household Bill/Expense")
             
-            categories_df = get_budget_categories(household_id, is_personal=False) 
+            categories_df = get_budget_categories(household_id, is_personal=False)
+            user_categories_df = _exclude_system_categories(categories_df)
+            hh_expenses_display_df = _exclude_system_category_expenses(hh_expenses_df, categories_df)
             
-            if categories_df.empty:
+            if user_categories_df.empty:
                 st.warning("No active categories found. Please add one below.")
             else:
-                categories_df["display_name"] = categories_df.apply(lambda row: f"{row['category_name']} - {row['sub_category_name']}" if pd.notnull(row.get('sub_category_name')) else row['category_name'], axis=1)
-                display_list = categories_df["display_name"].tolist()
-                
+                user_categories_df = user_categories_df.copy()
+                user_categories_df["display_name"] = user_categories_df.apply(
+                    lambda row: f"{row['category_name']} - {row['sub_category_name']}"
+                    if pd.notnull(row.get("sub_category_name"))
+                    else row["category_name"],
+                    axis=1,
+                )
+                display_list = user_categories_df["display_name"].tolist()
+
+                selected_display_name = st.selectbox(
+                    "Category",
+                    display_list,
+                    key="hh_expense_category_select",
+                )
+                cat_row = user_categories_df[
+                    user_categories_df["display_name"] == selected_display_name
+                ].iloc[0]
+                is_allowance_payment = is_allowance_subcategory(
+                    cat_row.get("category_name"), cat_row.get("sub_category_name")
+                )
+                allowance_recipient = cat_row.get("username") if is_allowance_payment else None
+                if is_allowance_payment and allowance_recipient:
+                    st.caption(
+                        f"This payment will appear as income in **{allowance_recipient}**'s Personal Budget. "
+                        "Check recurring to pay the same amount each month on this day."
+                    )
+
                 with st.form("hh_expense_entry", clear_on_submit=True):
                     a1, a2 = st.columns([1, 1])
                     date_logged = a1.date_input("Date")
                     amount_raw = a2.text_input("Amount ($) *")
-                    
-                    # Category is now INSIDE the form
-                    selected_display_name = st.selectbox("Category", display_list)
-                    
-                    details = st.text_input("Details & Vendor *")
-                    is_recurring = st.checkbox("🔄 Make this a recurring monthly bill", value=False)
-                    
+
+                    details = st.text_input("Details")
+                    is_recurring = st.checkbox(
+                        "🔄 Make this a recurring monthly bill",
+                        value=False,
+                    )
+
                     if st.form_submit_button("💾 Save Shared Expense", type="primary", width="stretch"):
                         parsed_amount = _parse_currency_input(amount_raw)
-                        if "invalid" == parsed_amount or parsed_amount is None or not details.strip():
-                            st.error("Valid amount and details required.")
+                        if "invalid" == parsed_amount or parsed_amount is None:
+                            st.error("Please enter a valid dollar amount.")
                         else:
-                            cat_row = categories_df[categories_df["display_name"] == selected_display_name].iloc[0]
-                            
                             success = log_expense_and_check_project(
                                 auth_user_id=auth_user_id, username=username, household_id=household_id,
                                 month_year=date_logged.strftime("%Y-%m"), date_logged=date_logged,
-                                category_id=cat_row["id"], amount=parsed_amount, details=details, 
-                                is_personal_spend=False, is_recurring=is_recurring
+                                category_id=cat_row["id"], amount=parsed_amount, details=details.strip(),
+                                is_personal_spend=False, is_recurring=is_recurring,
                             )
                             if success:
                                 st.success(f"Logged ${_format_money(parsed_amount)} to Household Ledger.")
@@ -1528,14 +1717,14 @@ def _render_budget_fragment(show_back_to_hub=False):
             
             st.divider()
 
-            hh_recurring_df, hh_one_time_df = _split_recurring_expenses(hh_expenses_df)
+            hh_recurring_df, hh_one_time_df = _split_recurring_expenses(hh_expenses_display_df)
 
             with st.expander("🔄 Recurring Household Expenses", expanded=False):
                 _render_expense_manage_rows(
                     hh_recurring_df,
                     "exp_hh_recur",
                     "No recurring household expenses logged for this month yet.",
-                    categories_df=categories_df,
+                    categories_df=user_categories_df,
                     can_edit=True,
                 )
 
@@ -1544,20 +1733,24 @@ def _render_budget_fragment(show_back_to_hub=False):
                     hh_one_time_df,
                     "exp_hh_once",
                     "No one-time household expenses logged for this month yet.",
-                    categories_df=categories_df,
+                    categories_df=user_categories_df,
                     can_edit=True,
                 )
             
             st.divider()
 
             with st.expander("⚙️ Manage Expense Categories"):
+                st.caption(
+                    "Project purchases use a system-managed category and are not listed here. "
+                    "Allowance sub-categories are managed automatically for each household member."
+                )
                 tab_add, tab_edit = st.tabs(["➕ Add New", "✏️ Edit Existing"])
 
                 with tab_add:
                     st.markdown("**🏷️ Add New Category**")
                     parent_options = ["➕ Create New Parent Category"]
-                    if not categories_df.empty:
-                        existing_parents = sorted(categories_df["category_name"].unique().tolist())
+                    if not user_categories_df.empty:
+                        existing_parents = sorted(user_categories_df["category_name"].unique().tolist())
                         parent_options.extend(existing_parents)
 
                     selected_parent = st.selectbox("Parent Category", parent_options, key="hh_parent_sel")
@@ -1579,6 +1772,10 @@ def _render_budget_fragment(show_back_to_hub=False):
 
                         if not final_parent or parsed_target == "invalid":
                             st.error("Valid category name and numeric budget required.")
+                        elif is_system_project_expense_category(final_parent, new_sub_cat):
+                            st.error("That category name is reserved for automatic project purchase logging.")
+                        elif is_system_managed_allowance_category(final_parent, new_sub_cat):
+                            st.error("Allowance categories are managed automatically for each household member.")
                         else:
                             if is_annual:
                                 parsed_target = parsed_target / 12.0
@@ -1589,14 +1786,22 @@ def _render_budget_fragment(show_back_to_hub=False):
 
                 with tab_edit:
                     st.markdown("**✏️ Edit or Delete Categories**")
-                    if not categories_df.empty:
-                        edit_cat_options = categories_df.apply(
+                    editable_cats_df = user_categories_df[
+                        ~user_categories_df.apply(
+                            lambda row: is_allowance_subcategory(
+                                row.get("category_name"), row.get("sub_category_name")
+                            ),
+                            axis=1,
+                        )
+                    ]
+                    if not editable_cats_df.empty:
+                        edit_cat_options = editable_cats_df.apply(
                             lambda row: f"{row['category_name']} - {row.get('sub_category_name', '')} (${row.get('target_budget', 0):.2f}/mo)", axis=1
                         ).tolist()
 
                         selected_edit_str = st.selectbox("Select Category to Edit", edit_cat_options, key="edit_cat_hh_select")
                         selected_edit_idx = edit_cat_options.index(selected_edit_str)
-                        target_cat_row = categories_df.iloc[selected_edit_idx]
+                        target_cat_row = editable_cats_df.iloc[selected_edit_idx]
                         target_cat_id = target_cat_row["id"]
 
                         is_edit_annual = (target_cat_row["category_name"] == "Annual Subscriptions")
@@ -1680,7 +1885,7 @@ def _render_budget_fragment(show_back_to_hub=False):
         
         personal_incomes_df = get_household_incomes(household_id, selected_month, is_personal_income=True, username=username)
         personal_incomes_actual_df = _filter_incomes_for_actual_totals(personal_incomes_df, selected_month)
-        total_personal_income = sum_income_for_month(personal_incomes_actual_df)
+        total_personal_income = sum_income_for_month(personal_incomes_actual_df, selected_month)
         personal_annual_income_totals = compute_annual_income_totals(personal_incomes_actual_df)
         
         if not indiv_expenses_df.empty and "is_personal_spend" in indiv_expenses_df.columns:
@@ -1781,20 +1986,20 @@ def _render_budget_fragment(show_back_to_hub=False):
                     
                     selected_display_name = st.selectbox("Category", display_list, key="pers_cat_form")
                     
-                    details = st.text_input("Details & Vendor *")
+                    details = st.text_input("Details")
                     is_recurring = st.checkbox("🔄 Make this a recurring monthly expense", value=False)
                     
                     if st.form_submit_button("💾 Save Personal Expense", type="primary", width="stretch"):
                         parsed_amount = _parse_currency_input(amount_raw)
-                        if "invalid" == parsed_amount or parsed_amount is None or not details.strip():
-                            st.error("Valid amount and details required.")
+                        if "invalid" == parsed_amount or parsed_amount is None:
+                            st.error("Please enter a valid dollar amount.")
                         else:
                             cat_row = categories_df[categories_df["display_name"] == selected_display_name].iloc[0]
                             
                             success = log_expense_and_check_project(
                                 auth_user_id=auth_user_id, username=username, household_id=household_id,
                                 month_year=date_logged.strftime("%Y-%m"), date_logged=date_logged,
-                                category_id=cat_row["id"], amount=parsed_amount, details=details, 
+                                category_id=cat_row["id"], amount=parsed_amount, details=details.strip(), 
                                 is_personal_spend=True, is_recurring=is_recurring
                             )
                             if success:
@@ -1946,22 +2151,23 @@ def _render_budget_fragment(show_back_to_hub=False):
         auth_user_id = st.session_state.get("auth_user_id")
         
         categories_df = get_budget_categories(household_id)
-        if categories_df.empty:
+        user_categories_df = _exclude_system_categories(categories_df)
+        if user_categories_df.empty:
             st.warning("No active categories found. Please ask an Admin to add categories in the Household Setup.")
             return
             
-        # Optional: Format string to show Sub-Category if it exists
-        categories_df["display_name"] = categories_df.apply(
+        user_categories_df = user_categories_df.copy()
+        user_categories_df["display_name"] = user_categories_df.apply(
             lambda row: f"{row['category_name']} - {row['sub_category_name']}" if pd.notnull(row.get('sub_category_name')) else row['category_name'], 
             axis=1
         )
         
-        cat_options = categories_df["display_name"].tolist()
+        cat_options = user_categories_df["display_name"].tolist()
         selected_display_name = st.selectbox("Category", cat_options)
         
-        cat_row = categories_df[categories_df["display_name"] == selected_display_name].iloc[0]
+        cat_row = user_categories_df[user_categories_df["display_name"] == selected_display_name].iloc[0]
         category_id = cat_row["id"]
-        category_type = cat_row["category_type"]
+        category_type = cat_row.get("category_type")
         
         selected_project_id = None
         
@@ -2444,85 +2650,117 @@ def _render_budget_fragment(show_back_to_hub=False):
                     if can_edit_projects:
                         project_popover_key = f"project_{project_id}"
                         with right_col.popover("⚙️ Manage", key=manage_popover_key(project_popover_key)):
-                            st.markdown(f"**Edit: {title}**")
-                            with st.form(f"edit_project_budget_form_{project_id}"):
-                                e1, e2, e3 = st.columns([2, 1, 1])
-                                e_item = e1.text_input("Project Name *", value=title)
-                                safe_category = category if category in PROJECT_CATEGORIES else "Home Improvement"
-                                e_category = e2.selectbox(
-                                    "Category",
-                                    PROJECT_CATEGORIES,
-                                    index=PROJECT_CATEGORIES.index(safe_category),
-                                    key=f"edit_cat_{project_id}",
-                                )
-                                e_priority = e3.number_input("Priority", min_value=1, step=1, value=max(priority, 1))
+                            tab_expense, tab_edit = st.tabs(["➕ Add Expense", "✏️ Edit Project"])
 
-                                e_description = st.text_area("Description", value=description)
-
-                                eb1, eb2, eb3 = st.columns(3)
-                                e_est_low_raw = eb1.text_input(
-                                    "Est. Low ($)",
-                                    value=_format_currency_for_input(est_low),
-                                    placeholder="Enter amount",
-                                    key=f"edit_est_low_{project_id}",
-                                )
-                                e_est_high_raw = eb2.text_input(
-                                    "Est. High ($)",
-                                    value=_format_currency_for_input(est_high),
-                                    placeholder="Enter amount",
-                                    key=f"edit_est_high_{project_id}",
-                                )
-                                e_actual_raw = eb3.text_input(
-                                    "Actual Spent ($)",
-                                    value=_format_currency_for_input(actual),
-                                    placeholder="Enter amount",
-                                    key=f"edit_actual_{project_id}",
-                                )
-
-                                if budget_cap > 0:
-                                    remaining_preview = budget_cap - _to_number(e_actual_raw if _clean_text(e_actual_raw) else actual, 0)
-                                    preview_color = "#16A34A" if remaining_preview >= 0 else "#DC2626"
-                                    st.markdown(
-                                        f"**Remaining Budget:** <span style='color:{preview_color}; font-weight:700;'>{_format_money(remaining_preview)}</span>",
-                                        unsafe_allow_html=True,
+                            with tab_expense:
+                                st.markdown(f"**Log purchase for {title}**")
+                                st.caption("Adds to this project's Actual Spent and records a Projects line in the household budget.")
+                                with st.form(f"add_project_expense_form_{project_id}"):
+                                    exp_date = st.date_input(
+                                        "Purchase date",
+                                        value=date.today(),
+                                        key=f"proj_exp_date_{project_id}",
+                                    )
+                                    exp_amount_raw = st.text_input(
+                                        "Amount ($) *",
+                                        placeholder="e.g., 125.00",
+                                        key=f"proj_exp_amt_{project_id}",
+                                    )
+                                    expense_submit = st.form_submit_button(
+                                        "💾 Add Expense",
+                                        type="primary",
+                                        width="stretch",
                                     )
 
-                                en1, en2 = st.columns(2)
-                                e_vendors = en1.text_input("Vendors", value=vendors)
-                                e_vet_discount = en2.checkbox("Veteran Discount", value=has_vet_discount)
-                                cleaned_edit_notes = notes.replace(COMPLETED_TAG, "").strip()
-                                e_notes = st.text_area("Notes", value=cleaned_edit_notes)
-
-                                save_col, complete_col = st.columns(2)
-                                save_clicked = save_col.form_submit_button("💾 Save", type="primary", width="stretch")
-                                complete_clicked = complete_col.form_submit_button("✅ Complete Project", width="stretch")
-
-                            if save_clicked or complete_clicked:
-                                parsed_low = _parse_currency_input(e_est_low_raw)
-                                parsed_high = _parse_currency_input(e_est_high_raw)
-                                parsed_actual = _parse_currency_input(e_actual_raw)
-
-                                if not e_item.strip():
-                                    st.warning("Project Name is required.")
-                                elif "invalid" in [parsed_low, parsed_high, parsed_actual]:
-                                    st.warning("Est. Low, Est. High, and Actual Spent must be valid numbers.")
-                                else:
-                                    update_payload = {
-                                        "item": e_item.strip(),
-                                        "category": e_category,
-                                        "priority": int(e_priority),
-                                        "description": _clean_text(e_description) or None,
-                                        "est_low_cost": float(parsed_low) if parsed_low is not None else float(est_low),
-                                        "est_high_cost": float(parsed_high) if parsed_high is not None else float(est_high),
-                                        "actual_cost": float(parsed_actual) if parsed_actual is not None else float(actual),
-                                        "veteran_discount": bool(e_vet_discount),
-                                        "vendors": _clean_text(e_vendors) or None,
-                                        "notes": _mark_completed_notes(e_notes) if complete_clicked else (_clean_text(e_notes) or None),
-                                    }
-                                    if update_project_budget_item(project_id, update_payload):
-                                        finish_manage_popover("project_write", project_popover_key)
+                                if expense_submit:
+                                    parsed_exp_amount = _parse_currency_input(exp_amount_raw)
+                                    if parsed_exp_amount == "invalid" or parsed_exp_amount is None:
+                                        st.error("Please enter a valid dollar amount.")
+                                    elif add_project_purchase_expense(project_id, exp_date, parsed_exp_amount):
+                                        finish_manage_popover("project_expense_write", project_popover_key)
                                     else:
-                                        st.error("Could not update project.")
+                                        st.error("Could not log project expense.")
+
+                            with tab_edit:
+                                st.markdown(f"**Edit: {title}**")
+                                with st.form(f"edit_project_budget_form_{project_id}"):
+                                    e1, e2, e3 = st.columns([2, 1, 1])
+                                    e_item = e1.text_input("Project Name *", value=title)
+                                    safe_category = category if category in PROJECT_CATEGORIES else "Home Improvement"
+                                    e_category = e2.selectbox(
+                                        "Category",
+                                        PROJECT_CATEGORIES,
+                                        index=PROJECT_CATEGORIES.index(safe_category),
+                                        key=f"edit_cat_{project_id}",
+                                    )
+                                    e_priority = e3.number_input("Priority", min_value=1, step=1, value=max(priority, 1))
+
+                                    e_description = st.text_area("Description", value=description)
+
+                                    eb1, eb2, eb3 = st.columns(3)
+                                    e_est_low_raw = eb1.text_input(
+                                        "Est. Low ($)",
+                                        value=_format_currency_for_input(est_low),
+                                        placeholder="Enter amount",
+                                        key=f"edit_est_low_{project_id}",
+                                    )
+                                    e_est_high_raw = eb2.text_input(
+                                        "Est. High ($)",
+                                        value=_format_currency_for_input(est_high),
+                                        placeholder="Enter amount",
+                                        key=f"edit_est_high_{project_id}",
+                                    )
+                                    e_actual_raw = eb3.text_input(
+                                        "Actual Spent ($)",
+                                        value=_format_currency_for_input(actual),
+                                        placeholder="Enter amount",
+                                        key=f"edit_actual_{project_id}",
+                                    )
+
+                                    if budget_cap > 0:
+                                        remaining_preview = budget_cap - _to_number(e_actual_raw if _clean_text(e_actual_raw) else actual, 0)
+                                        preview_color = "#16A34A" if remaining_preview >= 0 else "#DC2626"
+                                        st.markdown(
+                                            f"**Remaining Budget:** <span style='color:{preview_color}; font-weight:700;'>{_format_money(remaining_preview)}</span>",
+                                            unsafe_allow_html=True,
+                                        )
+
+                                    en1, en2 = st.columns(2)
+                                    e_vendors = en1.text_input("Vendors", value=vendors)
+                                    e_vet_discount = en2.checkbox("Veteran Discount", value=has_vet_discount)
+                                    cleaned_edit_notes = notes.replace(COMPLETED_TAG, "").strip()
+                                    e_notes = st.text_area("Notes", value=cleaned_edit_notes)
+
+                                    save_col, complete_col = st.columns(2)
+                                    save_clicked = save_col.form_submit_button("💾 Save", type="primary", width="stretch")
+                                    complete_clicked = complete_col.form_submit_button("✅ Complete Project", width="stretch")
+
+                                if save_clicked or complete_clicked:
+                                    parsed_low = _parse_currency_input(e_est_low_raw)
+                                    parsed_high = _parse_currency_input(e_est_high_raw)
+                                    parsed_actual = _parse_currency_input(e_actual_raw)
+
+                                    if not e_item.strip():
+                                        st.warning("Project Name is required.")
+                                    elif "invalid" in [parsed_low, parsed_high, parsed_actual]:
+                                        st.warning("Est. Low, Est. High, and Actual Spent must be valid numbers.")
+                                    else:
+                                        update_payload = {
+                                            "item": e_item.strip(),
+                                            "category": e_category,
+                                            "priority": int(e_priority),
+                                            "description": _clean_text(e_description) or None,
+                                            "est_low_cost": float(parsed_low) if parsed_low is not None else float(est_low),
+                                            "est_high_cost": float(parsed_high) if parsed_high is not None else float(est_high),
+                                            "actual_cost": float(parsed_actual) if parsed_actual is not None else float(actual),
+                                            "veteran_discount": bool(e_vet_discount),
+                                            "vendors": _clean_text(e_vendors) or None,
+                                            "notes": _mark_completed_notes(e_notes) if complete_clicked else (_clean_text(e_notes) or None),
+                                        }
+                                        if update_project_budget_item(project_id, update_payload):
+                                            finish_manage_popover("project_write", project_popover_key)
+                                        else:
+                                            st.error("Could not update project.")
 
             def render_tab_totals(project_rows):
                 tab_est_low = sum(p.get("_est_low", 0) for p in project_rows)
