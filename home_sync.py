@@ -1114,19 +1114,11 @@ if selected_dashboard_view == "🚗 Garage":
         
         # 3. The Action Button
         if st.button(action_text, type=btn_type, width='stretch'):
-            # Simulate the delay of the ratgdo hardware processing the command
-            with st.spinner("Transmitting local command via ratgdo..."):
-                import time
-                time.sleep(1.5) # 1.5 second fake delay
-                
-                # Flip the fake state
-                if current_state == "closed":
-                    st.session_state["mock_garage_state"] = "open"
-                else:
-                    st.session_state["mock_garage_state"] = "closed"
-                    
-                # Rerun the app to show the new state
-                st.rerun()
+            if current_state == "closed":
+                st.session_state["mock_garage_state"] = "open"
+            else:
+                st.session_state["mock_garage_state"] = "closed"
+            rerun_with_reason("garage_toggle")
 
 if selected_dashboard_view == "⚙️ System Logs":
     st.subheader("Event History")

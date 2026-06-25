@@ -32,10 +32,12 @@ APP_TIMEZONE = ZoneInfo("America/Chicago")
 AUTH_BOOTSTRAP_MAX_ATTEMPTS = 2
 
 
+@st.cache_resource
 def get_auth_client():
     return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
 
 
+@st.cache_resource
 def get_user_data_client():
     return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_SERVICE_KEY"])
 

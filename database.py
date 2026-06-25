@@ -39,43 +39,62 @@ def require_privileged_user():
 # 📋 TO-DO LIST FUNCTIONS
 # ==========================================
 
+def _decrypt_task_rows(data):
+    if not data:
+        return []
+    for row in data:
+        row["task_name"] = decrypt_text(row.get("task_name"))
+        row["notes"] = decrypt_text(row.get("notes"))
+        row["description"] = decrypt_text(row.get("description"))
+    return data
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _fetch_active_tasks_cached(household_id):
+    response = (
+        supabase.table(TASK_TABLE)
+        .select("*")
+        .eq("is_completed", False)
+        .eq("household_id", household_id)
+        .execute()
+    )
+    return _decrypt_task_rows(response.data or [])
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _fetch_completed_tasks_cached(household_id):
+    response = (
+        supabase.table(TASK_TABLE)
+        .select("*")
+        .eq("is_completed", True)
+        .eq("household_id", household_id)
+        .order("created_at", desc=True)
+        .limit(50)
+        .execute()
+    )
+    return _decrypt_task_rows(response.data or [])
+
+
+def clear_task_list_cache():
+    for cached_fn in (_fetch_active_tasks_cached, _fetch_completed_tasks_cached):
+        clear_fn = getattr(cached_fn, "clear", None)
+        if callable(clear_fn):
+            clear_fn()
+
+
 def get_active_tasks():
     try:
-        # Grab the ID from the active session
         house_id = get_current_household_id()
-        
-        # 🟢 NEW: Added the .eq("household_id", house_id) filter!
-        response = supabase.table(TASK_TABLE).select("*").eq("is_completed", False).eq("household_id", house_id).execute()
-        data = response.data
-        
-        # 🟢 DECRYPT DATA BEFORE SENDING TO UI
-        if data:
-            for row in data:
-                row["task_name"] = decrypt_text(row.get("task_name"))
-                row["notes"] = decrypt_text(row.get("notes"))
-                row["description"] = decrypt_text(row.get("description"))
-                
-        return data
+        return list(_fetch_active_tasks_cached(house_id))
     except Exception as e:
         print(f"Error fetching tasks: {e}")
         return []
 
+
 def get_completed_tasks():
     try:
         house_id = get_current_household_id()
-        
-        # 🟢 NEW: Added the .eq("household_id", house_id) filter!
-        response = supabase.table(TASK_TABLE).select("*").eq("is_completed", True).eq("household_id", house_id).order("created_at", desc=True).limit(50).execute()
-        data = response.data
-        
-        # 🟢 DECRYPT DATA BEFORE SENDING TO UI
-        if data:
-            for row in data:
-                row["task_name"] = decrypt_text(row.get("task_name"))
-                row["notes"] = decrypt_text(row.get("notes"))
-                row["description"] = decrypt_text(row.get("description"))
-                
-        return data
+        return [dict(row) for row in _fetch_completed_tasks_cached(house_id)]
     except Exception as e:
         print(f"Error fetching completed tasks: {e}")
         return []
@@ -130,6 +149,7 @@ def add_new_task(task_name, category, priority, assigned_to, target_date, notes=
             "notes": encrypt_data(notes) if notes else None
         }
         supabase.table(TASK_TABLE).insert(data).execute()
+        clear_task_list_cache()
         return True
     except Exception as e:
         print(f"Error inserting task: {e}")
@@ -181,6 +201,7 @@ def batch_update_tasks(task_ids, new_status):
                     "household_id": house_id,
                 }
                 supabase.table(TASK_TABLE).insert(next_task).execute()
+        clear_task_list_cache()
         return True
     except Exception as e:
         print(f"Error in batch update: {e}")
@@ -216,6 +237,7 @@ def update_task(task_id, task_name=None, notes=None, category=None, priority=Non
         
         if update_data:
             supabase.table(TASK_TABLE).update(update_data).eq("id", task_id).eq("household_id", house_id).execute()
+            clear_task_list_cache()
             return True
         return False
     except Exception as e:
@@ -480,6 +502,7 @@ def delete_task(task_id):
     try:
         house_id = get_current_household_id()
         supabase.table(TASK_TABLE).delete().eq("id", task_id).eq("household_id", house_id).execute()
+        clear_task_list_cache()
         return True
     except Exception as e:
         print(f"Error deleting task: {e}")
@@ -1268,28 +1291,42 @@ def get_current_user_permissions():
 # 🛡️ ADMIN FUNCTIONS
 # ==========================================
 
+@st.cache_data(ttl=60, show_spinner=False)
+def _fetch_household_users_cached(household_id):
+    try:
+        response = (
+            supabase.table("users")
+            .select(
+                "auth_user_id, username, role, can_view_budget, "
+                "can_view_projects, can_edit_projects, "
+                "can_view_monthly_budget, can_edit_monthly_budget, "
+                "can_view_wishlist_members, can_view_wishlist_admin"
+            )
+            .eq("household_id", household_id)
+            .execute()
+        )
+        return response.data or []
+    except Exception:
+        response = (
+            supabase.table("users")
+            .select("auth_user_id, username, role, can_view_budget")
+            .eq("household_id", household_id)
+            .execute()
+        )
+        return response.data or []
+
+
+def clear_household_users_cache():
+    clear_fn = getattr(_fetch_household_users_cached, "clear", None)
+    if callable(clear_fn):
+        clear_fn()
+
+
 def get_household_users_for_admin():
     """Fetches all users in the current household so admins can manage them."""
     try:
         house_id = get_current_household_id()
-        # FIXED: Changed 'id' to 'auth_user_id'
-        try:
-            response = supabase.table("users") \
-                .select(
-                    "auth_user_id, username, role, can_view_budget, "
-                    "can_view_projects, can_edit_projects, "
-                    "can_view_monthly_budget, can_edit_monthly_budget, "
-                    "can_view_wishlist_members, can_view_wishlist_admin"
-                ) \
-                .eq("household_id", house_id) \
-                .execute()
-        except Exception:
-            # Compatibility path before module-level columns are migrated.
-            response = supabase.table("users") \
-                .select("auth_user_id, username, role, can_view_budget") \
-                .eq("household_id", house_id) \
-                .execute()
-        return response.data
+        return list(_fetch_household_users_cached(house_id))
     except Exception as e:
         print(f"Error fetching users: {e}")
         return []
@@ -1366,6 +1403,7 @@ def update_user_module_permissions(auth_user_id: str, updates: dict):
             .eq("household_id", house_id)
             .execute()
         )
+        clear_household_users_cache()
         return True
     except Exception as e:
         print(f"Error updating module permissions: {e}")

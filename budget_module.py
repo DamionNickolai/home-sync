@@ -42,6 +42,19 @@ from database import (
     get_recurring_schedule
 )
 
+def _maybe_auto_rollover(household_id, selected_month):
+    """Run recurring-expense rollover once per session/month to avoid repeat DB scans on every rerun."""
+    if not household_id:
+        return
+    guard_key = f"rollover_checked_{household_id}_{selected_month}"
+    if st.session_state.get(guard_key):
+        return
+    if auto_rollover_recurring_expenses(household_id, selected_month):
+        st.session_state[guard_key] = True
+        st.rerun()
+    st.session_state[guard_key] = True
+
+
 def _to_number(value, default=0.0):
     try:
         if value is None or str(value).strip() == "":
@@ -710,9 +723,7 @@ def render_budget_module(show_back_to_hub=False):
         
         current_month = datetime.now().strftime("%Y-%m")
         selected_month = st.selectbox("Select Month", [current_month, "2026-05", "2026-04"], index=0)
-        # 🟢 EXPENSE AUTOMATION HOOK
-        if auto_rollover_recurring_expenses(household_id, selected_month):
-            st.rerun()
+        _maybe_auto_rollover(household_id, selected_month)
             
         incomes_df = get_household_incomes(household_id, selected_month)
         expenses_df = get_monthly_expenses(household_id, selected_month, include_private_members=True)
@@ -1116,8 +1127,7 @@ def render_budget_module(show_back_to_hub=False):
         current_month = datetime.now().strftime("%Y-%m")
         selected_month = st.selectbox("Select Month", [current_month, "2026-05", "2026-04"], index=0, key="personal_month")
         
-        if auto_rollover_recurring_expenses(household_id, selected_month):
-            st.rerun()
+        _maybe_auto_rollover(household_id, selected_month)
             
         settings = get_user_finance_settings(household_id, username)
         indiv_expenses_df = get_individual_expenses(household_id, auth_user_id, selected_month)
