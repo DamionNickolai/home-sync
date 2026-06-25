@@ -16,6 +16,27 @@ def rerun_app_with_reason(reason: str) -> None:
     st.rerun(scope="app")
 
 
+def _popover_gen_state_key(base_key: str) -> str:
+    return f"_popover_gen::{base_key}"
+
+
+def manage_popover_key(base_key: str) -> str:
+    """Stable-but-resettable popover widget key; bump via close_manage_popover() to force close."""
+    generation = st.session_state.get(_popover_gen_state_key(base_key), 0)
+    return f"popover::{base_key}::{generation}"
+
+
+def close_manage_popover(base_key: str) -> None:
+    gen_key = _popover_gen_state_key(base_key)
+    st.session_state[gen_key] = int(st.session_state.get(gen_key, 0)) + 1
+
+
+def finish_manage_popover(reason: str, base_key: str) -> None:
+    """Close a manage popover and rerun the app (matches backlog save behavior)."""
+    close_manage_popover(base_key)
+    rerun_with_reason(reason)
+
+
 def render_two_col_selector(key: str, options: list, format_func=None):
     if not options:
         return None

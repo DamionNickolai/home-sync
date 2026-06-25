@@ -13,7 +13,7 @@ from database import (
     get_completed_tasks,
     update_task,
 )
-from ui_helpers import queue_rerun_reason, render_two_col_selector
+from ui_helpers import render_two_col_selector, finish_manage_popover, manage_popover_key, rerun_with_reason
 
 FALLBACK_TIMEZONE = "America/Chicago"
 RECURRENCE_OPTIONS = ["Daily", "Weekly", "Biweekly", "Monthly", "Quarterly", "Every 6 Months", "Yearly"]
@@ -102,7 +102,6 @@ def _get_due_bucket(task):
     return None
 
 
-@st.fragment
 def render_todo_view():
     st.subheader("📋 Active To-Do List")
     current_user = st.session_state.get("logged_in_user", "Unknown")
@@ -123,9 +122,6 @@ def render_todo_view():
         """,
         unsafe_allow_html=True,
     )
-
-    if "editing_task_id" not in st.session_state:
-        st.session_state["editing_task_id"] = None
 
     all_active_tasks = get_active_tasks()
     active_tasks = []
@@ -201,7 +197,7 @@ def render_todo_view():
                 )
                 if success:
                     st.success("Task added!")
-                    queue_rerun_reason("task_write")
+                    rerun_with_reason("task_write")
                 else:
                     st.error("Could not save task.")
             elif submit and not new_task:
@@ -286,11 +282,6 @@ def render_todo_view():
                 with st.container(border=True):
                     title_col, action_col = st.columns([6, 1])
                     title_col.write(f"**{task_name}**")
-                    if user_role in ["developer", "admin"]:
-                        if action_col.button("✏️ Edit", key=f"open_task_{task['id']}_{key_scope}", width="stretch"):
-                            current_editing = st.session_state.get("editing_task_id")
-                            st.session_state["editing_task_id"] = None if current_editing == task["id"] else task["id"]
-                            queue_rerun_reason("task_edit_toggle")
 
                     st.caption(" • ".join(detail_parts))
                     if len(assignees) > 1:
@@ -298,141 +289,133 @@ def render_todo_view():
                     if notes:
                         st.caption(f"Notes: {notes}")
 
-                if st.session_state.get("editing_task_id") == task["id"] and user_role in ["developer", "admin"]:
-                    current_assignees = _parse_assignees(task.get("assigned_to", "Unassigned"))
+                    if user_role in ["developer", "admin"]:
+                        task_popover_key = f"task_{task['id']}_{key_scope}"
+                        with action_col.popover("⚙️ Manage", key=manage_popover_key(task_popover_key)):
+                            st.markdown(f"**Edit: {task_name}**")
+                            current_assignees = _parse_assignees(task.get("assigned_to", "Unassigned"))
 
-                    with st.container(border=True):
-                        st.caption("✏️ Edit Task")
-                        with st.form(f"edit_task_form_{task['id']}_{key_scope}"):
-                            edit_col1, edit_col2 = st.columns([3, 1])
-                            edit_task_name = edit_col1.text_input(
-                                "Task",
-                                value=task.get("task_name", ""),
-                                key=f"edit_task_name_{task['id']}_{key_scope}",
-                            )
-
-                            safe_priority = task.get("priority", "Normal")
-                            p_index = (
-                                ["Normal", "High", "Low"].index(safe_priority)
-                                if safe_priority in ["Normal", "High", "Low"]
-                                else 0
-                            )
-                            edit_priority = edit_col2.selectbox(
-                                "Priority",
-                                ["Normal", "High", "Low"],
-                                index=p_index,
-                                key=f"edit_priority_{task['id']}_{key_scope}",
-                            )
-
-                            edit_notes = st.text_area(
-                                "Notes",
-                                value=task.get("notes") or "",
-                                key=f"edit_notes_{task['id']}_{key_scope}",
-                            )
-
-                            edit_col3, edit_col4, edit_col5 = st.columns(3)
-                            safe_cat = task.get("category", "House")
-                            c_index = (
-                                ["House", "Yard", "Admin", "Errand"].index(safe_cat)
-                                if safe_cat in ["House", "Yard", "Admin", "Errand"]
-                                else 0
-                            )
-                            edit_category = edit_col3.selectbox(
-                                "Category",
-                                ["House", "Yard", "Admin", "Errand"],
-                                index=c_index,
-                                key=f"edit_cat_{task['id']}_{key_scope}",
-                            )
-
-                            available_users = get_available_users(current_household)
-                            safe_defaults = [u for u in current_assignees if u in available_users]
-                            edit_assigned_to = edit_col4.multiselect(
-                                "Assign To",
-                                options=available_users,
-                                default=safe_defaults,
-                                key=f"edit_assign_{task['id']}_{key_scope}",
-                            )
-
-                            current_target_date = (
-                                pd.to_datetime(task.get("target_date")).date() if task.get("target_date") else None
-                            )
-                            has_target_date = edit_col5.checkbox(
-                                "Has Target Date",
-                                value=current_target_date is not None,
-                                key=f"has_target_{task['id']}_{key_scope}",
-                            )
-                            edit_target_date = edit_col5.date_input(
-                                "Target Date",
-                                value=current_target_date or _central_now().tz_localize(None).date(),
-                                key=f"edit_target_{task['id']}_{key_scope}",
-                            )
-
-                            edit_rec_col1, edit_rec_col2 = st.columns([1, 2])
-                            safe_recurring = bool(task.get("is_recurring", False))
-                            edit_is_recurring = edit_rec_col1.checkbox(
-                                "Recurring task",
-                                value=safe_recurring,
-                                key=f"edit_recur_enabled_{task['id']}_{key_scope}",
-                            )
-                            existing_pattern = task.get("recurrence_pattern", "Monthly")
-                            rec_index = (
-                                RECURRENCE_OPTIONS.index(existing_pattern)
-                                if existing_pattern in RECURRENCE_OPTIONS
-                                else 3
-                            )
-                            edit_recurrence_pattern = edit_rec_col2.selectbox(
-                                "Recurring",
-                                RECURRENCE_OPTIONS,
-                                index=rec_index,
-                                key=f"edit_recur_pattern_{task['id']}_{key_scope}",
-                            )
-
-                            save_col, complete_col, del_col, cancel_col = st.columns([2, 1, 1, 1])
-                            save_clicked = save_col.form_submit_button("💾 Save", type="primary", width="stretch")
-                            complete_clicked = complete_col.form_submit_button("✅ Complete", width="stretch")
-                            delete_clicked = del_col.form_submit_button("🗑️ Delete", width="stretch")
-                            cancel_clicked = cancel_col.form_submit_button("❌ Cancel", width="stretch")
-
-                        if save_clicked:
-                            if not edit_task_name.strip():
-                                st.error("Task is required.")
-                            elif not edit_assigned_to:
-                                st.error("Please assign the task to at least one person.")
-                            else:
-                                success = update_task(
-                                    task_id=task["id"],
-                                    task_name=edit_task_name,
-                                    notes=edit_notes,
-                                    category=edit_category,
-                                    priority=edit_priority,
-                                    assigned_to=json.dumps(edit_assigned_to),
-                                    target_date=edit_target_date if has_target_date else None,
-                                    clear_target_date=not has_target_date,
-                                    is_recurring=edit_is_recurring,
-                                    recurrence_pattern=edit_recurrence_pattern if edit_is_recurring else None,
+                            with st.form(f"edit_task_form_{task['id']}_{key_scope}"):
+                                edit_col1, edit_col2 = st.columns([3, 1])
+                                edit_task_name = edit_col1.text_input(
+                                    "Task",
+                                    value=task.get("task_name", ""),
+                                    key=f"edit_task_name_{task['id']}_{key_scope}",
                                 )
-                                if success:
-                                    st.session_state["editing_task_id"] = None
-                                    st.success("Task updated.")
-                                    queue_rerun_reason("task_write")
+
+                                safe_priority = task.get("priority", "Normal")
+                                p_index = (
+                                    ["Normal", "High", "Low"].index(safe_priority)
+                                    if safe_priority in ["Normal", "High", "Low"]
+                                    else 0
+                                )
+                                edit_priority = edit_col2.selectbox(
+                                    "Priority",
+                                    ["Normal", "High", "Low"],
+                                    index=p_index,
+                                    key=f"edit_priority_{task['id']}_{key_scope}",
+                                )
+
+                                edit_notes = st.text_area(
+                                    "Notes",
+                                    value=task.get("notes") or "",
+                                    key=f"edit_notes_{task['id']}_{key_scope}",
+                                )
+
+                                edit_col3, edit_col4, edit_col5 = st.columns(3)
+                                safe_cat = task.get("category", "House")
+                                c_index = (
+                                    ["House", "Yard", "Admin", "Errand"].index(safe_cat)
+                                    if safe_cat in ["House", "Yard", "Admin", "Errand"]
+                                    else 0
+                                )
+                                edit_category = edit_col3.selectbox(
+                                    "Category",
+                                    ["House", "Yard", "Admin", "Errand"],
+                                    index=c_index,
+                                    key=f"edit_cat_{task['id']}_{key_scope}",
+                                )
+
+                                available_users = get_available_users(current_household)
+                                safe_defaults = [u for u in current_assignees if u in available_users]
+                                edit_assigned_to = edit_col4.multiselect(
+                                    "Assign To",
+                                    options=available_users,
+                                    default=safe_defaults,
+                                    key=f"edit_assign_{task['id']}_{key_scope}",
+                                )
+
+                                current_target_date = (
+                                    pd.to_datetime(task.get("target_date")).date() if task.get("target_date") else None
+                                )
+                                has_target_date = edit_col5.checkbox(
+                                    "Has Target Date",
+                                    value=current_target_date is not None,
+                                    key=f"has_target_{task['id']}_{key_scope}",
+                                )
+                                edit_target_date = edit_col5.date_input(
+                                    "Target Date",
+                                    value=current_target_date or _central_now().tz_localize(None).date(),
+                                    key=f"edit_target_{task['id']}_{key_scope}",
+                                )
+
+                                edit_rec_col1, edit_rec_col2 = st.columns([1, 2])
+                                safe_recurring = bool(task.get("is_recurring", False))
+                                edit_is_recurring = edit_rec_col1.checkbox(
+                                    "Recurring task",
+                                    value=safe_recurring,
+                                    key=f"edit_recur_enabled_{task['id']}_{key_scope}",
+                                )
+                                existing_pattern = task.get("recurrence_pattern", "Monthly")
+                                rec_index = (
+                                    RECURRENCE_OPTIONS.index(existing_pattern)
+                                    if existing_pattern in RECURRENCE_OPTIONS
+                                    else 3
+                                )
+                                edit_recurrence_pattern = edit_rec_col2.selectbox(
+                                    "Recurring",
+                                    RECURRENCE_OPTIONS,
+                                    index=rec_index,
+                                    key=f"edit_recur_pattern_{task['id']}_{key_scope}",
+                                )
+
+                                save_col, complete_col, del_col = st.columns([2, 1, 1])
+                                save_clicked = save_col.form_submit_button("💾 Save", type="primary", width="stretch")
+                                complete_clicked = complete_col.form_submit_button("✅ Complete", width="stretch")
+                                delete_clicked = del_col.form_submit_button("🗑️ Delete", width="stretch")
+
+                            if save_clicked:
+                                if not edit_task_name.strip():
+                                    st.error("Task is required.")
+                                elif not edit_assigned_to:
+                                    st.error("Please assign the task to at least one person.")
                                 else:
-                                    st.error("Could not update task.")
+                                    success = update_task(
+                                        task_id=task["id"],
+                                        task_name=edit_task_name,
+                                        notes=edit_notes,
+                                        category=edit_category,
+                                        priority=edit_priority,
+                                        assigned_to=json.dumps(edit_assigned_to),
+                                        target_date=edit_target_date if has_target_date else None,
+                                        clear_target_date=not has_target_date,
+                                        is_recurring=edit_is_recurring,
+                                        recurrence_pattern=edit_recurrence_pattern if edit_is_recurring else None,
+                                    )
+                                    if success:
+                                        finish_manage_popover("task_write", task_popover_key)
+                                    else:
+                                        st.error("Could not update task.")
 
-                        if delete_clicked:
-                            delete_task(task["id"])
-                            st.session_state["editing_task_id"] = None
-                            queue_rerun_reason("task_write")
+                            if delete_clicked:
+                                delete_task(task["id"])
+                                finish_manage_popover("task_write", task_popover_key)
 
-                        if complete_clicked:
-                            if batch_update_tasks([task["id"]], True):
-                                st.session_state["editing_task_id"] = None
-                                queue_rerun_reason("task_write")
-                            else:
-                                st.error("Could not complete task.")
-
-                        if cancel_clicked:
-                            st.session_state["editing_task_id"] = None
-                            queue_rerun_reason("task_edit_cancel")
+                            if complete_clicked:
+                                if batch_update_tasks([task["id"]], True):
+                                    finish_manage_popover("task_write", task_popover_key)
+                                else:
+                                    st.error("Could not complete task.")
 
             if selected_task_bucket == "multi":
                 tasks_in_bucket = [x[0] for x in multi_assigned_tasks]
@@ -485,6 +468,6 @@ def render_todo_view():
                 if user_role in ["developer", "admin"] or current_user in assignees:
                     if col_recall.button("🔄 Recall", key=f"recall_{task['id']}"):
                         batch_update_tasks([task["id"]], False)
-                        queue_rerun_reason("task_write")
+                        rerun_with_reason("task_write")
         else:
             st.caption("No recently completed tasks in the last 14 days.")

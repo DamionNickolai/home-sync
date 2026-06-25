@@ -41,7 +41,7 @@ from database import (
     auto_rollover_recurring_expenses,
     get_recurring_schedule
 )
-from ui_helpers import rerun_app_with_reason
+from ui_helpers import rerun_app_with_reason, manage_popover_key, finish_manage_popover
 
 
 def _maybe_auto_rollover(household_id, selected_month):
@@ -53,9 +53,36 @@ def _maybe_auto_rollover(household_id, selected_month):
         return
     if auto_rollover_recurring_expenses(household_id, selected_month):
         st.session_state[guard_key] = True
-        st.rerun()
+        rerun_app_with_reason("recurring_rollover")
     st.session_state[guard_key] = True
 
+
+def _recurring_due_date_in_month(expense_row, selected_month):
+    year, month = map(int, selected_month.split("-"))
+    date_str = expense_row.get("date_logged")
+    if not date_str:
+        return date(year, month, 1)
+    logged = datetime.strptime(date_str, "%Y-%m-%d").date()
+    _, last_day = calendar.monthrange(year, month)
+    return date(year, month, min(logged.day, last_day))
+
+
+def _expense_counts_toward_actual(expense_row, selected_month, as_of=None):
+    if not expense_row.get("is_recurring", False):
+        return True
+    as_of = as_of or date.today()
+    return as_of >= _recurring_due_date_in_month(expense_row, selected_month)
+
+
+def _filter_expenses_for_actual_totals(expenses_df, selected_month, as_of=None):
+    if expenses_df is None or expenses_df.empty:
+        return expenses_df
+    as_of = as_of or date.today()
+    mask = expenses_df.apply(
+        lambda row: _expense_counts_toward_actual(row, selected_month, as_of),
+        axis=1,
+    )
+    return expenses_df[mask]
 
 def _to_number(value, default=0.0):
     try:
@@ -189,7 +216,7 @@ def _render_two_col_selector(key: str, options: list, format_func=None):
             ):
                 if selected_value != left_opt:
                     st.session_state[key] = left_opt
-                    st.rerun()
+                    rerun_app_with_reason("selector_change")
 
             if col_right.button(
                 right_label,
@@ -199,7 +226,7 @@ def _render_two_col_selector(key: str, options: list, format_func=None):
             ):
                 if selected_value != right_opt:
                     st.session_state[key] = right_opt
-                    st.rerun()
+                    rerun_app_with_reason("selector_change")
         else:
             only_opt = row_options[0]
             only_label = format_func(only_opt) if format_func else str(only_opt)
@@ -211,7 +238,7 @@ def _render_two_col_selector(key: str, options: list, format_func=None):
             ):
                 if selected_value != only_opt:
                     st.session_state[key] = only_opt
-                    st.rerun()
+                    rerun_app_with_reason("selector_change")
 
     return st.session_state.get(key)
 
@@ -232,11 +259,6 @@ def _extract_project_year(row, fallback_year):
             except Exception:
                 pass
     return fallback_year
-
-
-def _toggle_project_edit(project_id):
-    current_id = st.session_state.get("editing_project_budget_id")
-    st.session_state["editing_project_budget_id"] = None if current_id == project_id else project_id
 
 
 def _can_access_projects_module():
@@ -264,15 +286,12 @@ def render_budget_module(show_back_to_hub=False):
     _render_budget_fragment(show_back_to_hub)
 
 
-@st.fragment
 def _render_budget_fragment(show_back_to_hub=False):
     # DISABLED: contsants.py is null for now as we do not need a default category init at this time.
     #ensure_household_initialized(st.session_state["household_id"])
 
     if "budget_view" not in st.session_state:
         st.session_state["budget_view"] = "menu"
-    if "editing_project_budget_id" not in st.session_state:
-        st.session_state["editing_project_budget_id"] = None
     if "projects_funds" not in st.session_state:
         st.session_state["projects_funds"] = None
     if "pending_restore_project_id" not in st.session_state:
@@ -280,11 +299,9 @@ def _render_budget_fragment(show_back_to_hub=False):
     if "projects_funds_input" not in st.session_state:
         st.session_state["projects_funds_input"] = ""
     if "projects_active_section" not in st.session_state:
-        st.session_state["projects_active_section"] = "overview"
+        st.session_state["projects_active_section"] = "workspace"
     if "projects_workspace_active_category" not in st.session_state:
         st.session_state["projects_workspace_active_category"] = "priority"
-    if "editing_wishlist_id" not in st.session_state:
-        st.session_state["editing_wishlist_id"] = None
     if "wishlist_active_owner" not in st.session_state:
         st.session_state["wishlist_active_owner"] = None
     if "wishlist_pending_owner" not in st.session_state:
@@ -344,6 +361,7 @@ def _render_budget_fragment(show_back_to_hub=False):
                     st.caption("View active project estimates and execution notes.")
                     if st.button("Open Projects", key="btn_projects", type="secondary", width="stretch"):
                         st.session_state["budget_view"] = "projects"
+                        st.session_state["projects_active_section"] = "workspace"
                         st.rerun()
                 else:
                     st.caption("Projects access is restricted.")
@@ -361,8 +379,6 @@ def _render_budget_fragment(show_back_to_hub=False):
 
     if st.button("⬅️ Back to Budget Modules", width="content"):
         st.session_state["budget_view"] = "menu"
-        st.session_state["editing_project_budget_id"] = None
-        st.session_state["editing_wishlist_id"] = None
         st.rerun()
 
     st.divider()
@@ -561,79 +577,67 @@ def _render_budget_fragment(show_back_to_hub=False):
                         left.caption("Eligible for veteran discount.")
 
                     if editable:
-                        if right.button("✏️ Edit", key=f"edit_wishlist_{row_id}", width="stretch"):
-                            current_edit = st.session_state.get("editing_wishlist_id")
-                            st.session_state["editing_wishlist_id"] = None if current_edit == row_id else row_id
-                            st.rerun()
+                        wishlist_popover_key = f"wishlist_{row_id}"
+                        with right.popover("⚙️ Manage", key=manage_popover_key(wishlist_popover_key)):
+                            st.markdown(f"**Edit: {item_name}**")
+                            with st.form(f"edit_wishlist_form_{row_id}"):
+                                e1, e2 = st.columns([2, 1])
+                                e_item = e1.text_input("Item *", value=item_name)
+                                e_est_raw = e2.text_input("Estimated Price", value=_format_currency_for_input(est_price))
 
-                if editable and st.session_state.get("editing_wishlist_id") == row_id:
-                    with st.container(border=True):
-                        st.markdown("### ✏️ Edit Wish Item")
-                        with st.form(f"edit_wishlist_form_{row_id}"):
-                            e1, e2 = st.columns([2, 1])
-                            e_item = e1.text_input("Item *", value=item_name)
-                            e_est_raw = e2.text_input("Estimated Price", value=_format_currency_for_input(est_price))
+                                e_description = st.text_area("Description", value=description)
 
-                            e_description = st.text_area("Description", value=description)
+                                f1, f2, f3 = st.columns([1, 1, 2])
+                                e_actual_raw = f1.text_input("Actual Cost", value=_format_currency_for_input(actual_cost))
+                                e_vet_discount = f2.checkbox("Veteran Discount", value=veteran_discount)
+                                e_vendor = f3.text_input("Vendor", value=vendor)
 
-                            f1, f2, f3 = st.columns([1, 1, 2])
-                            e_actual_raw = f1.text_input("Actual Cost", value=_format_currency_for_input(actual_cost))
-                            e_vet_discount = f2.checkbox("Veteran Discount", value=veteran_discount)
-                            e_vendor = f3.text_input("Vendor", value=vendor)
+                                e_notes = st.text_area("Notes", value=notes)
 
-                            e_notes = st.text_area("Notes", value=notes)
+                                save_col, complete_col, delete_col, cancel_col = st.columns([2, 1, 1, 1])
+                                save_clicked = save_col.form_submit_button("💾 Save", type="primary", width="stretch")
+                                complete_clicked = complete_col.form_submit_button("✅ Complete", width="stretch")
+                                delete_clicked = delete_col.form_submit_button("🗑️ Delete", width="stretch")
+                                cancel_clicked = cancel_col.form_submit_button("❌ Cancel", width="stretch")
 
-                            save_col, complete_col, delete_col, cancel_col = st.columns([2, 1, 1, 1])
-                            save_clicked = save_col.form_submit_button("💾 Save", type="primary", width="stretch")
-                            complete_clicked = complete_col.form_submit_button("✅ Complete", width="stretch")
-                            delete_clicked = delete_col.form_submit_button("🗑️ Delete", width="stretch")
-                            cancel_clicked = cancel_col.form_submit_button("❌ Cancel", width="stretch")
+                            if save_clicked:
+                                parsed_est = _parse_currency_input(e_est_raw)
+                                parsed_actual = _parse_currency_input(e_actual_raw)
 
-                        if save_clicked:
-                            parsed_est = _parse_currency_input(e_est_raw)
-                            parsed_actual = _parse_currency_input(e_actual_raw)
-
-                            if not e_item.strip():
-                                st.warning("Item is required.")
-                            elif "invalid" in [parsed_est, parsed_actual]:
-                                st.warning("Estimated Price and Actual Cost must be valid numbers.")
-                            else:
-                                update_payload = {
-                                    "item": e_item.strip(),
-                                    "description": _clean_text(e_description) or None,
-                                    "estimated_price": float(parsed_est) if parsed_est is not None else None,
-                                    "actual_cost": float(parsed_actual) if parsed_actual is not None else None,
-                                    "veteran_discount": bool(e_vet_discount),
-                                    "vendor": _clean_text(e_vendor) or None,
-                                    "notes": _clean_text(e_notes) or None,
-                                }
-                                if update_wish_list_item(str(row_id), update_payload):
-                                    st.session_state["wishlist_pending_owner"] = owner_name
-                                    st.session_state["editing_wishlist_id"] = None
-                                    st.success("Wish list item updated.")
-                                    st.rerun()
+                                if not e_item.strip():
+                                    st.warning("Item is required.")
+                                elif "invalid" in [parsed_est, parsed_actual]:
+                                    st.warning("Estimated Price and Actual Cost must be valid numbers.")
                                 else:
-                                    st.error("Could not update this wish list item.")
+                                    update_payload = {
+                                        "item": e_item.strip(),
+                                        "description": _clean_text(e_description) or None,
+                                        "estimated_price": float(parsed_est) if parsed_est is not None else None,
+                                        "actual_cost": float(parsed_actual) if parsed_actual is not None else None,
+                                        "veteran_discount": bool(e_vet_discount),
+                                        "vendor": _clean_text(e_vendor) or None,
+                                        "notes": _clean_text(e_notes) or None,
+                                    }
+                                    if update_wish_list_item(str(row_id), update_payload):
+                                        st.session_state["wishlist_pending_owner"] = owner_name
+                                        finish_manage_popover("wishlist_write", wishlist_popover_key)
+                                    else:
+                                        st.error("Could not update this wish list item.")
 
-                        if complete_clicked:
-                            if complete_wish_list_item(str(row_id)):
-                                st.session_state["editing_wishlist_id"] = None
-                                st.success("Wish list item completed.")
-                                st.rerun()
-                            else:
-                                st.error("Could not complete this wish list item.")
+                            if complete_clicked:
+                                if complete_wish_list_item(str(row_id)):
+                                    finish_manage_popover("wishlist_write", wishlist_popover_key)
+                                else:
+                                    st.error("Could not complete this wish list item.")
 
-                        if delete_clicked:
-                            if delete_wish_list_item(str(row_id)):
-                                st.session_state["editing_wishlist_id"] = None
-                                st.success("Wish list item deleted.")
-                                st.rerun()
-                            else:
-                                st.error("Could not delete this wish list item.")
+                            if delete_clicked:
+                                if delete_wish_list_item(str(row_id)):
+                                    finish_manage_popover("wishlist_write", wishlist_popover_key)
+                                else:
+                                    st.error("Could not delete this wish list item.")
 
-                        if cancel_clicked:
-                            st.session_state["editing_wishlist_id"] = None
-                            st.rerun()
+                            if cancel_clicked:
+                                finish_manage_popover("wishlist_edit_cancel", wishlist_popover_key)
 
                 st.divider()
         else:
@@ -744,7 +748,8 @@ def _render_budget_fragment(show_back_to_hub=False):
         else:
             hh_expenses_df = expenses_df
             
-        total_expenses = hh_expenses_df["amount"].sum() if not hh_expenses_df.empty else 0.0
+        hh_actual_df = _filter_expenses_for_actual_totals(hh_expenses_df, selected_month)
+        total_expenses = hh_actual_df["amount"].sum() if not hh_actual_df.empty else 0.0
         net_cash_flow = total_take_home - total_expenses
         
         household_view_mode = _render_two_col_selector(
@@ -769,8 +774,8 @@ def _render_budget_fragment(show_back_to_hub=False):
             if categories_df.empty:
                 st.info("No categories setup yet. Add some to build your ledger!")
             else:
-                if not hh_expenses_df.empty:
-                    exp_summary = hh_expenses_df.groupby("category_id")["amount"].sum().reset_index()
+                if not hh_actual_df.empty:
+                    exp_summary = hh_actual_df.groupby("category_id")["amount"].sum().reset_index()
                 else:
                     exp_summary = pd.DataFrame(columns=["category_id", "amount"])
                 
@@ -805,19 +810,13 @@ def _render_budget_fragment(show_back_to_hub=False):
                             
                         sub_name = row["sub_category_name"] if pd.notnull(row["sub_category_name"]) and str(row["sub_category_name"]).strip() != "" else "(General)"
                         
-                        # 🟢 LOGIC: 
-                        # 1. Check if already logged (Actual exists)
-                        recurring_item_logged = hh_expenses_df[
-                            (hh_expenses_df["category_id"] == row["id"]) & 
+                        recurring_items = hh_expenses_df[
+                            (hh_expenses_df["category_id"] == row["id"]) &
                             (hh_expenses_df["is_recurring"] == True)
                         ]
-                        
-                        # 2. If already logged, DO NOTHING (No date appended)
-                        if not recurring_item_logged.empty:
-                            pass 
-                        
-                        # 3. Only if NOT logged, check the upcoming schedule
-                        elif row["id"] in recurring_schedule:
+                        recurring_due = _filter_expenses_for_actual_totals(recurring_items, selected_month)
+
+                        if recurring_due.empty and row["id"] in recurring_schedule:
                             target_day = recurring_schedule[row["id"]]
                             _, last_day = calendar.monthrange(year, month)
                             safe_day = min(target_day, last_day)
@@ -922,27 +921,30 @@ def _render_budget_fragment(show_back_to_hub=False):
                         c1, c2 = st.columns([6, 1])
                         c1.caption(f"**{row['date_logged']}** | {row['details']} - **${row['amount']:.2f}**")
                         
-                        with c2.popover("⚙️ Manage"):
+                        expense_popover_key = f"exp_hh_{exp_id}"
+                        with c2.popover("⚙️ Manage", key=manage_popover_key(expense_popover_key)):
                             st.markdown(f"**Edit: {row['details']}**")
                             with st.form(f"edit_form_{exp_id}"):
                                 new_date = st.date_input("Date", value=datetime.strptime(row['date_logged'], "%Y-%m-%d"))
                                 new_amt = st.text_input("Amount ($)", value=str(row["amount"]))
                                 new_det = st.text_input("Details", value=row["details"])
                                 new_recur = st.checkbox("🔄 Is Recurring?", value=row.get("is_recurring", False))
-                                
-                                if st.form_submit_button("💾 Save Changes", type="primary", width='stretch'):
-                                    parsed_amt = _parse_currency_input(new_amt)
-                                    if parsed_amt != "invalid" and new_det.strip():
-                                        if update_expense(exp_id, parsed_amt, new_det, new_recur, date_logged=new_date): 
-                                            st.success("Updated!")
-                                            st.rerun()
+
+                                save_clicked = st.form_submit_button("💾 Save Changes", type="primary", width='stretch')
+
+                            if save_clicked:
+                                parsed_amt = _parse_currency_input(new_amt)
+                                if parsed_amt != "invalid" and new_det.strip():
+                                    if update_expense(exp_id, parsed_amt, new_det, new_recur, date_logged=new_date):
+                                        finish_manage_popover("expense_write", expense_popover_key)
                                     else:
-                                        st.error("Invalid input.")
-                                        
-                            # 🟢 Delete Button moved OUTSIDE the form, but INSIDE the popover
+                                        st.error("Could not update expense.")
+                                else:
+                                    st.error("Invalid input.")
+
                             if st.button("❌ Delete Expense", key=f"del_btn_hh_{exp_id}", type="secondary", width='stretch'):
                                 if delete_expense(exp_id):
-                                    st.rerun()
+                                    finish_manage_popover("expense_write", expense_popover_key)
             
             st.divider()
             
@@ -1010,25 +1012,25 @@ def _render_budget_fragment(show_back_to_hub=False):
                             safe_sub = target_cat_row.get("sub_category_name")
                             edit_sub = st.text_input("Sub-Category", value=safe_sub if pd.notnull(safe_sub) else "")
                             edit_target = st.text_input(target_label, value=f"{display_val:.2f}")
-                            
+
                             u1, u2 = st.columns(2)
-                            if u1.form_submit_button("💾 Update Category", type="primary", width="stretch"):
-                                parsed_target = _parse_currency_input(edit_target)
-                                if not edit_parent.strip() or parsed_target == "invalid":
-                                    st.error("Valid category name and numeric budget required.")
-                                else:
-                                    # 🟢 SINKING FUND LOGIC: Divide by 12 before updating DB
-                                    if edit_parent.strip() == "Annual Subscriptions":
-                                        parsed_target = parsed_target / 12.0
-                                        
-                                    if update_budget_category(target_cat_id, edit_parent, edit_sub, parsed_target):
-                                        st.success("Category updated!")
-                                        st.rerun()
-                                        
-                            if u2.form_submit_button("🗑️ Delete Category", type="secondary", width="stretch"):
-                                if delete_budget_category(target_cat_id):
-                                    st.error("Category deleted.")
-                                    st.rerun()
+                            update_clicked = u1.form_submit_button("💾 Update Category", type="primary", width="stretch")
+                            delete_clicked = u2.form_submit_button("🗑️ Delete Category", type="secondary", width="stretch")
+
+                        if update_clicked:
+                            parsed_target = _parse_currency_input(edit_target)
+                            if not edit_parent.strip() or parsed_target == "invalid":
+                                st.error("Valid category name and numeric budget required.")
+                            else:
+                                if edit_parent.strip() == "Annual Subscriptions":
+                                    parsed_target = parsed_target / 12.0
+
+                                if update_budget_category(target_cat_id, edit_parent, edit_sub, parsed_target):
+                                    rerun_app_with_reason("category_write")
+
+                        if delete_clicked:
+                            if delete_budget_category(target_cat_id):
+                                rerun_app_with_reason("category_write")
                     else:
                         st.caption("No categories found to edit.")
                                 
@@ -1147,7 +1149,8 @@ def _render_budget_fragment(show_back_to_hub=False):
         else:
             my_personal_df = pd.DataFrame()
             
-        total_personal_spend = my_personal_df["amount"].sum() if not my_personal_df.empty else 0.0
+        my_actual_df = _filter_expenses_for_actual_totals(my_personal_df, selected_month)
+        total_personal_spend = my_actual_df["amount"].sum() if not my_actual_df.empty else 0.0
 
         toggle_text = "🔒 Keep my personal ledger private (Hide from Admins)" if role == "member" else "🔒 Keep my personal ledger private (Hide from other Admins)"
         current_share_status = settings.get("share_budget_with_admin", True)
@@ -1181,8 +1184,8 @@ def _render_budget_fragment(show_back_to_hub=False):
             if categories_df.empty:
                 st.info("No personal categories setup yet. Build your blank slate below!")
             else:
-                if not my_personal_df.empty:
-                    exp_summary = my_personal_df.groupby("category_id")["amount"].sum().reset_index()
+                if not my_actual_df.empty:
+                    exp_summary = my_actual_df.groupby("category_id")["amount"].sum().reset_index()
                 else:
                     exp_summary = pd.DataFrame(columns=["category_id", "amount"])
                 
@@ -1216,12 +1219,13 @@ def _render_budget_fragment(show_back_to_hub=False):
                             
                         sub_name = row["sub_category_name"] if pd.notnull(row["sub_category_name"]) and str(row["sub_category_name"]).strip() != "" else "(General)"
                         
-                        recurring_item_logged = my_personal_df[
-                            (my_personal_df["category_id"] == row["id"]) & 
+                        recurring_items = my_personal_df[
+                            (my_personal_df["category_id"] == row["id"]) &
                             (my_personal_df["is_recurring"] == True)
                         ]
-                        
-                        if recurring_item_logged.empty and row["id"] in recurring_schedule:
+                        recurring_due = _filter_expenses_for_actual_totals(recurring_items, selected_month)
+
+                        if recurring_due.empty and row["id"] in recurring_schedule:
                             target_day = recurring_schedule[row["id"]]
                             _, last_day = calendar.monthrange(year, month)
                             safe_day = min(target_day, last_day)
@@ -1325,26 +1329,30 @@ def _render_budget_fragment(show_back_to_hub=False):
                         c1, c2 = st.columns([6, 1])
                         c1.caption(f"**{row['date_logged']}** | {row['details']} - **${row['amount']:.2f}**")
                         
-                        with c2.popover("⚙️ Manage"):
+                        expense_popover_key = f"exp_pers_{exp_id}"
+                        with c2.popover("⚙️ Manage", key=manage_popover_key(expense_popover_key)):
                             st.markdown(f"**Edit: {row['details']}**")
                             with st.form(f"edit_form_pers_{exp_id}"):
                                 new_date = st.date_input("Date", value=datetime.strptime(row['date_logged'], "%Y-%m-%d"))
                                 new_amt = st.text_input("Amount ($)", value=str(row["amount"]))
                                 new_det = st.text_input("Details", value=row["details"])
                                 new_recur = st.checkbox("🔄 Is Recurring?", value=row.get("is_recurring", False))
-                                
-                                if st.form_submit_button("💾 Save Changes", type="primary", width='stretch'):
-                                    parsed_amt = _parse_currency_input(new_amt)
-                                    if parsed_amt != "invalid" and new_det.strip():
-                                        if update_expense(exp_id, parsed_amt, new_det, new_recur, date_logged=new_date):
-                                            st.success("Updated!")
-                                            st.rerun()
+
+                                save_clicked = st.form_submit_button("💾 Save Changes", type="primary", width='stretch')
+
+                            if save_clicked:
+                                parsed_amt = _parse_currency_input(new_amt)
+                                if parsed_amt != "invalid" and new_det.strip():
+                                    if update_expense(exp_id, parsed_amt, new_det, new_recur, date_logged=new_date):
+                                        finish_manage_popover("expense_write", expense_popover_key)
                                     else:
-                                        st.error("Invalid input.")
-                                        
+                                        st.error("Could not update expense.")
+                                else:
+                                    st.error("Invalid input.")
+
                             if st.button("❌ Delete Expense", key=f"del_btn_pers_{exp_id}", type="secondary", width='stretch'):
                                 if delete_expense(exp_id):
-                                    st.rerun()
+                                    finish_manage_popover("expense_write", expense_popover_key)
 
             with st.expander("⚙️ Manage Personal Categories"):
                 tab_add, tab_edit = st.tabs(["➕ Add New", "✏️ Edit Existing"])
@@ -1405,24 +1413,25 @@ def _render_budget_fragment(show_back_to_hub=False):
                             safe_sub = target_cat_row.get("sub_category_name")
                             edit_sub = st.text_input("Sub-Category", value=safe_sub if pd.notnull(safe_sub) else "")
                             edit_target = st.text_input(target_label, value=f"{display_val:.2f}")
-                            
+
                             u1, u2 = st.columns(2)
-                            if u1.form_submit_button("💾 Update Category", type="primary", width="stretch"):
-                                parsed_target = _parse_currency_input(edit_target)
-                                if not edit_parent.strip() or parsed_target == "invalid":
-                                    st.error("Valid category name and numeric budget required.")
-                                else:
-                                    if edit_parent.strip() == "Annual Subscriptions":
-                                        parsed_target = parsed_target / 12.0
-                                        
-                                    if update_budget_category(target_cat_id, edit_parent, edit_sub, parsed_target):
-                                        st.success("Category updated!")
-                                        st.rerun()
-                                        
-                            if u2.form_submit_button("🗑️ Delete Category", type="secondary", width="stretch"):
-                                if delete_budget_category(target_cat_id):
-                                    st.error("Category deleted.")
-                                    st.rerun()
+                            update_clicked = u1.form_submit_button("💾 Update Category", type="primary", width="stretch")
+                            delete_clicked = u2.form_submit_button("🗑️ Delete Category", type="secondary", width="stretch")
+
+                        if update_clicked:
+                            parsed_target = _parse_currency_input(edit_target)
+                            if not edit_parent.strip() or parsed_target == "invalid":
+                                st.error("Valid category name and numeric budget required.")
+                            else:
+                                if edit_parent.strip() == "Annual Subscriptions":
+                                    parsed_target = parsed_target / 12.0
+
+                                if update_budget_category(target_cat_id, edit_parent, edit_sub, parsed_target):
+                                    rerun_app_with_reason("category_write")
+
+                        if delete_clicked:
+                            if delete_budget_category(target_cat_id):
+                                rerun_app_with_reason("category_write")
                     else:
                         st.caption("No categories found to edit.")                    
                                 
@@ -1583,10 +1592,10 @@ def _render_budget_fragment(show_back_to_hub=False):
 
     archive_years = [y for y in available_years if y != selected_year]
 
-    projects_section_keys = ["overview", "workspace", "completed"]
+    projects_section_keys = ["workspace", "overview", "completed"]
 
     if st.session_state.get("projects_active_section") not in projects_section_keys:
-        st.session_state["projects_active_section"] = "overview"
+        st.session_state["projects_active_section"] = "workspace"
 
     def projects_section_label(section_key):
         if section_key == "overview":
@@ -1985,102 +1994,87 @@ def _render_budget_fragment(show_back_to_hub=False):
                         left_col.caption("Eligible for veteran discount.")
 
                     if can_edit_projects:
-                        right_col.button(
-                            "✏️ Edit",
-                            key=f"edit_project_budget_{project_id}",
-                            width="stretch",
-                            on_click=_toggle_project_edit,
-                            args=(project_id,),
-                        )
+                        project_popover_key = f"project_{project_id}"
+                        with right_col.popover("⚙️ Manage", key=manage_popover_key(project_popover_key)):
+                            st.markdown(f"**Edit: {title}**")
+                            with st.form(f"edit_project_budget_form_{project_id}"):
+                                e1, e2, e3 = st.columns([2, 1, 1])
+                                e_item = e1.text_input("Project Name *", value=title)
+                                safe_category = category if category in PROJECT_CATEGORIES else "Home Improvement"
+                                e_category = e2.selectbox(
+                                    "Category",
+                                    PROJECT_CATEGORIES,
+                                    index=PROJECT_CATEGORIES.index(safe_category),
+                                    key=f"edit_cat_{project_id}",
+                                )
+                                e_priority = e3.number_input("Priority", min_value=1, step=1, value=max(priority, 1))
 
-                if can_edit_projects and st.session_state.get("editing_project_budget_id") == project_id:
-                    with st.container(border=True):
-                        st.markdown("### ✏️ Edit Project")
-                        with st.form(f"edit_project_budget_form_{project_id}"):
-                            e1, e2, e3 = st.columns([2, 1, 1])
-                            e_item = e1.text_input("Project Name *", value=title)
-                            safe_category = category if category in PROJECT_CATEGORIES else "Home Improvement"
-                            e_category = e2.selectbox(
-                                "Category",
-                                PROJECT_CATEGORIES,
-                                index=PROJECT_CATEGORIES.index(safe_category),
-                                key=f"edit_cat_{project_id}",
-                            )
-                            e_priority = e3.number_input("Priority", min_value=1, step=1, value=max(priority, 1))
+                                e_description = st.text_area("Description", value=description)
 
-                            e_description = st.text_area("Description", value=description)
-
-                            eb1, eb2, eb3 = st.columns(3)
-                            e_est_low_raw = eb1.text_input(
-                                "Est. Low ($)",
-                                value=_format_currency_for_input(est_low),
-                                placeholder="Enter amount",
-                                key=f"edit_est_low_{project_id}",
-                            )
-                            e_est_high_raw = eb2.text_input(
-                                "Est. High ($)",
-                                value=_format_currency_for_input(est_high),
-                                placeholder="Enter amount",
-                                key=f"edit_est_high_{project_id}",
-                            )
-                            e_actual_raw = eb3.text_input(
-                                "Actual Spent ($)",
-                                value=_format_currency_for_input(actual),
-                                placeholder="Enter amount",
-                                key=f"edit_actual_{project_id}",
-                            )
-
-                            if budget_cap > 0:
-                                remaining_preview = budget_cap - _to_number(e_actual_raw if _clean_text(e_actual_raw) else actual, 0)
-                                preview_color = "#16A34A" if remaining_preview >= 0 else "#DC2626"
-                                st.markdown(
-                                    f"**Remaining Budget:** <span style='color:{preview_color}; font-weight:700;'>{_format_money(remaining_preview)}</span>",
-                                    unsafe_allow_html=True,
+                                eb1, eb2, eb3 = st.columns(3)
+                                e_est_low_raw = eb1.text_input(
+                                    "Est. Low ($)",
+                                    value=_format_currency_for_input(est_low),
+                                    placeholder="Enter amount",
+                                    key=f"edit_est_low_{project_id}",
+                                )
+                                e_est_high_raw = eb2.text_input(
+                                    "Est. High ($)",
+                                    value=_format_currency_for_input(est_high),
+                                    placeholder="Enter amount",
+                                    key=f"edit_est_high_{project_id}",
+                                )
+                                e_actual_raw = eb3.text_input(
+                                    "Actual Spent ($)",
+                                    value=_format_currency_for_input(actual),
+                                    placeholder="Enter amount",
+                                    key=f"edit_actual_{project_id}",
                                 )
 
-                            en1, en2 = st.columns(2)
-                            e_vendors = en1.text_input("Vendors", value=vendors)
-                            e_vet_discount = en2.checkbox("Veteran Discount", value=has_vet_discount)
-                            cleaned_edit_notes = notes.replace(COMPLETED_TAG, "").strip()
-                            e_notes = st.text_area("Notes", value=cleaned_edit_notes)
+                                if budget_cap > 0:
+                                    remaining_preview = budget_cap - _to_number(e_actual_raw if _clean_text(e_actual_raw) else actual, 0)
+                                    preview_color = "#16A34A" if remaining_preview >= 0 else "#DC2626"
+                                    st.markdown(
+                                        f"**Remaining Budget:** <span style='color:{preview_color}; font-weight:700;'>{_format_money(remaining_preview)}</span>",
+                                        unsafe_allow_html=True,
+                                    )
 
-                            save_col, complete_col, cancel_col = st.columns([2, 2, 1])
-                            save_clicked = save_col.form_submit_button("💾 Save", type="primary", width="stretch")
-                            complete_clicked = complete_col.form_submit_button("✅ Complete Project", width="stretch")
-                            cancel_clicked = cancel_col.form_submit_button("❌ Cancel", width="stretch")
+                                en1, en2 = st.columns(2)
+                                e_vendors = en1.text_input("Vendors", value=vendors)
+                                e_vet_discount = en2.checkbox("Veteran Discount", value=has_vet_discount)
+                                cleaned_edit_notes = notes.replace(COMPLETED_TAG, "").strip()
+                                e_notes = st.text_area("Notes", value=cleaned_edit_notes)
 
-                        if save_clicked or complete_clicked:
-                            parsed_low = _parse_currency_input(e_est_low_raw)
-                            parsed_high = _parse_currency_input(e_est_high_raw)
-                            parsed_actual = _parse_currency_input(e_actual_raw)
+                                save_col, complete_col = st.columns(2)
+                                save_clicked = save_col.form_submit_button("💾 Save", type="primary", width="stretch")
+                                complete_clicked = complete_col.form_submit_button("✅ Complete Project", width="stretch")
 
-                            if not e_item.strip():
-                                st.warning("Project Name is required.")
-                            elif "invalid" in [parsed_low, parsed_high, parsed_actual]:
-                                st.warning("Est. Low, Est. High, and Actual Spent must be valid numbers.")
-                            else:
-                                update_payload = {
-                                    "item": e_item.strip(),
-                                    "category": e_category,
-                                    "priority": int(e_priority),
-                                    "description": _clean_text(e_description) or None,
-                                    "est_low_cost": float(parsed_low) if parsed_low is not None else float(est_low),
-                                    "est_high_cost": float(parsed_high) if parsed_high is not None else float(est_high),
-                                    "actual_cost": float(parsed_actual) if parsed_actual is not None else float(actual),
-                                    "veteran_discount": bool(e_vet_discount),
-                                    "vendors": _clean_text(e_vendors) or None,
-                                    "notes": _mark_completed_notes(e_notes) if complete_clicked else (_clean_text(e_notes) or None),
-                                }
-                                if update_project_budget_item(project_id, update_payload):
-                                    st.session_state["editing_project_budget_id"] = None
-                                    st.success("Project completed and moved out of active totals." if complete_clicked else "Project updated.")
-                                    st.rerun()
+                            if save_clicked or complete_clicked:
+                                parsed_low = _parse_currency_input(e_est_low_raw)
+                                parsed_high = _parse_currency_input(e_est_high_raw)
+                                parsed_actual = _parse_currency_input(e_actual_raw)
+
+                                if not e_item.strip():
+                                    st.warning("Project Name is required.")
+                                elif "invalid" in [parsed_low, parsed_high, parsed_actual]:
+                                    st.warning("Est. Low, Est. High, and Actual Spent must be valid numbers.")
                                 else:
-                                    st.error("Could not update project.")
-
-                        if cancel_clicked:
-                            st.session_state["editing_project_budget_id"] = None
-                            st.rerun()
+                                    update_payload = {
+                                        "item": e_item.strip(),
+                                        "category": e_category,
+                                        "priority": int(e_priority),
+                                        "description": _clean_text(e_description) or None,
+                                        "est_low_cost": float(parsed_low) if parsed_low is not None else float(est_low),
+                                        "est_high_cost": float(parsed_high) if parsed_high is not None else float(est_high),
+                                        "actual_cost": float(parsed_actual) if parsed_actual is not None else float(actual),
+                                        "veteran_discount": bool(e_vet_discount),
+                                        "vendors": _clean_text(e_vendors) or None,
+                                        "notes": _mark_completed_notes(e_notes) if complete_clicked else (_clean_text(e_notes) or None),
+                                    }
+                                    if update_project_budget_item(project_id, update_payload):
+                                        finish_manage_popover("project_write", project_popover_key)
+                                    else:
+                                        st.error("Could not update project.")
 
             def render_tab_totals(project_rows):
                 tab_est_low = sum(p.get("_est_low", 0) for p in project_rows)

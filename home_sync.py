@@ -827,8 +827,6 @@ if user_role == "developer" and selected_dashboard_view == "🛠️ Developer Da
             st.session_state["developer_dashboard_view"] = "menu"
         if "backlog_flash" not in st.session_state:
             st.session_state["backlog_flash"] = None
-        if "editing_backlog_id" not in st.session_state:
-            st.session_state["editing_backlog_id"] = None
         if "backlog_active_section" not in st.session_state:
             st.session_state["backlog_active_section"] = None
 
@@ -1075,87 +1073,76 @@ if user_role == "developer" and selected_dashboard_view == "🛠️ Developer Da
                     items = []
 
                 def render_edit_form(item, form_key_suffix):
-                    with st.container(border=True):
-                        st.markdown("### ✏️ Edit Ticket")
-                    
-                        # Form inputs plus Save/Delete submit buttons
-                        with st.form(f"edit_backlog_form_{form_key_suffix}"):
-                            c1, c2, c3, c4 = st.columns(4)
+                    with st.form(f"edit_backlog_form_{form_key_suffix}"):
+                        c1, c2, c3, c4 = st.columns(4)
 
-                            s_idx = backlog_status_options.index(item.get("status", "Backlog")) if item.get("status") in backlog_status_options else 0
-                            e_status = c1.selectbox("Status", backlog_status_options, index=s_idx, key=f"s_{form_key_suffix}")
+                        s_idx = backlog_status_options.index(item.get("status", "Backlog")) if item.get("status") in backlog_status_options else 0
+                        e_status = c1.selectbox("Status", backlog_status_options, index=s_idx, key=f"s_{form_key_suffix}")
 
-                            cat_idx = backlog_category_options.index(item.get("category", "Core")) if item.get("category") in backlog_category_options else 0
-                            e_category = c2.selectbox("Category", backlog_category_options, index=cat_idx, key=f"c_{form_key_suffix}")
+                        cat_idx = backlog_category_options.index(item.get("category", "Core")) if item.get("category") in backlog_category_options else 0
+                        e_category = c2.selectbox("Category", backlog_category_options, index=cat_idx, key=f"c_{form_key_suffix}")
 
-                            p_idx = backlog_priority_options.index(item.get("priority", "Medium")) if item.get("priority") in backlog_priority_options else 1
-                            e_priority = c3.selectbox("Priority", backlog_priority_options, index=p_idx, key=f"p_{form_key_suffix}")
+                        p_idx = backlog_priority_options.index(item.get("priority", "Medium")) if item.get("priority") in backlog_priority_options else 1
+                        e_priority = c3.selectbox("Priority", backlog_priority_options, index=p_idx, key=f"p_{form_key_suffix}")
 
-                            app_opts = ["home_sync", "get_fit", "Global"]
-                            app_idx = app_opts.index(item.get("app_name", "home_sync")) if item.get("app_name") in app_opts else 0
-                            e_app = c4.selectbox("Target App", app_opts, index=app_idx, key=f"a_{form_key_suffix}")
+                        app_opts = ["home_sync", "get_fit", "Global"]
+                        app_idx = app_opts.index(item.get("app_name", "home_sync")) if item.get("app_name") in app_opts else 0
+                        e_app = c4.selectbox("Target App", app_opts, index=app_idx, key=f"a_{form_key_suffix}")
 
-                            st.caption("Fields marked with * are required.")
+                        st.caption("Fields marked with * are required.")
 
-                            e_feature = st.text_input("Feature or Bug Name *", value=item.get("feature", ""), key=f"f_{form_key_suffix}")
-                            e_notes = st.text_area("Description", value=item.get("notes", ""), help="External-facing description", key=f"n_{form_key_suffix}")
-                            e_work_notes = st.text_area("Work Notes", value=item.get("work_notes", ""), help="Internal implementation notes", key=f"w_{form_key_suffix}")
-                            e_public_msg = st.text_area("Public Release Message", value=item.get("public_message", ""), key=f"pm_{form_key_suffix}")
+                        e_feature = st.text_input("Feature or Bug Name *", value=item.get("feature", ""), key=f"f_{form_key_suffix}")
+                        e_notes = st.text_area("Description", value=item.get("notes", ""), help="External-facing description", key=f"n_{form_key_suffix}")
+                        e_work_notes = st.text_area("Work Notes", value=item.get("work_notes", ""), help="Internal implementation notes", key=f"w_{form_key_suffix}")
+                        e_public_msg = st.text_area("Public Release Message", value=item.get("public_message", ""), key=f"pm_{form_key_suffix}")
 
-                            save_col, delete_col = st.columns([3, 1])
-                            save_clicked = save_col.form_submit_button("💾 Save", type="primary", width="stretch")
-                            delete_clicked = delete_col.form_submit_button("🗑️ Delete", width="stretch")
+                        save_col, delete_col = st.columns([3, 1])
+                        save_clicked = save_col.form_submit_button("💾 Save", type="primary", width="stretch")
+                        delete_clicked = delete_col.form_submit_button("🗑️ Delete", width="stretch")
 
-                        if save_clicked:
-                            if not e_feature.strip():
-                                st.session_state["backlog_flash"] = {
-                                    "level": "warning",
-                                    "message": "Save blocked: Feature or Bug Name is required.",
-                                }
-                            else:
-                                updated = update_backlog_item(
-                                    item["id"],
-                                    e_feature,
-                                    e_notes,
-                                    e_status,
-                                    e_app,
-                                    e_category,
-                                    e_priority,
-                                    e_public_msg,
-                                    e_work_notes,
-                                )
-                                if updated:
-                                    st.session_state["backlog_flash"] = {
-                                        "level": "success",
-                                        "message": f"Ticket updated successfully for {e_app}.",
-                                    }
-                                    st.session_state["editing_backlog_id"] = None
-                                else:
-                                    st.session_state["backlog_flash"] = {
-                                        "level": "error",
-                                        "message": "Failed to update ticket. Check logs and try again.",
-                                    }
-                            rerun_with_reason("backlog_write")
-
-                        if delete_clicked:
-                            deleted = delete_backlog_item(item["id"])
-                            if deleted:
+                    if save_clicked:
+                        if not e_feature.strip():
+                            st.session_state["backlog_flash"] = {
+                                "level": "warning",
+                                "message": "Save blocked: Feature or Bug Name is required.",
+                            }
+                        else:
+                            updated = update_backlog_item(
+                                item["id"],
+                                e_feature,
+                                e_notes,
+                                e_status,
+                                e_app,
+                                e_category,
+                                e_priority,
+                                e_public_msg,
+                                e_work_notes,
+                            )
+                            if updated:
                                 st.session_state["backlog_flash"] = {
                                     "level": "success",
-                                    "message": "Ticket deleted successfully.",
+                                    "message": f"Ticket updated successfully for {e_app}.",
                                 }
-                                st.session_state["editing_backlog_id"] = None
                             else:
                                 st.session_state["backlog_flash"] = {
                                     "level": "error",
-                                    "message": "Failed to delete ticket. Check logs and try again.",
+                                    "message": "Failed to update ticket. Check logs and try again.",
                                 }
-                            rerun_with_reason("backlog_write")
+                        rerun_with_reason("backlog_write")
 
-                def begin_backlog_edit(item_id, app_name, is_staged=False):
-                    current_id = st.session_state.get("editing_backlog_id")
-                    st.session_state["editing_backlog_id"] = None if current_id == item_id else item_id
-                    st.session_state["backlog_active_section"] = "staged" if is_staged else f"app::{app_name}"
+                    if delete_clicked:
+                        deleted = delete_backlog_item(item["id"])
+                        if deleted:
+                            st.session_state["backlog_flash"] = {
+                                "level": "success",
+                                "message": "Ticket deleted successfully.",
+                            }
+                        else:
+                            st.session_state["backlog_flash"] = {
+                                "level": "error",
+                                "message": "Failed to delete ticket. Check logs and try again.",
+                            }
+                        rerun_with_reason("backlog_write")
 
                 def render_backlog_item(item, app_name, is_staged=False):
                     col_text, col_act = st.columns([5, 1])
@@ -1178,14 +1165,8 @@ if user_role == "developer" and selected_dashboard_view == "🛠️ Developer Da
                     if version_info:
                         col_text.caption(f"🏷️ Released as v{version_info}")
 
-                    col_act.button(
-                        "✏️ Edit",
-                        key=f"edit_{'staged' if is_staged else 'bl'}_{item['id']}",
-                        on_click=begin_backlog_edit,
-                        args=(item["id"], app_name, is_staged),
-                    )
-
-                    if st.session_state["editing_backlog_id"] == item["id"]:
+                    with col_act.popover("⚙️ Manage"):
+                        st.markdown(f"**Edit: {item.get('feature', 'Unnamed Feature')}**")
                         render_edit_form(item, f"{'staged' if is_staged else 'app'}_{item['id']}")
 
                     st.divider()
