@@ -1534,27 +1534,37 @@ if user_role == "developer" and selected_dashboard_view == "🛠️ Developer Da
                             )
 
                             submit_label = f"Save {app_label} Ticket"
-                            if st.form_submit_button(submit_label, type="primary"):
-                                if not new_feature.strip():
-                                    st.warning("Create blocked: Feature or Bug Name is required.")
+                            create_clicked = st.form_submit_button(submit_label, type="primary")
+
+                        if create_clicked:
+                            if not new_feature.strip():
+                                st.session_state["backlog_flash"] = {
+                                    "level": "warning",
+                                    "message": "Create blocked: Feature or Bug Name is required.",
+                                }
+                                rerun_with_reason("backlog_write")
+                            else:
+                                created = add_backlog_item(
+                                    new_feature,
+                                    new_notes,
+                                    new_status,
+                                    default_target_app,
+                                    new_category,
+                                    new_priority,
+                                    new_work_notes,
+                                )
+                                if created:
+                                    st.session_state["backlog_flash"] = {
+                                        "level": "success",
+                                        "message": f"Ticket created successfully in {app_label}.",
+                                    }
+                                    rerun_with_reason("backlog_write")
                                 else:
-                                    created = add_backlog_item(
-                                        new_feature,
-                                        new_notes,
-                                        new_status,
-                                        default_target_app,
-                                        new_category,
-                                        new_priority,
-                                        new_work_notes,
-                                    )
-                                    if created:
-                                        st.session_state["backlog_flash"] = {
-                                            "level": "success",
-                                            "message": f"Ticket created successfully in {app_label}.",
-                                        }
-                                        queue_rerun_reason("backlog_write")
-                                    else:
-                                        st.error("Failed to create ticket. Check logs and try again.")
+                                    st.session_state["backlog_flash"] = {
+                                        "level": "error",
+                                        "message": "Failed to create ticket. Check logs and try again.",
+                                    }
+                                    rerun_with_reason("backlog_write")
 
                 raw_items = get_all_backlog_items()
                 if raw_items:
@@ -1584,7 +1594,7 @@ if user_role == "developer" and selected_dashboard_view == "🛠️ Developer Da
                     with st.container(border=True):
                         st.markdown("### ✏️ Edit Ticket")
                     
-                        # 🟢 THE FORM: Only contains inputs and the single SAVE button
+                        # Form inputs plus Save/Delete submit buttons
                         with st.form(f"edit_backlog_form_{form_key_suffix}"):
                             c1, c2, c3, c4 = st.columns(4)
 
@@ -1608,41 +1618,42 @@ if user_role == "developer" and selected_dashboard_view == "🛠️ Developer Da
                             e_work_notes = st.text_area("Work Notes", value=item.get("work_notes", ""), help="Internal implementation notes", key=f"w_{form_key_suffix}")
                             e_public_msg = st.text_area("Public Release Message", value=item.get("public_message", ""), key=f"pm_{form_key_suffix}")
 
-                            # 🟢 SAVE BUTTON: The only submit button inside the form
-                            if st.form_submit_button("💾 Save", type="primary"):
-                                if not e_feature.strip():
-                                    st.session_state["backlog_flash"] = {
-                                        "level": "warning",
-                                        "message": "Save blocked: Feature or Bug Name is required.",
-                                    }
-                                else:
-                                    updated = update_backlog_item(
-                                        item["id"],
-                                        e_feature,
-                                        e_notes,
-                                        e_status,
-                                        e_app,
-                                        e_category,
-                                        e_priority,
-                                        e_public_msg,
-                                        e_work_notes,
-                                    )
-                                    if updated:
-                                        st.session_state["backlog_flash"] = {
-                                            "level": "success",
-                                            "message": f"Ticket updated successfully for {e_app}.",
-                                        }
-                                        st.session_state["editing_backlog_id"] = None
-                                    else:
-                                        st.session_state["backlog_flash"] = {
-                                            "level": "error",
-                                            "message": "Failed to update ticket. Check logs and try again.",
-                                        }
-                                queue_rerun_reason("backlog_write")
+                            save_col, delete_col = st.columns([3, 1])
+                            save_clicked = save_col.form_submit_button("💾 Save", type="primary", width="stretch")
+                            delete_clicked = delete_col.form_submit_button("🗑️ Delete", width="stretch")
 
-                        # 🟢 OUTSIDE THE FORM: Callback logic
-                        def handle_delete_backlog():
-                            """Callback to process deletion instantly before the UI redraws."""
+                        if save_clicked:
+                            if not e_feature.strip():
+                                st.session_state["backlog_flash"] = {
+                                    "level": "warning",
+                                    "message": "Save blocked: Feature or Bug Name is required.",
+                                }
+                            else:
+                                updated = update_backlog_item(
+                                    item["id"],
+                                    e_feature,
+                                    e_notes,
+                                    e_status,
+                                    e_app,
+                                    e_category,
+                                    e_priority,
+                                    e_public_msg,
+                                    e_work_notes,
+                                )
+                                if updated:
+                                    st.session_state["backlog_flash"] = {
+                                        "level": "success",
+                                        "message": f"Ticket updated successfully for {e_app}.",
+                                    }
+                                    st.session_state["editing_backlog_id"] = None
+                                else:
+                                    st.session_state["backlog_flash"] = {
+                                        "level": "error",
+                                        "message": "Failed to update ticket. Check logs and try again.",
+                                    }
+                            rerun_with_reason("backlog_write")
+
+                        if delete_clicked:
                             deleted = delete_backlog_item(item["id"])
                             if deleted:
                                 st.session_state["backlog_flash"] = {
@@ -1655,20 +1666,7 @@ if user_role == "developer" and selected_dashboard_view == "🛠️ Developer Da
                                     "level": "error",
                                     "message": "Failed to delete ticket. Check logs and try again.",
                                 }
-                            queue_rerun_reason("backlog_write")
-
-                        # 🟢 SAFETY NET: Delete Confirmation Popover
-                        with st.popover("🗑️ Delete"):
-                            st.markdown("⚠️ **Are you sure?**")
-                            st.caption("This ticket will be permanently removed.")
-                            
-                            # The actual delete trigger is safely tucked inside here
-                            st.button(
-                                "🚨 Confirm Delete", 
-                                key=f"confirm_del_{form_key_suffix}", 
-                                on_click=handle_delete_backlog,
-                                type="primary"
-                            )
+                            rerun_with_reason("backlog_write")
 
                 def begin_backlog_edit(item_id, app_name, is_staged=False):
                     current_id = st.session_state.get("editing_backlog_id")
