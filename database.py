@@ -35,6 +35,17 @@ def require_privileged_user():
     if st.session_state.get("user_role") != "developer":
         raise PermissionError("This action requires developer access.")
 
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_available_users(household_id):
+    """Fetch usernames for a household (used by to-do assignee pickers)."""
+    try:
+        response = supabase.table("users").select("username").eq("household_id", household_id).execute()
+        return [user["username"] for user in response.data] if response.data else []
+    except Exception as e:
+        print(f"Could not fetch users: {e}")
+        return []
+
 # ==========================================
 # 📋 TO-DO LIST FUNCTIONS
 # ==========================================

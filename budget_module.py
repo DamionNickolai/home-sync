@@ -41,6 +41,8 @@ from database import (
     auto_rollover_recurring_expenses,
     get_recurring_schedule
 )
+from ui_helpers import rerun_app_with_reason
+
 
 def _maybe_auto_rollover(household_id, selected_month):
     """Run recurring-expense rollover once per session/month to avoid repeat DB scans on every rerun."""
@@ -259,6 +261,11 @@ def _can_access_monthly_module():
 
 
 def render_budget_module(show_back_to_hub=False):
+    _render_budget_fragment(show_back_to_hub)
+
+
+@st.fragment
+def _render_budget_fragment(show_back_to_hub=False):
     # DISABLED: contsants.py is null for now as we do not need a default category init at this time.
     #ensure_household_initialized(st.session_state["household_id"])
 
@@ -294,7 +301,7 @@ def render_budget_module(show_back_to_hub=False):
         if show_back_to_hub:
             if st.button("⬅️ Back to Hub Menu", width="content"):
                 st.session_state["active_hub_view"] = "main_menu"
-                st.rerun()
+                rerun_app_with_reason("hub_nav")
 
         st.title("Financial Hub 💰")
         st.caption("Manage household finances with quick cards and project-level visibility.")
