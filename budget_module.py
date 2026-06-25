@@ -818,9 +818,30 @@ def render_budget_module(show_back_to_hub=False):
                                  column_config={"Projected": st.column_config.NumberColumn(format="$%.2f"), "Actual": st.column_config.NumberColumn(format="$%.2f")})
                 else:
                     st.info("No active budget targets or expenses for this month.")
-
+            
             st.divider()
             
+            # 🟢 SINKING FUNDS TRACKER
+            annual_df = merged_df[merged_df["category_name"] == "Annual Subscriptions"]
+            if not annual_df.empty:
+                with st.expander("📅 Annual Subscriptions (Sinking Funds) Tracker", expanded=False):
+                    annual_rows = []
+                    for _, row in annual_df.iterrows():
+                        sub = row["sub_category_name"] if pd.notnull(row["sub_category_name"]) and str(row["sub_category_name"]).strip() != "" else "(General)"
+                        monthly_target = row["target_budget"]
+                        annual_target = monthly_target * 12
+                        
+                        annual_rows.append({
+                            "Subscription": sub,
+                            "Monthly Set-Aside": monthly_target,
+                            "Total Annual Cost": annual_target
+                        })
+                        
+                    st.dataframe(pd.DataFrame(annual_rows), hide_index=True, width='stretch',
+                                    column_config={"Monthly Set-Aside": st.column_config.NumberColumn(format="$%.2f"),
+                                                "Total Annual Cost": st.column_config.NumberColumn(format="$%.2f")})
+        
+
             # 🟢 NEW: Annual Reports Footer
             with st.expander("📈 Annual Reports & YTD Summary"):
                 st.markdown("##### Year-to-Date Performance")
@@ -871,39 +892,39 @@ def render_budget_module(show_back_to_hub=False):
                                 st.error("Failed to log expense.")
             
             st.divider()
-            st.markdown("##### 📝 Recent Expenses")
             
-            if hh_expenses_df.empty:
-                st.caption("No expenses logged for this month yet.")
-            else:
-                for _, row in hh_expenses_df.iterrows():
-                    exp_id = row["id"]
-                    
-                    # 🟢 OVERLAY: Using Popover for the Edit Form
-                    c1, c2, c3 = st.columns([5, 1, 1])
-                    c1.caption(f"**{row['date_logged']}** | {row['details']} - **${row['amount']:.2f}**")
-                    
-                    with c2.popover("✏️ Edit"):
-                        st.markdown(f"**Edit: {row['details']}**")
-                        with st.form(f"edit_form_{exp_id}"):
-                            new_date = st.date_input("Date", value=datetime.strptime(row['date_logged'], "%Y-%m-%d"))
-                            new_amt = st.text_input("Amount ($)", value=str(row["amount"]))
-                            new_det = st.text_input("Details", value=row["details"])
-                            new_recur = st.checkbox("🔄 Is Recurring?", value=row.get("is_recurring", False))
-                            
-                            if st.form_submit_button("💾 Update"):
-                                parsed_amt = _parse_currency_input(new_amt)
-                                if parsed_amt != "invalid" and new_det.strip():
-                                    # Note: You may need a small helper to update the date if your update_expense doesn't take it!
-                                    if update_expense(exp_id, parsed_amt, new_det, new_recur): 
-                                        st.success("Updated!")
-                                        st.rerun()
-                                else:
-                                    st.error("Invalid input.")
-
-                    if c3.button("❌", key=f"del_btn_hh_{exp_id}"):
-                        if delete_expense(exp_id):
-                            st.rerun()
+            # 🟢 Expander + Delete inside Popover
+            with st.expander("📝 Recent Household Expenses", expanded=False):
+                if hh_expenses_df.empty:
+                    st.caption("No expenses logged for this month yet.")
+                else:
+                    for _, row in hh_expenses_df.iterrows():
+                        exp_id = row["id"]
+                        
+                        c1, c2 = st.columns([6, 1])
+                        c1.caption(f"**{row['date_logged']}** | {row['details']} - **${row['amount']:.2f}**")
+                        
+                        with c2.popover("⚙️ Manage"):
+                            st.markdown(f"**Edit: {row['details']}**")
+                            with st.form(f"edit_form_{exp_id}"):
+                                new_date = st.date_input("Date", value=datetime.strptime(row['date_logged'], "%Y-%m-%d"))
+                                new_amt = st.text_input("Amount ($)", value=str(row["amount"]))
+                                new_det = st.text_input("Details", value=row["details"])
+                                new_recur = st.checkbox("🔄 Is Recurring?", value=row.get("is_recurring", False))
+                                
+                                if st.form_submit_button("💾 Save Changes", type="primary", width='stretch'):
+                                    parsed_amt = _parse_currency_input(new_amt)
+                                    if parsed_amt != "invalid" and new_det.strip():
+                                        if update_expense(exp_id, parsed_amt, new_det, new_recur, date_logged=new_date): 
+                                            st.success("Updated!")
+                                            st.rerun()
+                                    else:
+                                        st.error("Invalid input.")
+                                        
+                            # 🟢 Delete Button moved OUTSIDE the form, but INSIDE the popover
+                            if st.button("❌ Delete Expense", key=f"del_btn_hh_{exp_id}", type="secondary", width='stretch'):
+                                if delete_expense(exp_id):
+                                    st.rerun()
             
             st.divider()
             
@@ -919,17 +940,19 @@ def render_budget_module(show_back_to_hub=False):
                         existing_parents = sorted(categories_df["category_name"].unique().tolist())
                         parent_options.extend(existing_parents)
                         
-                    # 🟢 FORM REMOVED: This dropdown is now "live"
                     selected_parent = st.selectbox("Parent Category", parent_options, key="hh_parent_sel")
                     
-                    # 🟢 DYNAMIC UX: The text box only appears if they ask to create a new parent
                     if selected_parent == "➕ Create New Parent Category":
-                        final_parent_input = st.text_input("New Parent Name *", placeholder="e.g., Auto, Home", key="hh_new_parent_input")
+                        final_parent_input = st.text_input("New Parent Name *", placeholder="e.g., Annual Subscriptions, Auto", key="hh_new_parent_input")
                     else:
                         final_parent_input = selected_parent
                         
-                    new_sub_cat = st.text_input("Sub-Category (Optional)", placeholder="e.g., Fuel, Groceries", key="hh_new_sub_input")
-                    target_budget_raw = st.text_input("Projected Monthly Budget ($)", placeholder="e.g., 300", key="hh_new_target_input")
+                    # 🟢 SINKING FUND LOGIC: Dynamic Labeling
+                    is_annual = (final_parent_input == "Annual Subscriptions")
+                    target_label = "Full YEARLY Budget ($) - Will automatically divide by 12" if is_annual else "Projected Monthly Budget ($)"
+                        
+                    new_sub_cat = st.text_input("Sub-Category (Optional)", placeholder="e.g., Amazon Prime, Costco", key="hh_new_sub_input")
+                    target_budget_raw = st.text_input(target_label, placeholder="e.g., 120" if is_annual else "e.g., 300", key="hh_new_target_input")
                     
                     if st.button("💾 Save Category", type="primary", width='stretch', key="hh_save_cat_btn"):
                         final_parent = final_parent_input.strip() if isinstance(final_parent_input, str) else final_parent_input
@@ -938,16 +961,19 @@ def render_budget_module(show_back_to_hub=False):
                         if not final_parent or parsed_target == "invalid":
                             st.error("Valid category name and numeric budget required.")
                         else:
+                            # 🟢 SINKING FUND LOGIC: Math interceptor
+                            if is_annual:
+                                parsed_target = parsed_target / 12.0
+                                
                             if insert_budget_category(household_id, final_parent, new_sub_cat, target_budget=parsed_target):
                                 st.success(f"Added {final_parent}!")
                                 st.rerun()
-                                    
+                                
                 with tab_edit:
                     st.markdown("**✏️ Edit or Delete Categories**")
                     if not categories_df.empty:
-                        # Create a clean display list for the dropdown
                         edit_cat_options = categories_df.apply(
-                            lambda row: f"{row['category_name']} - {row.get('sub_category_name', '')} (${row.get('target_budget', 0):.2f})", axis=1
+                            lambda row: f"{row['category_name']} - {row.get('sub_category_name', '')} (${row.get('target_budget', 0):.2f}/mo)", axis=1
                         ).tolist()
                         
                         selected_edit_str = st.selectbox("Select Category to Edit", edit_cat_options, key="edit_cat_hh_select")
@@ -955,14 +981,17 @@ def render_budget_module(show_back_to_hub=False):
                         target_cat_row = categories_df.iloc[selected_edit_idx]
                         target_cat_id = target_cat_row["id"]
                         
+                        # 🟢 SINKING FUND LOGIC: Multiply by 12 for the edit UI
+                        is_edit_annual = (target_cat_row["category_name"] == "Annual Subscriptions")
+                        edit_val = target_cat_row.get("target_budget", 0.0)
+                        display_val = edit_val * 12.0 if is_edit_annual else edit_val
+                        target_label = "Full YEARLY Budget ($) - Will automatically divide by 12" if is_edit_annual else "Projected Monthly Budget ($)"
+                        
                         with st.form("edit_cat_hh_form", clear_on_submit=True):
                             edit_parent = st.text_input("Parent Category", value=target_cat_row["category_name"])
-                            
-                            # Handle empty sub-categories safely
                             safe_sub = target_cat_row.get("sub_category_name")
                             edit_sub = st.text_input("Sub-Category", value=safe_sub if pd.notnull(safe_sub) else "")
-                            
-                            edit_target = st.text_input("Projected Monthly Budget ($)", value=str(target_cat_row.get("target_budget", 0.0)))
+                            edit_target = st.text_input(target_label, value=f"{display_val:.2f}")
                             
                             u1, u2 = st.columns(2)
                             if u1.form_submit_button("💾 Update Category", type="primary", width="stretch"):
@@ -970,6 +999,10 @@ def render_budget_module(show_back_to_hub=False):
                                 if not edit_parent.strip() or parsed_target == "invalid":
                                     st.error("Valid category name and numeric budget required.")
                                 else:
+                                    # 🟢 SINKING FUND LOGIC: Divide by 12 before updating DB
+                                    if edit_parent.strip() == "Annual Subscriptions":
+                                        parsed_target = parsed_target / 12.0
+                                        
                                     if update_budget_category(target_cat_id, edit_parent, edit_sub, parsed_target):
                                         st.success("Category updated!")
                                         st.rerun()
@@ -1215,9 +1248,29 @@ def render_budget_module(show_back_to_hub=False):
                         "Actual": st.column_config.NumberColumn(format="$%.2f")
                     }
                 )
-
+                
             st.divider()
             
+            # 🟢 PERSONAL SINKING FUNDS TRACKER
+                    annual_df = merged_df[merged_df["category_name"] == "Annual Subscriptions"]
+                    if not annual_df.empty:
+                        with st.expander("📅 Annual Subscriptions (Sinking Funds) Tracker", expanded=False):
+                            annual_rows = []
+                            for _, row in annual_df.iterrows():
+                                sub = row["sub_category_name"] if pd.notnull(row["sub_category_name"]) and str(row["sub_category_name"]).strip() != "" else "(General)"
+                                monthly_target = row["target_budget"]
+                                annual_target = monthly_target * 12
+                                
+                                annual_rows.append({
+                                    "Subscription": sub,
+                                    "Monthly Set-Aside": monthly_target,
+                                    "Total Annual Cost": annual_target
+                                })
+                                
+                            st.dataframe(pd.DataFrame(annual_rows), hide_index=True, width='stretch',
+                                        column_config={"Monthly Set-Aside": st.column_config.NumberColumn(format="$%.2f"),
+                                                        "Total Annual Cost": st.column_config.NumberColumn(format="$%.2f")})
+
             with st.expander("📈 Annual Reports & YTD Summary"):
                 st.markdown("##### Year-to-Date Performance")
                 st.caption("YTD aggregations and charting logic will go here.")
@@ -1264,41 +1317,37 @@ def render_budget_module(show_back_to_hub=False):
                                 
             st.divider()
             
-            # 🟢 Edit/Delete Personal Expenses
-            with st.expander("✏️ Edit or Delete Recent Personal Expenses"):
+            # 🟢 Expander + Delete inside Popover
+            with st.expander("📝 Recent Personal Expenses", expanded=False):
                 if my_personal_df.empty:
                     st.caption("No personal expenses logged for this month yet.")
                 else:
-                    expense_options = my_personal_df.apply(
-                        lambda row: f"{row['date_logged']} - {row['details']} (${row['amount']:.2f})", axis=1
-                    ).tolist()
-                    
-                    selected_expense_str = st.selectbox("Select Expense to Manage", expense_options, key="pers_edit_exp_select")
-                    selected_idx = expense_options.index(selected_expense_str)
-                    target_exp_row = my_personal_df.iloc[selected_idx]
-                    target_exp_id = target_exp_row["id"]
-                    
-                    st.markdown("**Update Details**")
-                    with st.form("edit_pers_expense_form", clear_on_submit=True):
-                        e_col1, e_col2 = st.columns(2)
-                        new_amt = e_col1.text_input("Amount ($)", value=str(target_exp_row["amount"]))
-                        new_det = e_col2.text_input("Details", value=target_exp_row["details"])
-                        new_recur = st.checkbox("🔄 Is Recurring?", value=target_exp_row.get("is_recurring", False))
+                    for _, row in my_personal_df.iterrows():
+                        exp_id = row["id"]
                         
-                        u1, u2 = st.columns(2)
-                        if u1.form_submit_button("💾 Update Expense", type="primary", width="stretch"):
-                            parsed_amt = _parse_currency_input(new_amt)
-                            if parsed_amt != "invalid" and new_det.strip():
-                                if update_expense(target_exp_id, parsed_amt, new_det, new_recur):
-                                    st.success("Expense updated successfully!")
-                                    st.rerun()
-                            else:
-                                st.error("Valid amount and details required.")
+                        c1, c2 = st.columns([6, 1])
+                        c1.caption(f"**{row['date_logged']}** | {row['details']} - **${row['amount']:.2f}**")
+                        
+                        with c2.popover("⚙️ Manage"):
+                            st.markdown(f"**Edit: {row['details']}**")
+                            with st.form(f"edit_form_pers_{exp_id}"):
+                                new_date = st.date_input("Date", value=datetime.strptime(row['date_logged'], "%Y-%m-%d"))
+                                new_amt = st.text_input("Amount ($)", value=str(row["amount"]))
+                                new_det = st.text_input("Details", value=row["details"])
+                                new_recur = st.checkbox("🔄 Is Recurring?", value=row.get("is_recurring", False))
                                 
-                        if u2.form_submit_button("🗑️ Delete Expense", type="secondary", width="stretch"):
-                            if delete_expense(target_exp_id):
-                                st.error("Expense deleted.")
-                                st.rerun()
+                                if st.form_submit_button("💾 Save Changes", type="primary", width='stretch'):
+                                    parsed_amt = _parse_currency_input(new_amt)
+                                    if parsed_amt != "invalid" and new_det.strip():
+                                        if update_expense(exp_id, parsed_amt, new_det, new_recur, date_logged=new_date):
+                                            st.success("Updated!")
+                                            st.rerun()
+                                    else:
+                                        st.error("Invalid input.")
+                                        
+                            if st.button("❌ Delete Expense", key=f"del_btn_pers_{exp_id}", type="secondary", width='stretch'):
+                                if delete_expense(exp_id):
+                                    st.rerun()
 
             # 🟢 STREAMLINED SETTINGS: Manage Personal Categories
             with st.expander("⚙️ Manage Personal Categories"):
@@ -1311,17 +1360,19 @@ def render_budget_module(show_back_to_hub=False):
                         existing_parents = sorted(categories_df["category_name"].unique().tolist())
                         parent_options.extend(existing_parents)
                         
-                    # 🟢 FORM REMOVED: This dropdown is now "live"
                     selected_parent = st.selectbox("Parent Category", parent_options, key="pers_parent_sel")
                     
-                    # 🟢 DYNAMIC UX: The text box only appears if they ask to create a new parent
                     if selected_parent == "➕ Create New Parent Category":
-                        final_parent_input = st.text_input("New Parent Name *", placeholder="e.g., Gaming, Coffee", key="pers_new_parent_input")
+                        final_parent_input = st.text_input("New Parent Name *", placeholder="e.g., Annual Subscriptions, Gaming", key="pers_new_parent_input")
                     else:
                         final_parent_input = selected_parent
                         
-                    new_sub_cat = st.text_input("Sub-Category (Optional)", placeholder="e.g., Subscriptions", key="pers_new_sub_input")
-                    target_budget_raw = st.text_input("Projected Monthly Budget ($)", placeholder="e.g., 50", key="pers_new_target_input")
+                    # 🟢 SINKING FUND LOGIC: Dynamic Labeling
+                    is_annual = (final_parent_input == "Annual Subscriptions")
+                    target_label = "Full YEARLY Budget ($) - Will automatically divide by 12" if is_annual else "Projected Monthly Budget ($)"
+                        
+                    new_sub_cat = st.text_input("Sub-Category (Optional)", placeholder="e.g., PlayStation Plus, Coffee", key="pers_new_sub_input")
+                    target_budget_raw = st.text_input(target_label, placeholder="e.g., 60" if is_annual else "e.g., 50", key="pers_new_target_input")
                     
                     if st.button("💾 Save Personal Category", type="primary", width='stretch', key="pers_save_cat_btn"):
                         final_parent = final_parent_input.strip() if isinstance(final_parent_input, str) else final_parent_input
@@ -1330,15 +1381,19 @@ def render_budget_module(show_back_to_hub=False):
                         if not final_parent or parsed_target == "invalid":
                             st.error("Valid category name and numeric budget required.")
                         else:
+                            # 🟢 SINKING FUND LOGIC: Math interceptor
+                            if is_annual:
+                                parsed_target = parsed_target / 12.0
+                                
                             if insert_budget_category(household_id, final_parent, new_sub_cat, is_personal=True, username=username, target_budget=parsed_target):
                                 st.success(f"Added {final_parent} to your private list!")
                                 st.rerun()
-                                    
+                                
                 with tab_edit:
                     st.markdown("**✏️ Edit or Delete Personal Categories**")
                     if not categories_df.empty:
                         edit_cat_options = categories_df.apply(
-                            lambda row: f"{row['category_name']} - {row.get('sub_category_name', '')} (${row.get('target_budget', 0):.2f})", axis=1
+                            lambda row: f"{row['category_name']} - {row.get('sub_category_name', '')} (${row.get('target_budget', 0):.2f}/mo)", axis=1
                         ).tolist()
                         
                         selected_edit_str = st.selectbox("Select Category to Edit", edit_cat_options, key="edit_cat_pers_select")
@@ -1346,11 +1401,17 @@ def render_budget_module(show_back_to_hub=False):
                         target_cat_row = categories_df.iloc[selected_edit_idx]
                         target_cat_id = target_cat_row["id"]
                         
+                        # 🟢 SINKING FUND LOGIC: Multiply by 12 for the edit UI
+                        is_edit_annual = (target_cat_row["category_name"] == "Annual Subscriptions")
+                        edit_val = target_cat_row.get("target_budget", 0.0)
+                        display_val = edit_val * 12.0 if is_edit_annual else edit_val
+                        target_label = "Full YEARLY Budget ($) - Will automatically divide by 12" if is_edit_annual else "Projected Monthly Budget ($)"
+                        
                         with st.form("edit_cat_pers_form", clear_on_submit=True):
                             edit_parent = st.text_input("Parent Category", value=target_cat_row["category_name"])
                             safe_sub = target_cat_row.get("sub_category_name")
                             edit_sub = st.text_input("Sub-Category", value=safe_sub if pd.notnull(safe_sub) else "")
-                            edit_target = st.text_input("Projected Monthly Budget ($)", value=str(target_cat_row.get("target_budget", 0.0)))
+                            edit_target = st.text_input(target_label, value=f"{display_val:.2f}")
                             
                             u1, u2 = st.columns(2)
                             if u1.form_submit_button("💾 Update Category", type="primary", width="stretch"):
@@ -1358,6 +1419,10 @@ def render_budget_module(show_back_to_hub=False):
                                 if not edit_parent.strip() or parsed_target == "invalid":
                                     st.error("Valid category name and numeric budget required.")
                                 else:
+                                    # 🟢 SINKING FUND LOGIC: Divide by 12 before updating DB
+                                    if edit_parent.strip() == "Annual Subscriptions":
+                                        parsed_target = parsed_target / 12.0
+                                        
                                     if update_budget_category(target_cat_id, edit_parent, edit_sub, parsed_target):
                                         st.success("Category updated!")
                                         st.rerun()
@@ -1367,7 +1432,7 @@ def render_budget_module(show_back_to_hub=False):
                                     st.error("Category deleted.")
                                     st.rerun()
                     else:
-                        st.caption("No personal categories found. Build your blank slate above!")                    
+                        st.caption("No categories found to edit.")                    
                                 
         # --- TAB 3: PERSONAL CASH FLOW & TREASURY ---
         elif personal_view_mode == "🔄 Cash Flow & Treasury":
