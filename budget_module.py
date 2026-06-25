@@ -1111,18 +1111,17 @@ def render_budget_module(show_back_to_hub=False):
         auth_user_id = st.session_state.get("auth_user_id")
         role = st.session_state.get("user_role", "member")
         
-        # 🟢 4. CHANGED: Dynamic User Header
         st.subheader(f"👤 {username.title()}'s Personal Ledger")
         
         current_month = datetime.now().strftime("%Y-%m")
         selected_month = st.selectbox("Select Month", [current_month, "2026-05", "2026-04"], index=0, key="personal_month")
-        # 🟢 EXPENSE AUTOMATION HOOK
+        
         if auto_rollover_recurring_expenses(household_id, selected_month):
             st.rerun()
+            
         settings = get_user_finance_settings(household_id, username)
         indiv_expenses_df = get_individual_expenses(household_id, auth_user_id, selected_month)
         
-        # 🟢 5. FETCH PERSONAL INCOME
         personal_incomes_df = get_household_incomes(household_id, selected_month, is_personal_income=True, username=username)
         total_personal_income = personal_incomes_df["take_home_amount"].sum() if not personal_incomes_df.empty else 0.0
         
@@ -1141,7 +1140,6 @@ def render_budget_module(show_back_to_hub=False):
             if update_user_privacy_toggle(household_id, username, not is_private):
                 st.rerun()
                 
-        # 🟢 APPLIED YOUR CUSTOM SELECTOR
         personal_view_mode = _render_two_col_selector(
             key="personal_view_mode",
             options=[f"📊 {username.title()}'s Ledger", "💳 Expenses", "🔄 Cash Flow & Treasury"]
@@ -1161,120 +1159,103 @@ def render_budget_module(show_back_to_hub=False):
             
             st.markdown(f"#### {username.title()}'s Budget Breakdown")
             
-            # 1. Fetch personal categories (Projected Costs)
             categories_df = get_budget_categories(household_id, is_personal=True, username=username)
             
             if categories_df.empty:
                 st.info("No personal categories setup yet. Build your blank slate below!")
             else:
-                # 2. Sum actual expenses by Category ID
                 if not my_personal_df.empty:
                     exp_summary = my_personal_df.groupby("category_id")["amount"].sum().reset_index()
                 else:
                     exp_summary = pd.DataFrame(columns=["category_id", "amount"])
                 
-                # 3. Merge Projected vs Actual
                 merged_df = pd.merge(categories_df, exp_summary, left_on="id", right_on="category_id", how="left")
                 merged_df["actual_amount"] = merged_df["amount"].fillna(0.0)
                 
-                # 4. Build the Hierarchical Matrix
+                # Grab personal recurring schedule
+                year, month = map(int, selected_month.split('-'))
+                prev_month = month - 1 if month > 1 else 12
+                prev_year = year if month > 1 else year - 1
+                prev_month_str = f"{prev_year}-{prev_month:02d}"
+                recurring_schedule = get_recurring_schedule(household_id, prev_month_str, is_personal=True)
+                
                 display_rows = []
                 for parent in merged_df["category_name"].unique():
                     parent_mask = merged_df["category_name"] == parent
                     parent_target = merged_df.loc[parent_mask, "target_budget"].sum()
                     parent_actual = merged_df.loc[parent_mask, "actual_amount"].sum()
-                    diff = parent_target - parent_actual
                     
-                    if diff > 0:
-                        diff_str = f"🟢 +${diff:,.2f}"
-                    elif diff < 0:
-                        diff_str = f"🔴 -${abs(diff):,.2f}"
-                    else:
-                        diff_str = "➖ $0.00"
+                    if parent_target == 0 and parent_actual == 0:
+                        continue
                         
-                    # Add Parent Row
-                    display_rows.append({
-                        "Category": f"📂 {parent}",
-                        "Projected": parent_target,
-                        "Actual": parent_actual,
-                        "Difference": diff_str
-                    })
+                    diff = parent_target - parent_actual
+                    diff_str = f"🟢 +${diff:,.2f}" if diff > 0 else (f"🔴 -${abs(diff):,.2f}" if diff < 0 else "➖ $0.00")
+                        
+                    display_rows.append({"Category": f"📂 {parent}", "Projected": parent_target, "Actual": parent_actual, "Difference": diff_str})
                     
-                    # 🟢 1. Grab the personal recurring schedule
-            year, month = map(int, selected_month.split('-')) # Assumes selected_month is in scope
-            prev_month = month - 1 if month > 1 else 12
-            prev_year = year if month > 1 else year - 1
-            prev_month_str = f"{prev_year}-{prev_month:02d}"
-            
-            # Use is_personal=True here!
-            recurring_schedule = get_recurring_schedule(household_id, prev_month_str, is_personal=True)
+                    for _, row in merged_df[parent_mask].iterrows():
+                        if row["target_budget"] == 0 and row["actual_amount"] == 0:
+                            continue
+                            
+                        sub_name = row["sub_category_name"] if pd.notnull(row["sub_category_name"]) and str(row["sub_category_name"]).strip() != "" else "(General)"
+                        
+                        recurring_item_logged = my_personal_df[
+                            (my_personal_df["category_id"] == row["id"]) & 
+                            (my_personal_df["is_recurring"] == True)
+                        ]
+                        
+                        if recurring_item_logged.empty and row["id"] in recurring_schedule:
+                            target_day = recurring_schedule[row["id"]]
+                            _, last_day = calendar.monthrange(year, month)
+                            safe_day = min(target_day, last_day)
+                            scheduled_date = date(year, month, safe_day).strftime("%B %d")
+                            sub_name = f"{sub_name} {scheduled_date}"
 
-            # 🟢 2. Build Sub-category Rows
-            for _, row in merged_df[parent_mask].iterrows():
-                if row["target_budget"] == 0 and row["actual_amount"] == 0:
-                    continue
-                    
-                sub_name = row["sub_category_name"] if pd.notnull(row["sub_category_name"]) and str(row["sub_category_name"]).strip() != "" else "(General)"
+                        display_rows.append({"Category": f"      ↳ {sub_name}", "Projected": row["target_budget"], "Actual": row["actual_amount"], "Difference": ""})
                 
-                # 🟢 PERSONAL LOGIC: 
-                recurring_item_logged = my_personal_df[
-                    (my_personal_df["category_id"] == row["id"]) & 
-                    (my_personal_df["is_recurring"] == True)
-                ]
-                
-                # Only show date if NOT logged yet
-                if recurring_item_logged.empty and row["id"] in recurring_schedule:
-                    target_day = recurring_schedule[row["id"]]
-                    _, last_day = calendar.monthrange(year, month)
-                    safe_day = min(target_day, last_day)
-                    scheduled_date = date(year, month, safe_day).strftime("%B %d")
-                    sub_name = f"{sub_name} {scheduled_date}"
+                if display_rows:
+                    st.dataframe(
+                        pd.DataFrame(display_rows), 
+                        hide_index=True, 
+                        column_config={
+                            "Projected": st.column_config.NumberColumn(format="$%.2f"), 
+                            "Actual": st.column_config.NumberColumn(format="$%.2f")
+                        }
+                    )
+                else:
+                    st.info("No active budget targets or expenses for this month.")
 
-                display_rows.append({
-                    "Category": f"      ↳ {sub_name}",
-                    "Projected": row["target_budget"],
-                    "Actual": row["actual_amount"],
-                    "Difference": "" 
-                })
-                
-                final_df = pd.DataFrame(display_rows)
-                
-                st.dataframe(
-                    final_df, 
-                    hide_index=True, 
-                    width='stretch',
-                    column_config={
-                        "Projected": st.column_config.NumberColumn(format="$%.2f"),
-                        "Actual": st.column_config.NumberColumn(format="$%.2f")
-                    }
-                )
-                
-            st.divider()
-            
-            # 🟢 PERSONAL SINKING FUNDS TRACKER
-                    annual_df = merged_df[merged_df["category_name"] == "Annual Subscriptions"]
-                    if not annual_df.empty:
-                        with st.expander("📅 Annual Subscriptions (Sinking Funds) Tracker", expanded=False):
-                            annual_rows = []
-                            for _, row in annual_df.iterrows():
-                                sub = row["sub_category_name"] if pd.notnull(row["sub_category_name"]) and str(row["sub_category_name"]).strip() != "" else "(General)"
-                                monthly_target = row["target_budget"]
-                                annual_target = monthly_target * 12
-                                
-                                annual_rows.append({
-                                    "Subscription": sub,
-                                    "Monthly Set-Aside": monthly_target,
-                                    "Total Annual Cost": annual_target
-                                })
-                                
-                            st.dataframe(pd.DataFrame(annual_rows), hide_index=True, width='stretch',
-                                        column_config={"Monthly Set-Aside": st.column_config.NumberColumn(format="$%.2f"),
-                                                        "Total Annual Cost": st.column_config.NumberColumn(format="$%.2f")})
+                # 🟢 PERSONAL SINKING FUNDS TRACKER
+                annual_df = merged_df[merged_df["category_name"] == "Annual Subscriptions"]
+                if not annual_df.empty:
+                    with st.expander("📅 Annual Subscriptions (Sinking Funds) Tracker", expanded=False):
+                        annual_rows = []
+                        for _, row in annual_df.iterrows():
+                            sub = row["sub_category_name"] if pd.notnull(row["sub_category_name"]) and str(row["sub_category_name"]).strip() != "" else "(General)"
+                            monthly_target = row["target_budget"]
+                            annual_target = monthly_target * 12
+                            
+                            annual_rows.append({
+                                "Subscription": sub,
+                                "Monthly Set-Aside": monthly_target,
+                                "Total Annual Cost": annual_target
+                            })
+                            
+                        st.dataframe(
+                            pd.DataFrame(annual_rows), 
+                            hide_index=True,
+                            column_config={
+                                "Monthly Set-Aside": st.column_config.NumberColumn(format="$%.2f"),
+                                "Total Annual Cost": st.column_config.NumberColumn(format="$%.2f")
+                            }
+                        )
 
             with st.expander("📈 Annual Reports & YTD Summary"):
                 st.markdown("##### Year-to-Date Performance")
                 st.caption("YTD aggregations and charting logic will go here.")
-                
+
+            st.divider()
+
         # --- TAB 2: LOG EXPENSE (PERSONAL) ---
         elif personal_view_mode == "💳 Expenses":
             st.markdown("#### Log a Personal Expense")
@@ -1317,7 +1298,6 @@ def render_budget_module(show_back_to_hub=False):
                                 
             st.divider()
             
-            # 🟢 Expander + Delete inside Popover
             with st.expander("📝 Recent Personal Expenses", expanded=False):
                 if my_personal_df.empty:
                     st.caption("No personal expenses logged for this month yet.")
@@ -1349,7 +1329,6 @@ def render_budget_module(show_back_to_hub=False):
                                 if delete_expense(exp_id):
                                     st.rerun()
 
-            # 🟢 STREAMLINED SETTINGS: Manage Personal Categories
             with st.expander("⚙️ Manage Personal Categories"):
                 tab_add, tab_edit = st.tabs(["➕ Add New", "✏️ Edit Existing"])
                 
@@ -1367,7 +1346,6 @@ def render_budget_module(show_back_to_hub=False):
                     else:
                         final_parent_input = selected_parent
                         
-                    # 🟢 SINKING FUND LOGIC: Dynamic Labeling
                     is_annual = (final_parent_input == "Annual Subscriptions")
                     target_label = "Full YEARLY Budget ($) - Will automatically divide by 12" if is_annual else "Projected Monthly Budget ($)"
                         
@@ -1381,7 +1359,6 @@ def render_budget_module(show_back_to_hub=False):
                         if not final_parent or parsed_target == "invalid":
                             st.error("Valid category name and numeric budget required.")
                         else:
-                            # 🟢 SINKING FUND LOGIC: Math interceptor
                             if is_annual:
                                 parsed_target = parsed_target / 12.0
                                 
@@ -1401,7 +1378,6 @@ def render_budget_module(show_back_to_hub=False):
                         target_cat_row = categories_df.iloc[selected_edit_idx]
                         target_cat_id = target_cat_row["id"]
                         
-                        # 🟢 SINKING FUND LOGIC: Multiply by 12 for the edit UI
                         is_edit_annual = (target_cat_row["category_name"] == "Annual Subscriptions")
                         edit_val = target_cat_row.get("target_budget", 0.0)
                         display_val = edit_val * 12.0 if is_edit_annual else edit_val
@@ -1419,7 +1395,6 @@ def render_budget_module(show_back_to_hub=False):
                                 if not edit_parent.strip() or parsed_target == "invalid":
                                     st.error("Valid category name and numeric budget required.")
                                 else:
-                                    # 🟢 SINKING FUND LOGIC: Divide by 12 before updating DB
                                     if edit_parent.strip() == "Annual Subscriptions":
                                         parsed_target = parsed_target / 12.0
                                         
@@ -1467,12 +1442,10 @@ def render_budget_module(show_back_to_hub=False):
                         if not source_name.strip() or th_val == "invalid" or g_val == "invalid":
                             st.error("Please provide a valid source name and dollar amounts.")
                         else:
-                            # 🟢 SAVES DIRECTLY AS A PERSONAL INCOME STREAM
                             if insert_household_income(household_id, selected_month, source_name, th_val, g_val, is_taxable, username, is_windfall, is_recurring, is_personal_income=True):
                                 st.success(f"Added {source_name}!")
                                 st.rerun()
                                 
-            # Manage Existing Personal Income
             with st.expander(f"🛠️ Manage Personal Income ({selected_month})"):
                 if not personal_incomes_df.empty:
                     for _, row in personal_incomes_df.iterrows():

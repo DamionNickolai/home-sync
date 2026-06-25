@@ -1583,6 +1583,8 @@ if user_role == "developer" and selected_dashboard_view == "🛠️ Developer Da
                 def render_edit_form(item, form_key_suffix):
                     with st.container(border=True):
                         st.markdown("### ✏️ Edit Ticket")
+                    
+                        # 🟢 THE FORM: Only contains inputs and the single SAVE button
                         with st.form(f"edit_backlog_form_{form_key_suffix}"):
                             c1, c2, c3, c4 = st.columns(4)
 
@@ -1606,9 +1608,8 @@ if user_role == "developer" and selected_dashboard_view == "🛠️ Developer Da
                             e_work_notes = st.text_area("Work Notes", value=item.get("work_notes", ""), help="Internal implementation notes", key=f"w_{form_key_suffix}")
                             e_public_msg = st.text_area("Public Release Message", value=item.get("public_message", ""), key=f"pm_{form_key_suffix}")
 
-                            col_save, col_del, col_cancel = st.columns([2, 1, 1])
-
-                            if col_save.form_submit_button("💾 Save", type="primary", width='stretch'):
+                            # 🟢 SAVE BUTTON: The only submit button inside the form
+                            if st.form_submit_button("💾 Save", type="primary"):
                                 if not e_feature.strip():
                                     st.session_state["backlog_flash"] = {
                                         "level": "warning",
@@ -1639,24 +1640,35 @@ if user_role == "developer" and selected_dashboard_view == "🛠️ Developer Da
                                         }
                                 queue_rerun_reason("backlog_write")
 
-                            if col_del.form_submit_button("🗑️ Delete", width='stretch'):
-                                deleted = delete_backlog_item(item["id"])
-                                if deleted:
-                                    st.session_state["backlog_flash"] = {
-                                        "level": "success",
-                                        "message": "Ticket deleted successfully.",
-                                    }
-                                    st.session_state["editing_backlog_id"] = None
-                                else:
-                                    st.session_state["backlog_flash"] = {
-                                        "level": "error",
-                                        "message": "Failed to delete ticket. Check logs and try again.",
-                                    }
-                                queue_rerun_reason("backlog_write")
-
-                            if col_cancel.form_submit_button("❌ Cancel", width='stretch'):
+                        # 🟢 OUTSIDE THE FORM: Callback logic
+                        def handle_delete_backlog():
+                            """Callback to process deletion instantly before the UI redraws."""
+                            deleted = delete_backlog_item(item["id"])
+                            if deleted:
+                                st.session_state["backlog_flash"] = {
+                                    "level": "success",
+                                    "message": "Ticket deleted successfully.",
+                                }
                                 st.session_state["editing_backlog_id"] = None
-                                queue_rerun_reason("backlog_edit_cancel")
+                            else:
+                                st.session_state["backlog_flash"] = {
+                                    "level": "error",
+                                    "message": "Failed to delete ticket. Check logs and try again.",
+                                }
+                            queue_rerun_reason("backlog_write")
+
+                        # 🟢 SAFETY NET: Delete Confirmation Popover
+                        with st.popover("🗑️ Delete"):
+                            st.markdown("⚠️ **Are you sure?**")
+                            st.caption("This ticket will be permanently removed.")
+                            
+                            # The actual delete trigger is safely tucked inside here
+                            st.button(
+                                "🚨 Confirm Delete", 
+                                key=f"confirm_del_{form_key_suffix}", 
+                                on_click=handle_delete_backlog,
+                                type="primary"
+                            )
 
                 def begin_backlog_edit(item_id, app_name, is_staged=False):
                     current_id = st.session_state.get("editing_backlog_id")
