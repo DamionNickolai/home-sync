@@ -53,9 +53,6 @@ python push_to_prod.py
 INSTALL PACKAGES:
 pip install -r requirements.txt
 
-ENTER VIRTUAL ENV:
-.\venv\Scripts\activate
-
 RUN DATABASE MIGRATIONS:
 python maintenance/migrate_projects.py
 
