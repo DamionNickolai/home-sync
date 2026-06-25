@@ -258,9 +258,20 @@ def hydrate_user_session(db_user, auth_user_id=None):
     st.session_state["user_role"] = db_user.get("role", "member")
     st.session_state["can_view_budget"] = db_user.get("can_view_budget", False)
     st.session_state["can_view_projects"] = db_user.get("can_view_projects", db_user.get("can_view_budget", False))
-    st.session_state["can_edit_projects"] = db_user.get("can_edit_projects", db_user.get("can_view_budget", False))
+    st.session_state["can_edit_projects"] = db_user.get("can_edit_projects", False)
     st.session_state["can_view_monthly_budget"] = db_user.get("can_view_monthly_budget", db_user.get("can_view_budget", False))
     st.session_state["can_edit_monthly_budget"] = db_user.get("can_edit_monthly_budget", False)
+    for perm in (
+        "can_view_home_solar",
+        "can_edit_home_solar",
+        "can_view_home_security",
+        "can_edit_home_security",
+        "can_view_home_garage",
+        "can_edit_home_garage",
+        "can_view_home_logs",
+        "can_edit_home_logs",
+    ):
+        st.session_state[perm] = db_user.get(perm, False)
     st.session_state["primary_color"] = db_user.get("primary_color", "#1E3A8A")
     st.session_state["sidebar_color"] = db_user.get("sidebar_color", "#162A61")
     st.session_state["line_color"] = db_user.get("line_color", "#60A5FA")

@@ -4,3 +4,11 @@ showErrorDetails = false
 
 [browser]
 gatherUsageStats = false
+
+[server]
+# Windows often misses file-change events with the default watcher; poll is reliable.
+fileWatcherType = "poll"
+runOnSave = true
+
+[runner]
+fastReruns = true

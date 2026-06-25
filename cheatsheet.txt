@@ -66,5 +66,6 @@ Home Sync and Get Fit Together must use the same ENCRYPTION_KEY in production be
 ENTER VIRTUAL ENV:
 .\venv\Scripts\activate
 
+(Hot reload: .streamlit/config.toml enables runOnSave + poll watcher on Windows. Restart once after pulling config changes.)
 RUN APP:
 python -m streamlit run home_sync.py

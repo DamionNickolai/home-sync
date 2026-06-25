@@ -15,6 +15,124 @@ PROJECT_BUDGETS_TABLE = "project_budgets_dev" if env == "local" else "project_bu
 HOUSEHOLD_FINANCE_SETTINGS_TABLE = "household_finance_settings_dev" if env == "local" else "household_finance_settings"
 WISH_LIST_TABLE = "wish_list_dev" if env == "local" else "wish_list"
 
+INCOME_PAY_FREQUENCIES = (
+    "weekly",
+    "bi_weekly",
+    "semi_monthly",
+    "monthly",
+    "quarterly",
+    "annually",
+    "one_time",
+)
+
+INCOME_PAY_FREQUENCY_LABELS = {
+    "weekly": "Weekly",
+    "bi_weekly": "Bi-weekly",
+    "semi_monthly": "Semi-monthly",
+    "monthly": "Monthly",
+    "quarterly": "Quarterly",
+    "annually": "Annually",
+    "one_time": "One-time",
+}
+
+
+def normalize_income_pay_frequency(value) -> str:
+    freq = str(value or "monthly").strip().lower()
+    if freq in INCOME_PAY_FREQUENCY_LABELS:
+        return freq
+    return "monthly"
+
+
+def income_pay_frequency_label(value) -> str:
+    return INCOME_PAY_FREQUENCY_LABELS.get(normalize_income_pay_frequency(value), "Monthly")
+
+
+def income_is_recurring_frequency(pay_frequency) -> bool:
+    return normalize_income_pay_frequency(pay_frequency) != "one_time"
+
+
+def normalize_income_amount_for_month(amount, pay_frequency) -> float:
+    """Convert a per-payment income amount into an estimated monthly total."""
+    freq = normalize_income_pay_frequency(pay_frequency)
+    safe_amount = float(amount or 0)
+    if freq == "weekly":
+        return safe_amount * 52 / 12
+    if freq == "bi_weekly":
+        return safe_amount * 26 / 12
+    if freq == "semi_monthly":
+        return safe_amount * 2
+    if freq == "monthly":
+        return safe_amount
+    if freq == "quarterly":
+        return safe_amount / 3
+    if freq == "annually":
+        return safe_amount / 12
+    return safe_amount
+
+
+def sum_income_for_month(incomes_df) -> float:
+    if incomes_df is None or incomes_df.empty:
+        return 0.0
+    total = 0.0
+    for _, row in incomes_df.iterrows():
+        freq = row.get("pay_frequency")
+        if not freq:
+            freq = "monthly" if row.get("is_recurring") else "one_time"
+        total += normalize_income_amount_for_month(row.get("take_home_amount"), freq)
+    return total
+
+
+def _income_row_frequency(row) -> str:
+    freq = row.get("pay_frequency")
+    if not freq:
+        return "monthly" if row.get("is_recurring") else "one_time"
+    return normalize_income_pay_frequency(freq)
+
+
+def sum_gross_for_month(incomes_df) -> float:
+    if incomes_df is None or incomes_df.empty:
+        return 0.0
+    total = 0.0
+    for _, row in incomes_df.iterrows():
+        total += normalize_income_amount_for_month(row.get("gross_amount"), _income_row_frequency(row))
+    return total
+
+
+def sum_taxable_gross_for_month(incomes_df) -> float:
+    if incomes_df is None or incomes_df.empty:
+        return 0.0
+    total = 0.0
+    for _, row in incomes_df.iterrows():
+        if not bool(row.get("is_taxable", False)):
+            continue
+        total += normalize_income_amount_for_month(row.get("gross_amount"), _income_row_frequency(row))
+    return total
+
+
+def sum_nontaxable_gross_for_month(incomes_df) -> float:
+    if incomes_df is None or incomes_df.empty:
+        return 0.0
+    total = 0.0
+    for _, row in incomes_df.iterrows():
+        if bool(row.get("is_taxable", False)):
+            continue
+        total += normalize_income_amount_for_month(row.get("gross_amount"), _income_row_frequency(row))
+    return total
+
+
+def compute_annual_income_totals(incomes_df) -> dict:
+    """Estimated annual income figures from month-normalized streams."""
+    monthly_takehome = sum_income_for_month(incomes_df)
+    monthly_gross = sum_gross_for_month(incomes_df)
+    monthly_taxable = sum_taxable_gross_for_month(incomes_df)
+    monthly_nontaxable = sum_nontaxable_gross_for_month(incomes_df)
+    return {
+        "annual_takehome": monthly_takehome * 12,
+        "annual_gross": monthly_gross * 12,
+        "annual_taxable": monthly_taxable * 12,
+        "annual_non_taxable": monthly_nontaxable * 12,
+    }
+
 @st.cache_resource
 def init_connection() -> Client:
     url = st.secrets["SUPABASE_URL"]
@@ -22,6 +140,42 @@ def init_connection() -> Client:
     return create_client(url, key)
 
 supabase = init_connection()
+
+HOME_MGMT_PERMISSION_KEYS = (
+    "can_view_home_solar",
+    "can_edit_home_solar",
+    "can_view_home_security",
+    "can_edit_home_security",
+    "can_view_home_garage",
+    "can_edit_home_garage",
+    "can_view_home_logs",
+    "can_edit_home_logs",
+)
+HOME_MGMT_PERMISSION_KEY_SET = frozenset(HOME_MGMT_PERMISSION_KEYS)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _home_mgmt_permissions_available() -> bool:
+    try:
+        (
+            supabase.table("users")
+            .select("can_view_home_solar")
+            .limit(1)
+            .execute()
+        )
+        return True
+    except Exception:
+        return False
+
+
+def home_mgmt_permissions_available() -> bool:
+    return _home_mgmt_permissions_available()
+
+
+def clear_home_mgmt_permissions_cache():
+    clear_fn = getattr(_home_mgmt_permissions_available, "clear", None)
+    if callable(clear_fn):
+        clear_fn()
 
 
 def get_current_household_id():
@@ -540,10 +694,10 @@ def get_user_finance_settings(household_id, username):
             data = response.data[0]
             # Decrypt optional future fields if you add them (like personal_savings_goal)
             return data
-        return {"share_budget_with_admin": True, "default_view": "Household"}
+        return {"share_budget_with_admin": False, "default_view": "Household"}
     except Exception as e:
         print(f"Error fetching finance settings: {e}")
-        return {"share_budget_with_admin": True, "default_view": "Household"}
+        return {"share_budget_with_admin": False, "default_view": "Household"}
 
 def ensure_household_initialized(household_id):
     """Silent check to inject defaults if the household has no categories."""
@@ -607,6 +761,12 @@ def get_household_incomes(household_id, month_year, is_personal_income=False, us
                     row["take_home_amount"] = decrypt_float(row.get("take_home_amount"))
                 if row.get("gross_amount") is not None:
                     row["gross_amount"] = decrypt_float(row.get("gross_amount"))
+                row["pay_frequency"] = normalize_income_pay_frequency(
+                    row.get("pay_frequency")
+                    or ("monthly" if row.get("is_recurring") else "one_time")
+                )
+                if row.get("payment_date") and not isinstance(row.get("payment_date"), str):
+                    row["payment_date"] = row["payment_date"].isoformat()
                     
             return pd.DataFrame(response.data)
         return pd.DataFrame()
@@ -643,6 +803,15 @@ def get_monthly_expenses(household_id, month_year, include_private_members=True)
 
 def log_expense_and_check_project(auth_user_id, username, household_id, month_year, date_logged, category_id, amount, details, is_personal_spend=False, is_recurring=False):
     """Logs an expense, now tracking if it is a recurring monthly bill."""
+    if not is_personal_spend:
+        if not _can_edit_monthly_budget_server_side():
+            return False
+    elif (
+        str(auth_user_id) != str(st.session_state.get("auth_user_id"))
+        and not _is_budget_privileged()
+    ):
+        return False
+
     target_table = get_budget_table("expenses")
     try:
         payload = {
@@ -663,28 +832,69 @@ def log_expense_and_check_project(auth_user_id, username, household_id, month_ye
         print(f"Error logging expense: {e}")
         return False
 
-def get_shared_member_expenses(household_id, month_year):
-    """Fetches personal expenses ONLY for members who have opted to share with Admins."""
+def get_members_sharing_personal_budget(household_id, exclude_username=None):
+    """Usernames in this household who allow family admins to view their personal budget."""
+    settings_table = get_budget_table("user_finance_settings")
+    try:
+        response = (
+            supabase.table(settings_table)
+            .select("username")
+            .eq("household_id", household_id)
+            .eq("share_budget_with_admin", True)
+            .execute()
+        )
+        usernames = [row["username"] for row in (response.data or []) if row.get("username")]
+        if exclude_username:
+            usernames = [name for name in usernames if name != exclude_username]
+        return usernames
+    except Exception as e:
+        print(f"Error fetching sharing members: {e}")
+        return []
+
+
+def member_allows_personal_budget_sharing(household_id, username):
+    settings = get_user_finance_settings(household_id, username)
+    return bool(settings.get("share_budget_with_admin", False))
+
+
+def get_shared_member_expenses(household_id, month_year, username=None):
+    """Fetches personal expenses for members who opted to share with family admins."""
     expenses_table = get_budget_table("expenses")
     settings_table = get_budget_table("user_finance_settings")
-    
+
     try:
-        # 1. Look up which users have the privacy toggle set to 'Share'
-        settings_res = supabase.table(settings_table).select("username").eq("household_id", household_id).eq("share_budget_with_admin", True).execute()
-        sharing_users = [row["username"] for row in settings_res.data]
-        
+        settings_res = (
+            supabase.table(settings_table)
+            .select("username")
+            .eq("household_id", household_id)
+            .eq("share_budget_with_admin", True)
+            .execute()
+        )
+        sharing_users = [row["username"] for row in (settings_res.data or []) if row.get("username")]
+        if username:
+            if username not in sharing_users:
+                return pd.DataFrame()
+            sharing_users = [username]
+
         if not sharing_users:
-            return pd.DataFrame() # No one is sharing
-            
-        # 2. Fetch only the personal expenses belonging to those specific users
-        exp_res = supabase.table(expenses_table).select("*").eq("household_id", household_id).eq("month_year", month_year).eq("is_personal_spend", True).in_("username", sharing_users).execute()
-        
+            return pd.DataFrame()
+
+        exp_res = (
+            supabase.table(expenses_table)
+            .select("*")
+            .eq("household_id", household_id)
+            .eq("month_year", month_year)
+            .eq("is_personal_spend", True)
+            .in_("username", sharing_users)
+            .execute()
+        )
+
         if exp_res.data:
             for row in exp_res.data:
                 row["amount"] = decrypt_float(row.get("amount"))
                 row["details"] = decrypt_text(row.get("details"))
             return pd.DataFrame(exp_res.data)
-            
+
         return pd.DataFrame()
     except Exception as e:
         print(f"Error fetching shared expenses: {e}")
@@ -731,6 +941,12 @@ def calculate_spend_money(paycheck_amount, routing_df):
 
 def insert_budget_category(household_id, category_name, sub_category_name=None, is_personal=False, username=None, target_budget=0.0):
     """Inserts a category, now streamlined without 'Type'."""
+    if is_personal:
+        if not _is_budget_privileged() and username != st.session_state.get("username"):
+            return False
+    elif not _can_edit_monthly_budget_server_side():
+        return False
+
     target_table = get_budget_table("budget_categories")
     try:
         safe_target = float(target_budget) if target_budget not in [None, ""] else 0.0
@@ -749,13 +965,44 @@ def insert_budget_category(household_id, category_name, sub_category_name=None, 
         print(f"Error inserting category: {e}")
         return False
 
-def insert_household_income(household_id, month_year, source_name, take_home, gross, is_taxable, owner_username, is_windfall, is_recurring, is_personal_income=False):
+def insert_household_income(
+    household_id,
+    month_year,
+    source_name,
+    take_home,
+    gross,
+    is_taxable,
+    owner_username,
+    is_windfall,
+    pay_frequency=None,
+    is_personal_income=False,
+    payment_date=None,
+    *,
+    is_recurring=None,
+):
     """Inserts a new income stream, safely handling empty (None) values."""
+    if is_personal_income:
+        if not _is_budget_privileged() and owner_username != st.session_state.get("username"):
+            return False
+    elif not _is_budget_privileged():
+        return False
+
+    if pay_frequency:
+        freq = normalize_income_pay_frequency(pay_frequency)
+    elif is_recurring is not None:
+        freq = normalize_income_pay_frequency("monthly" if is_recurring else "one_time")
+    else:
+        freq = "monthly"
+
     target_table = get_budget_table("household_incomes")
     try:
         # 🟢 SAFETY NET: Convert None to 0.0 before trying to make it a float
         safe_take_home = float(take_home) if take_home not in [None, ""] else 0.0
         safe_gross = float(gross) if gross not in [None, ""] else 0.0
+        if payment_date is None:
+            payment_date = date.today()
+        elif isinstance(payment_date, str):
+            payment_date = datetime.strptime(payment_date, "%Y-%m-%d").date()
         
         payload = {
             "household_id": household_id,
@@ -766,8 +1013,10 @@ def insert_household_income(household_id, month_year, source_name, take_home, gr
             "is_taxable": is_taxable,
             "owner_username": owner_username,
             "is_windfall": is_windfall,
-            "is_recurring": is_recurring,
-            "is_personal_income": is_personal_income
+            "is_recurring": income_is_recurring_frequency(freq),
+            "pay_frequency": freq,
+            "is_personal_income": is_personal_income,
+            "payment_date": payment_date.isoformat(),
         }
         supabase.table(target_table).insert(payload).execute()
         return True
@@ -777,6 +1026,8 @@ def insert_household_income(household_id, month_year, source_name, take_home, gr
 
 def delete_budget_category(category_id):
     """Soft-deletes a category by setting is_active to False."""
+    if not _can_edit_category_server_side(category_id):
+        return False
     target_table = get_budget_table("budget_categories")
     try:
         # Instead of .delete(), we update the status to keep the record for history
@@ -788,12 +1039,61 @@ def delete_budget_category(category_id):
 
 def delete_household_income(income_id):
     """Deletes an income stream from the database."""
+    if not _can_edit_household_income_server_side(income_id):
+        return False
     target_table = get_budget_table("household_incomes")
     try:
         supabase.table(target_table).delete().eq("id", income_id).execute()
         return True
     except Exception as e:
         print(f"Error deleting income: {e}")
+        return False
+
+def update_household_income(
+    income_id,
+    source_name,
+    take_home,
+    gross,
+    is_taxable,
+    owner_username,
+    is_windfall,
+    pay_frequency=None,
+    payment_date=None,
+    *,
+    is_recurring=None,
+):
+    """Updates an existing income stream."""
+    if not _can_edit_household_income_server_side(income_id):
+        return False
+    if pay_frequency:
+        freq = normalize_income_pay_frequency(pay_frequency)
+    elif is_recurring is not None:
+        freq = normalize_income_pay_frequency("monthly" if is_recurring else "one_time")
+    else:
+        freq = "monthly"
+
+    target_table = get_budget_table("household_incomes")
+    try:
+        safe_take_home = float(take_home) if take_home not in [None, ""] else 0.0
+        safe_gross = float(gross) if gross not in [None, ""] else 0.0
+        payload = {
+            "source_name": encrypt_data(source_name),
+            "take_home_amount": encrypt_data(safe_take_home),
+            "gross_amount": encrypt_data(safe_gross),
+            "is_taxable": is_taxable,
+            "owner_username": owner_username,
+            "is_windfall": is_windfall,
+            "is_recurring": income_is_recurring_frequency(freq),
+            "pay_frequency": freq,
+        }
+        if payment_date is not None:
+            if isinstance(payment_date, str):
+                payment_date = datetime.strptime(payment_date, "%Y-%m-%d").date()
+            payload["payment_date"] = payment_date.isoformat()
+        supabase.table(target_table).update(payload).eq("id", income_id).execute()
+        return True
+    except Exception as e:
+        print(f"Error updating income: {e}")
         return False
 
 def get_individual_expenses(household_id, auth_user_id, month_year):
@@ -870,14 +1170,102 @@ def initialize_default_categories(household_id):
 # 💰 BUDGET FUNCTIONS (Projects / Guardrails / Wish List)
 # ==========================================
 
+def _is_budget_privileged():
+    role = st.session_state.get("user_role", "member")
+    return role in ["admin", "developer"]
+
+
+def _can_edit_monthly_budget_server_side():
+    return _is_budget_privileged()
+
+
 def _can_edit_projects_server_side():
     """Authoritative guard for project write operations."""
-    role = st.session_state.get("user_role", "member")
-    if role in ["admin", "developer"]:
+    if _is_budget_privileged():
         return True
-    if st.session_state.get("can_edit_projects") is not None:
-        return bool(st.session_state.get("can_edit_projects"))
-    return bool(st.session_state.get("can_view_budget", False))
+    return bool(st.session_state.get("can_edit_projects", False))
+
+
+def _fetch_expense_flags(expense_id):
+    target_table = get_budget_table("expenses")
+    try:
+        response = (
+            supabase.table(target_table)
+            .select("is_personal_spend, auth_user_id, household_id")
+            .eq("id", expense_id)
+            .limit(1)
+            .execute()
+        )
+        return response.data[0] if response.data else None
+    except Exception:
+        return None
+
+
+def _can_edit_expense_server_side(expense_id) -> bool:
+    record = _fetch_expense_flags(expense_id)
+    if not record:
+        return False
+    if record.get("household_id") != get_current_household_id():
+        return False
+    if record.get("is_personal_spend"):
+        if _is_budget_privileged():
+            return True
+        return str(record.get("auth_user_id")) == str(st.session_state.get("auth_user_id"))
+    return _can_edit_monthly_budget_server_side()
+
+
+def _fetch_category_flags(category_id):
+    target_table = get_budget_table("budget_categories")
+    try:
+        response = (
+            supabase.table(target_table)
+            .select("is_personal, username, household_id")
+            .eq("id", category_id)
+            .limit(1)
+            .execute()
+        )
+        return response.data[0] if response.data else None
+    except Exception:
+        return None
+
+
+def _can_edit_category_server_side(category_id, *, is_personal=None, username=None) -> bool:
+    record = _fetch_category_flags(category_id)
+    if not record:
+        return False
+    if record.get("household_id") != get_current_household_id():
+        return False
+    is_personal_cat = bool(record.get("is_personal"))
+    if is_personal_cat:
+        if _is_budget_privileged():
+            return True
+        owner = record.get("username")
+        return bool(owner) and owner == st.session_state.get("username")
+    return _can_edit_monthly_budget_server_side()
+
+
+def _can_edit_household_income_server_side(income_id) -> bool:
+    target_table = get_budget_table("household_incomes")
+    try:
+        response = (
+            supabase.table(target_table)
+            .select("is_personal_income, owner_username, household_id")
+            .eq("id", income_id)
+            .limit(1)
+            .execute()
+        )
+        if not response.data:
+            return False
+        record = response.data[0]
+        if record.get("household_id") != get_current_household_id():
+            return False
+        if record.get("is_personal_income"):
+            if _is_budget_privileged():
+                return True
+            return record.get("owner_username") == st.session_state.get("username")
+        return _is_budget_privileged()
+    except Exception:
+        return False
 
 def get_project_budgets():
     """
@@ -1267,7 +1655,11 @@ def get_current_user_permissions():
                         .select(
                             "role, can_view_budget, can_view_projects, can_edit_projects, "
                             "can_view_monthly_budget, can_edit_monthly_budget, "
-                            "can_view_wishlist_members, can_view_wishlist_admin"
+                            "can_view_wishlist_members, can_view_wishlist_admin, "
+                            "can_view_home_solar, can_edit_home_solar, "
+                            "can_view_home_security, can_edit_home_security, "
+                            "can_view_home_garage, can_edit_home_garage, "
+                            "can_view_home_logs, can_edit_home_logs"
                         )
                         .eq("auth_user_id", auth_user_id)
                         .eq("household_id", house_id)
@@ -1311,7 +1703,11 @@ def _fetch_household_users_cached(household_id):
                 "auth_user_id, username, role, can_view_budget, "
                 "can_view_projects, can_edit_projects, "
                 "can_view_monthly_budget, can_edit_monthly_budget, "
-                "can_view_wishlist_members, can_view_wishlist_admin"
+                "can_view_wishlist_members, can_view_wishlist_admin, "
+                "can_view_home_solar, can_edit_home_solar, "
+                "can_view_home_security, can_edit_home_security, "
+                "can_view_home_garage, can_edit_home_garage, "
+                "can_view_home_logs, can_edit_home_logs"
             )
             .eq("household_id", household_id)
             .execute()
@@ -1382,6 +1778,14 @@ def update_user_module_permissions(auth_user_id: str, updates: dict):
             "can_view_budget",
             "can_view_wishlist_members",
             "can_view_wishlist_admin",
+            "can_view_home_solar",
+            "can_edit_home_solar",
+            "can_view_home_security",
+            "can_edit_home_security",
+            "can_view_home_garage",
+            "can_edit_home_garage",
+            "can_view_home_logs",
+            "can_edit_home_logs",
         }
         payload = {k: bool(v) for k, v in (updates or {}).items() if k in allowed_keys}
         if not payload:
@@ -1398,6 +1802,18 @@ def update_user_module_permissions(auth_user_id: str, updates: dict):
         if payload.get("can_view_monthly_budget") is False:
             payload["can_edit_monthly_budget"] = False
 
+        home_mgmt_pairs = [
+            ("can_view_home_solar", "can_edit_home_solar"),
+            ("can_view_home_security", "can_edit_home_security"),
+            ("can_view_home_garage", "can_edit_home_garage"),
+            ("can_view_home_logs", "can_edit_home_logs"),
+        ]
+        for view_key, edit_key in home_mgmt_pairs:
+            if payload.get(edit_key) is True:
+                payload[view_key] = True
+            if payload.get(view_key) is False:
+                payload[edit_key] = False
+
         # Keep legacy rollup for backwards compatibility.
         if "can_view_projects" in payload or "can_view_monthly_budget" in payload:
             projects_view = payload.get("can_view_projects")
@@ -1406,15 +1822,34 @@ def update_user_module_permissions(auth_user_id: str, updates: dict):
                 payload["can_view_budget"] = bool(projects_view or monthly_view)
 
         house_id = get_current_household_id()
-        (
-            supabase
-            .table("users")
-            .update(payload)
-            .eq("auth_user_id", auth_user_id)
-            .eq("household_id", house_id)
-            .execute()
-        )
+        home_payload = {k: v for k, v in payload.items() if k in HOME_MGMT_PERMISSION_KEY_SET}
+        base_payload = {k: v for k, v in payload.items() if k not in HOME_MGMT_PERMISSION_KEY_SET}
+
+        if home_payload and not home_mgmt_permissions_available():
+            if not base_payload:
+                print(
+                    "Home Management permissions require migration 015. "
+                    "Apply migrations/015_add_home_management_permissions.sql in Supabase."
+                )
+                return False
+            print(
+                "Skipping Home Management permission updates until migration 015 is applied."
+            )
+            home_payload = {}
+
+        for update_payload in (base_payload, home_payload):
+            if not update_payload:
+                continue
+            (
+                supabase
+                .table("users")
+                .update(update_payload)
+                .eq("auth_user_id", auth_user_id)
+                .eq("household_id", house_id)
+                .execute()
+            )
         clear_household_users_cache()
+        clear_home_mgmt_permissions_cache()
         return True
     except Exception as e:
         print(f"Error updating module permissions: {e}")
@@ -1422,6 +1857,8 @@ def update_user_module_permissions(auth_user_id: str, updates: dict):
     
 def delete_expense(expense_id):
     """Safely removes an expense from the ledger."""
+    if not _can_edit_expense_server_side(expense_id):
+        return False
     target_table = get_budget_table("expenses")
     try:
         supabase.table(target_table).delete().eq("id", expense_id).execute()
@@ -1432,6 +1869,8 @@ def delete_expense(expense_id):
 
 def update_expense(expense_id, amount, details, is_recurring, date_logged=None):
     """Updates an existing expense amount, details, recurring status, and optionally the date logged."""
+    if not _can_edit_expense_server_side(expense_id):
+        return False
     target_table = get_budget_table("expenses")
     try:
         payload = {
@@ -1448,6 +1887,8 @@ def update_expense(expense_id, amount, details, is_recurring, date_logged=None):
     
 def update_budget_category(category_id, category_name, sub_category_name, target_budget):
     """Updates an existing category's names and target budget."""
+    if not _can_edit_category_server_side(category_id):
+        return False
     target_table = get_budget_table("budget_categories")
     try:
         safe_target = float(target_budget) if target_budget not in [None, ""] else 0.0
@@ -1539,6 +1980,96 @@ def auto_rollover_recurring_expenses(household_id, selected_month):
         return injected_any
     except Exception as e:
         print(f"Error rolling over expenses: {e}")
+        return False
+
+
+def auto_rollover_recurring_incomes(household_id, selected_month):
+    """Rolls recurring income streams into a new month once their payment day arrives."""
+    target_table = get_budget_table("household_incomes")
+
+    year, month = map(int, selected_month.split("-"))
+    if month == 1:
+        prev_year = year - 1
+        prev_month = 12
+    else:
+        prev_year = year
+        prev_month = month - 1
+    prev_month_str = f"{prev_year}-{prev_month:02d}"
+
+    try:
+        prev_res = (
+            supabase.table(target_table)
+            .select("*")
+            .eq("household_id", household_id)
+            .eq("month_year", prev_month_str)
+            .eq("is_recurring", True)
+            .execute()
+        )
+        if not prev_res.data:
+            return False
+
+        curr_res = (
+            supabase.table(target_table)
+            .select("id, source_name, owner_username, is_personal_income")
+            .eq("household_id", household_id)
+            .eq("month_year", selected_month)
+            .eq("is_recurring", True)
+            .execute()
+        )
+
+        existing_signatures = []
+        if curr_res.data:
+            for row in curr_res.data:
+                source = decrypt_text(row.get("source_name")) if row.get("source_name") else ""
+                existing_signatures.append(
+                    f"{source}_{row.get('owner_username')}_{row.get('is_personal_income')}"
+                )
+
+        injected_any = False
+        today = datetime.now().date()
+
+        for row in prev_res.data:
+            source = decrypt_text(row.get("source_name")) if row.get("source_name") else ""
+            owner = row.get("owner_username")
+            is_personal = row.get("is_personal_income", False)
+            signature = f"{source}_{owner}_{is_personal}"
+            if signature in existing_signatures:
+                continue
+
+            prev_date_str = row.get("payment_date")
+            if prev_date_str:
+                prev_date = datetime.strptime(str(prev_date_str)[:10], "%Y-%m-%d").date()
+                target_day = prev_date.day
+            else:
+                target_day = 1
+
+            _, last_day_of_new_month = calendar.monthrange(year, month)
+            new_day = min(target_day, last_day_of_new_month)
+            new_payment_date = date(year, month, new_day)
+
+            if new_payment_date > today:
+                continue
+
+            payload = {
+                "household_id": household_id,
+                "month_year": selected_month,
+                "source_name": row.get("source_name"),
+                "take_home_amount": row.get("take_home_amount"),
+                "gross_amount": row.get("gross_amount"),
+                "is_taxable": row.get("is_taxable", True),
+                "owner_username": owner,
+                "is_windfall": row.get("is_windfall", False),
+                "is_recurring": True,
+                "pay_frequency": row.get("pay_frequency") or "monthly",
+                "is_personal_income": is_personal,
+                "payment_date": new_payment_date.isoformat(),
+            }
+            supabase.table(target_table).insert(payload).execute()
+            injected_any = True
+
+        return injected_any
+    except Exception as e:
+        print(f"Error rolling over incomes: {e}")
         return False
 
 def get_recurring_schedule(household_id, month_year, is_personal=False):

@@ -9,8 +9,13 @@ try:
 except Exception:
     streamlit_js_eval = None
 from auth import check_password
-from home_assist_api import fetch_ha_state
-from admin_module import render_admin_sidebar_panel
+from home_management_module import render_home_management_module, is_home_management_drilldown_active, can_access_home_management
+from admin_module import (
+    close_module_access_page,
+    is_module_access_page_active,
+    render_admin_module_access_page,
+    render_admin_sidebar_entry,
+)
 from budget_module import render_budget_module
 from database import get_all_backlog_items, get_current_app_version, add_backlog_item, update_backlog_item, delete_backlog_item, cut_release, get_current_user_permissions
 from todo_module import render_todo_view
@@ -64,6 +69,7 @@ def render_rerun_debug_panel() -> None:
 
 def mark_top_nav_change() -> None:
     st.session_state.pop("main_dashboard_lock", None)
+    close_module_access_page()
     queue_rerun_reason("top_nav")
 
 
@@ -117,6 +123,8 @@ def render_main_dashboard_selector(options: list[str]) -> None:
 def is_dashboard_drilldown_active(selected_dashboard: str) -> bool:
     if selected_dashboard == "🏠 Household Hub":
         return st.session_state.get("active_hub_view", "main_menu") != "main_menu"
+    if selected_dashboard == "🏡 Home Management":
+        return is_home_management_drilldown_active()
     if selected_dashboard == "🛠️ Developer Dashboard":
         return st.session_state.get("developer_dashboard_view", "menu") != "menu"
     return False
@@ -250,11 +258,19 @@ def refresh_permissions_from_db() -> bool:
     st.session_state["can_view_budget"] = bool(latest.get("can_view_budget", False))
     legacy_budget_view = bool(latest.get("can_view_budget", False))
     st.session_state["can_view_projects"] = bool(latest.get("can_view_projects", legacy_budget_view))
-    st.session_state["can_edit_projects"] = bool(latest.get("can_edit_projects", legacy_budget_view))
+    st.session_state["can_edit_projects"] = bool(latest.get("can_edit_projects", False))
     st.session_state["can_view_monthly_budget"] = bool(latest.get("can_view_monthly_budget", legacy_budget_view))
     st.session_state["can_edit_monthly_budget"] = bool(latest.get("can_edit_monthly_budget", False))
     st.session_state["can_view_wishlist_members"] = bool(latest.get("can_view_wishlist_members", True))
     st.session_state["can_view_wishlist_admin"] = bool(latest.get("can_view_wishlist_admin", False))
+    st.session_state["can_view_home_solar"] = bool(latest.get("can_view_home_solar", False))
+    st.session_state["can_edit_home_solar"] = bool(latest.get("can_edit_home_solar", False))
+    st.session_state["can_view_home_security"] = bool(latest.get("can_view_home_security", False))
+    st.session_state["can_edit_home_security"] = bool(latest.get("can_edit_home_security", False))
+    st.session_state["can_view_home_garage"] = bool(latest.get("can_view_home_garage", False))
+    st.session_state["can_edit_home_garage"] = bool(latest.get("can_edit_home_garage", False))
+    st.session_state["can_view_home_logs"] = bool(latest.get("can_view_home_logs", False))
+    st.session_state["can_edit_home_logs"] = bool(latest.get("can_edit_home_logs", False))
     st.session_state["permissions_refreshed_at"] = central_now().strftime("%I:%M:%S %p")
     return True
 
@@ -309,7 +325,7 @@ with st.sidebar:
     # ==========================================
     # ⚙️ ADMIN PANEL (Called from our new module!)
     # ==========================================
-    render_admin_sidebar_panel()
+    render_admin_sidebar_entry()
 
 # ==========================================
 # ⚙️ SIDEBAR UTILITY FOOTER 
@@ -380,28 +396,20 @@ render_rerun_debug_panel()
 # 🏷️ APPLICATION TAG
 st.sidebar.caption(f"<div style='text-align: center; color: gray; padding-top: 10px;'>Home Sync Hub v{APP_VERSION}</div>", unsafe_allow_html=True)
 
+def build_dashboard_sections(current_user_role: str) -> list:
+    sections = ["🏠 Household Hub"]
+    if can_access_home_management():
+        sections.append("🏡 Home Management")
+    sections.append("🆕 What's New")
+    if current_user_role == "developer":
+        sections.append("🛠️ Developer Dashboard")
+    return sections
+
+
 # ==========================================
 # 📋 MAIN DASHBOARD TABS
 # ==========================================
-if user_role == "developer":
-    dashboard_sections = [
-        "🏠 Household Hub",
-        "☀️ Solar Production",
-        "🛡️ Security",
-        "🚗 Garage",        
-        "⚙️ System Logs",
-        "🆕 What's New",
-        "🛠️ Developer Dashboard"
-    ]
-else:
-    dashboard_sections = [
-        "🏠 Household Hub",
-        "☀️ Solar Production",
-        "🛡️ Security",
-        "🚗 Garage",        
-        "⚙️ System Logs",
-        "🆕 What's New"
-    ]
+dashboard_sections = build_dashboard_sections(user_role)
 
 pending_main_dashboard_view = st.session_state.pop("pending_main_dashboard_view", None)
 locked_main_dashboard_view = st.session_state.get("main_dashboard_lock")
@@ -420,8 +428,9 @@ if st.session_state.get("main_dashboard_view") not in dashboard_sections:
     st.session_state["main_dashboard_view"] = dashboard_sections[0]
 
 active_hub_view = st.session_state.get("active_hub_view", "main_menu")
+module_access_active = is_module_access_page_active()
 current_main_view = st.session_state.get("main_dashboard_view", dashboard_sections[0])
-hide_main_dashboard_selector = is_dashboard_drilldown_active(current_main_view)
+hide_main_dashboard_selector = module_access_active or is_dashboard_drilldown_active(current_main_view)
 
 if hide_main_dashboard_selector:
     selected_dashboard_view = st.session_state.get("main_dashboard_view", dashboard_sections[0])
@@ -429,12 +438,14 @@ else:
     render_main_dashboard_selector(dashboard_sections)
     selected_dashboard_view = st.session_state.get("main_dashboard_view", dashboard_sections[0])
 
-show_app_header = not is_dashboard_drilldown_active(selected_dashboard_view)
+show_app_header = not module_access_active and not is_dashboard_drilldown_active(selected_dashboard_view)
 
 if show_app_header:
     st.title("🏠 Home Sync Dashboard")
 
-if selected_dashboard_view == "🏠 Household Hub":
+if module_access_active:
+    render_admin_module_access_page()
+elif selected_dashboard_view == "🏠 Household Hub":
     # 1. Initialize the session state for this tab
     if "active_hub_view" not in st.session_state:
         st.session_state["active_hub_view"] = "main_menu"
@@ -511,112 +522,16 @@ if selected_dashboard_view == "🏠 Household Hub":
             st.subheader("📅 Family Calendar")
             st.info("Upcoming events will render here...")
 
-if selected_dashboard_view == "☀️ Solar Production":
-    if st.button("🔄 Refresh Telemetry", type="primary", width='stretch'):
-        queue_rerun_reason("telemetry_refresh")
+elif selected_dashboard_view == "🏡 Home Management":
+    if can_access_home_management():
+        render_home_management_module()
+    else:
+        st.warning("Home Management access is restricted for your account.")
+        if st.button("Return to Household Hub", key="home_mgmt_access_denied"):
+            st.session_state["main_dashboard_view"] = "🏠 Household Hub"
+            rerun_with_reason("home_mgmt_access_denied")
 
-    st.subheader("☀️ Live Energy Flow")
-    
-    # 1. Fetch fresh data by calling the function directly
-    solar_data = fetch_ha_state("sensor.solaredge_current_power")
-    net_data = fetch_ha_state("sensor.solaredge_meter_power")
-    inv1_data = fetch_ha_state("sensor.solaredge_inverter_1")
-    inv2_data = fetch_ha_state("sensor.solaredge_inverter_2")
-                        
-    # 2. Extract and Calculate
-    try:
-        cur_solar_w = float(solar_data.get("state", 0))
-        net_w = float(net_data.get("state", 0))
-        inv1_w = float(inv1_data.get("state", 0))
-        inv2_w = float(inv2_data.get("state", 0))
-    except ValueError:
-        cur_solar_w, net_w, inv1_w, inv2_w = 0.0, 0.0, 0.0, 0.0
-        
-    home_cons_w = cur_solar_w + net_w
-    
-    # 3. Aggregates UI (Top Level)
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Panels Generating", f"{(cur_solar_w/1000):.2f} kW", 
-                "Producing" if cur_solar_w > 0 else "Offline")
-    col2.metric("Home Consuming", f"{((home_cons_w)/1000):.2f} kW", "Load", delta_color="off")
-    col3.metric("Grid Status", f"{abs(net_w/1000):.2f} kW", 
-                "Exporting" if net_w < 0 else "Importing", 
-                delta_color="inverse" if net_w < 0 else "normal")
-    
-    st.divider()
-    
-    # 4. Inverter Breakdown
-    st.markdown("#### 🔌 Inverter Performance")
-    inv_col1, inv_col2 = st.columns(2)
-    inv_col1.metric("Inverter 1", f"{(inv1_w/1000):.2f} kW", 
-                    "Active" if inv1_w > 0 else "Offline")
-    inv_col2.metric("Inverter 2", f"{(inv2_w/1000):.2f} kW", 
-                    "Active" if inv2_w > 0 else "Offline")
-    
-    st.write("")
-    
-    # 5. The 67 Panel Heatmap
-    with st.expander("🔍 View Individual Panel Optimizers (67)"):
-        # Pass the nonce here as well!
-        panel_data = fetch_ha_state("sensor.solaredge_panel_array")
-        panels = panel_data.get("attributes", {}).get("panels", {})
-        
-        if panels:
-            df = pd.DataFrame(list(panels.items()), columns=["Panel ID", "Power (W)"])
-            df.set_index("Panel ID", inplace=True)
-            try:
-                st.dataframe(
-                    df.style.background_gradient(cmap="Greens", vmin=50, vmax=350),
-                    width='stretch'
-                )
-            except ImportError:
-                st.dataframe(df, width='stretch')
-                st.caption("Install matplotlib to enable heatmap styling for panel power.")
-        else:
-            st.warning("Panel data currently unavailable.")
-    
-if selected_dashboard_view == "🛡️ Security":
-    st.subheader("Security Overview")
-    st.write("Camera and sensor feeds will render here...")
-
-if selected_dashboard_view == "🚗 Garage":
-    st.subheader("🚗 Garage Access")
-    
-    # 1. Establish the "Fake" Garage State in memory
-    # (When you get HA hardware, we will replace this with fetch_ha_state)
-    if "mock_garage_state" not in st.session_state:
-        st.session_state["mock_garage_state"] = "closed"
-        
-    current_state = st.session_state["mock_garage_state"]
-
-    # 2. Dynamic UI rendering based on the state
-    with st.container(border=True):
-        if current_state == "closed":
-            st.markdown("### 🟢 Status: **CLOSED**")
-            st.caption("The garage is secured.")
-            action_text = "📤 OPEN Garage Door"
-            btn_type = "secondary"
-        else:
-            st.markdown("### 🔴 Status: **OPEN**")
-            st.caption("Warning: The garage is exposed.")
-            action_text = "📥 CLOSE Garage Door"
-            btn_type = "primary" # Highlights the button in red/accent color when open
-        
-        st.write("") # Spacer
-        
-        # 3. The Action Button
-        if st.button(action_text, type=btn_type, width='stretch'):
-            if current_state == "closed":
-                st.session_state["mock_garage_state"] = "open"
-            else:
-                st.session_state["mock_garage_state"] = "closed"
-            rerun_with_reason("garage_toggle")
-
-if selected_dashboard_view == "⚙️ System Logs":
-    st.subheader("Event History")
-    st.write("Supabase database logs will render here...")
-
-if selected_dashboard_view == "🆕 What's New":
+elif selected_dashboard_view == "🆕 What's New":
     st.subheader("🆕 What's New")
     st.caption("Release notes for Home Sync and Global items only.")
 
@@ -822,7 +737,7 @@ if selected_dashboard_view == "🆕 What's New":
     except Exception as e:
         st.error(f"Could not load the changelog: {e}")
 
-if user_role == "developer" and selected_dashboard_view == "🛠️ Developer Dashboard":
+elif user_role == "developer" and selected_dashboard_view == "🛠️ Developer Dashboard":
         if "developer_dashboard_view" not in st.session_state:
             st.session_state["developer_dashboard_view"] = "menu"
         if "backlog_flash" not in st.session_state:
