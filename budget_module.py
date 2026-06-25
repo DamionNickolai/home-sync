@@ -2,8 +2,9 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import calendar
 from zoneinfo import ZoneInfo
-from datetime import datetime
+from datetime import datetime, date
 
 from database import (
     get_project_budgets,
@@ -37,7 +38,8 @@ from database import (
     delete_expense,
     update_expense,
     update_budget_category,
-    auto_rollover_recurring_expenses
+    auto_rollover_recurring_expenses,
+    get_recurring_schedule
 )
 
 def _to_number(value, default=0.0):
@@ -741,51 +743,69 @@ def render_budget_module(show_back_to_hub=False):
             col4.metric("Annual Taxable Pace", f"${(taxable_income * 12):,.2f}")
             st.divider()
             
+            # 🟢 Cleaned: Household Shared Ledger removed entirely. Breakdown only.
             st.markdown("#### Household Budget Breakdown")
             
-            # 1. Fetch categories (Projected Costs)
             categories_df = get_budget_categories(household_id, is_personal=False)
             
             if categories_df.empty:
                 st.info("No categories setup yet. Add some to build your ledger!")
             else:
-                # 2. Sum actual expenses by Category ID
                 if not hh_expenses_df.empty:
                     exp_summary = hh_expenses_df.groupby("category_id")["amount"].sum().reset_index()
                 else:
                     exp_summary = pd.DataFrame(columns=["category_id", "amount"])
                 
-                # 3. Merge Projected vs Actual
                 merged_df = pd.merge(categories_df, exp_summary, left_on="id", right_on="category_id", how="left")
                 merged_df["actual_amount"] = merged_df["amount"].fillna(0.0)
                 
-                # 4. Build the Hierarchical Matrix
+                # 🟢 Get the recurring schedule from the PREVIOUS month
+                year, month = map(int, selected_month.split('-'))
+                prev_month = month - 1 if month > 1 else 12
+                prev_year = year if month > 1 else year - 1
+                prev_month_str = f"{prev_year}-{prev_month:02d}"
+                recurring_schedule = get_recurring_schedule(household_id, prev_month_str)
+
                 display_rows = []
                 for parent in merged_df["category_name"].unique():
                     parent_mask = merged_df["category_name"] == parent
                     parent_target = merged_df.loc[parent_mask, "target_budget"].sum()
                     parent_actual = merged_df.loc[parent_mask, "actual_amount"].sum()
-                    diff = parent_target - parent_actual
                     
-                    # 🟢 Visual Status: Green for under budget, Red for over budget
-                    if diff > 0:
-                        diff_str = f"🟢 +${diff:,.2f}"
-                    elif diff < 0:
-                        diff_str = f"🔴 -${abs(diff):,.2f}"
-                    else:
-                        diff_str = "➖ $0.00"
+                    if parent_target == 0 and parent_actual == 0:
+                        continue
                         
-                    # Add Parent Row (Bolded, with totals)
-                    display_rows.append({
-                        "Category": f"📂 {parent}",
-                        "Projected": parent_target,
-                        "Actual": parent_actual,
-                        "Difference": diff_str
-                    })
+                    diff = parent_target - parent_actual
+                    diff_str = f"🟢 +${diff:,.2f}" if diff > 0 else (f"🔴 -${abs(diff):,.2f}" if diff < 0 else "➖ $0.00")
+                        
+                    display_rows.append({"Category": f"📂 {parent}", "Projected": parent_target, "Actual": parent_actual, "Difference": diff_str})
                     
-                    # Add Sub-category Rows (Indented, no difference calculated)
+                    # Add Sub-category Rows
                     for _, row in merged_df[parent_mask].iterrows():
+                        if row["target_budget"] == 0 and row["actual_amount"] == 0:
+                            continue
+                            
                         sub_name = row["sub_category_name"] if pd.notnull(row["sub_category_name"]) and str(row["sub_category_name"]).strip() != "" else "(General)"
+                        
+                        # 🟢 LOGIC: 
+                        # 1. Check if already logged (Actual exists)
+                        recurring_item_logged = hh_expenses_df[
+                            (hh_expenses_df["category_id"] == row["id"]) & 
+                            (hh_expenses_df["is_recurring"] == True)
+                        ]
+                        
+                        # 2. If already logged, DO NOTHING (No date appended)
+                        if not recurring_item_logged.empty:
+                            pass 
+                        
+                        # 3. Only if NOT logged, check the upcoming schedule
+                        elif row["id"] in recurring_schedule:
+                            target_day = recurring_schedule[row["id"]]
+                            _, last_day = calendar.monthrange(year, month)
+                            safe_day = min(target_day, last_day)
+                            scheduled_date = date(year, month, safe_day).strftime("%B %d")
+                            sub_name = f"{sub_name} {scheduled_date}"
+
                         display_rows.append({
                             "Category": f"      ↳ {sub_name}",
                             "Projected": row["target_budget"],
@@ -793,18 +813,11 @@ def render_budget_module(show_back_to_hub=False):
                             "Difference": "" 
                         })
                 
-                final_df = pd.DataFrame(display_rows)
-                
-                # 5. Render the styled table
-                st.dataframe(
-                    final_df, 
-                    hide_index=True, 
-                    width='stretch',
-                    column_config={
-                        "Projected": st.column_config.NumberColumn(format="$%.2f"),
-                        "Actual": st.column_config.NumberColumn(format="$%.2f")
-                    }
-                )
+                if display_rows:
+                    st.dataframe(pd.DataFrame(display_rows), hide_index=True, width='stretch',
+                                 column_config={"Projected": st.column_config.NumberColumn(format="$%.2f"), "Actual": st.column_config.NumberColumn(format="$%.2f")})
+                else:
+                    st.info("No active budget targets or expenses for this month.")
 
             st.divider()
             
@@ -813,14 +826,6 @@ def render_budget_module(show_back_to_hub=False):
                 st.markdown("##### Year-to-Date Performance")
                 st.caption("YTD aggregations and charting logic will go here.")
                 # We will write the complex SQL lookbacks for this next!
-            
-            st.markdown("#### Household Shared Ledger")
-            if not hh_expenses_df.empty:
-                display_exp = hh_expenses_df[["date_logged", "amount", "details"]].copy()
-                display_exp.columns = ["Date", "Amount", "Details"]
-                st.dataframe(display_exp, hide_index=True)
-            else:
-                st.info("No shared household expenses logged for this month yet.")
                 
         # --- TAB 2: LOG EXPENSE (HOUSEHOLD) ---
         elif household_view_mode == "💳 Expenses":
@@ -866,46 +871,42 @@ def render_budget_module(show_back_to_hub=False):
                                 st.error("Failed to log expense.")
             
             st.divider()
+            st.markdown("##### 📝 Recent Expenses")
             
-            # 🟢 NEW: Manage Logged Expenses (Edit/Delete)
-            with st.expander("✏️ Edit or Delete Recent Expenses"):
-                if hh_expenses_df.empty:
-                    st.caption("No expenses logged for this month yet.")
-                else:
-                    # Format a list of expenses for the user to pick from
-                    expense_options = hh_expenses_df.apply(
-                        lambda row: f"{row['date_logged']} - {row['details']} (${row['amount']:.2f})", axis=1
-                    ).tolist()
+            if hh_expenses_df.empty:
+                st.caption("No expenses logged for this month yet.")
+            else:
+                for _, row in hh_expenses_df.iterrows():
+                    exp_id = row["id"]
                     
-                    selected_expense_str = st.selectbox("Select Expense to Manage", expense_options, key="hh_edit_exp_select")
+                    # 🟢 OVERLAY: Using Popover for the Edit Form
+                    c1, c2, c3 = st.columns([5, 1, 1])
+                    c1.caption(f"**{row['date_logged']}** | {row['details']} - **${row['amount']:.2f}**")
                     
-                    # Extract the ID of the chosen expense
-                    selected_idx = expense_options.index(selected_expense_str)
-                    target_exp_row = hh_expenses_df.iloc[selected_idx]
-                    target_exp_id = target_exp_row["id"]
-                    
-                    st.markdown("**Update Details**")
-                    with st.form("edit_expense_form", clear_on_submit=True):
-                        e_col1, e_col2 = st.columns(2)
-                        new_amt = e_col1.text_input("Amount ($)", value=str(target_exp_row["amount"]))
-                        new_det = e_col2.text_input("Details", value=target_exp_row["details"])
-                        new_recur = st.checkbox("🔄 Is Recurring?", value=target_exp_row.get("is_recurring", False))
-                        
-                        u1, u2 = st.columns(2)
-                        if u1.form_submit_button("💾 Update Expense", type="primary", width="stretch"):
-                            parsed_amt = _parse_currency_input(new_amt)
-                            if parsed_amt != "invalid" and new_det.strip():
-                                if update_expense(target_exp_id, parsed_amt, new_det, new_recur):
-                                    st.success("Expense updated successfully!")
-                                    st.rerun()
-                            else:
-                                st.error("Valid amount and details required.")
-                                
-                        if u2.form_submit_button("🗑️ Delete Expense", type="secondary", width="stretch"):
-                            if delete_expense(target_exp_id):
-                                st.error("Expense deleted.")
-                                st.rerun()
+                    with c2.popover("✏️ Edit"):
+                        st.markdown(f"**Edit: {row['details']}**")
+                        with st.form(f"edit_form_{exp_id}"):
+                            new_date = st.date_input("Date", value=datetime.strptime(row['date_logged'], "%Y-%m-%d"))
+                            new_amt = st.text_input("Amount ($)", value=str(row["amount"]))
+                            new_det = st.text_input("Details", value=row["details"])
+                            new_recur = st.checkbox("🔄 Is Recurring?", value=row.get("is_recurring", False))
+                            
+                            if st.form_submit_button("💾 Update"):
+                                parsed_amt = _parse_currency_input(new_amt)
+                                if parsed_amt != "invalid" and new_det.strip():
+                                    # Note: You may need a small helper to update the date if your update_expense doesn't take it!
+                                    if update_expense(exp_id, parsed_amt, new_det, new_recur): 
+                                        st.success("Updated!")
+                                        st.rerun()
+                                else:
+                                    st.error("Invalid input.")
 
+                    if c3.button("❌", key=f"del_btn_hh_{exp_id}"):
+                        if delete_expense(exp_id):
+                            st.rerun()
+            
+            st.divider()
+            
             # 🟢 STREAMLINED SETTINGS: Manage Expense Categories
             with st.expander("⚙️ Manage Expense Categories"):
                 
@@ -1166,15 +1167,42 @@ def render_budget_module(show_back_to_hub=False):
                         "Difference": diff_str
                     })
                     
-                    # Add Sub-category Rows
-                    for _, row in merged_df[parent_mask].iterrows():
-                        sub_name = row["sub_category_name"] if pd.notnull(row["sub_category_name"]) and str(row["sub_category_name"]).strip() != "" else "(General)"
-                        display_rows.append({
-                            "Category": f"      ↳ {sub_name}",
-                            "Projected": row["target_budget"],
-                            "Actual": row["actual_amount"],
-                            "Difference": "" 
-                        })
+                    # 🟢 1. Grab the personal recurring schedule
+            year, month = map(int, selected_month.split('-')) # Assumes selected_month is in scope
+            prev_month = month - 1 if month > 1 else 12
+            prev_year = year if month > 1 else year - 1
+            prev_month_str = f"{prev_year}-{prev_month:02d}"
+            
+            # Use is_personal=True here!
+            recurring_schedule = get_recurring_schedule(household_id, prev_month_str, is_personal=True)
+
+            # 🟢 2. Build Sub-category Rows
+            for _, row in merged_df[parent_mask].iterrows():
+                if row["target_budget"] == 0 and row["actual_amount"] == 0:
+                    continue
+                    
+                sub_name = row["sub_category_name"] if pd.notnull(row["sub_category_name"]) and str(row["sub_category_name"]).strip() != "" else "(General)"
+                
+                # 🟢 PERSONAL LOGIC: 
+                recurring_item_logged = my_personal_df[
+                    (my_personal_df["category_id"] == row["id"]) & 
+                    (my_personal_df["is_recurring"] == True)
+                ]
+                
+                # Only show date if NOT logged yet
+                if recurring_item_logged.empty and row["id"] in recurring_schedule:
+                    target_day = recurring_schedule[row["id"]]
+                    _, last_day = calendar.monthrange(year, month)
+                    safe_day = min(target_day, last_day)
+                    scheduled_date = date(year, month, safe_day).strftime("%B %d")
+                    sub_name = f"{sub_name} {scheduled_date}"
+
+                display_rows.append({
+                    "Category": f"      ↳ {sub_name}",
+                    "Projected": row["target_budget"],
+                    "Actual": row["actual_amount"],
+                    "Difference": "" 
+                })
                 
                 final_df = pd.DataFrame(display_rows)
                 

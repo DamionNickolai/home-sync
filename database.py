@@ -4,7 +4,6 @@ import pandas as pd
 from security import encrypt_data, decrypt_text, decrypt_float
 import calendar
 from datetime import datetime, date
-from datetime import datetime
 from zoneinfo import ZoneInfo
 from utils import calculate_next_version
 from constants import DEFAULT_BUDGET_CATEGORIES
@@ -1382,14 +1381,15 @@ def delete_expense(expense_id):
         print(f"Error deleting expense: {e}")
         return False
 
-def update_expense(expense_id, amount, details, is_recurring):
-    """Updates an existing expense amount, details, or recurring status."""
+def update_expense(expense_id, amount, details, is_recurring, date_logged=None):
+    """Updates an existing expense amount, details, recurring status, and optionally the date logged."""
     target_table = get_budget_table("expenses")
     try:
         payload = {
             "amount": encrypt_data(float(amount)),
             "details": encrypt_data(details),
-            "is_recurring": is_recurring
+            "is_recurring": is_recurring,
+            "date_logged": date_logged.strftime("%Y-%m-%d") if date_logged else None
         }
         supabase.table(target_table).update(payload).eq("id", expense_id).execute()
         return True
@@ -1491,3 +1491,26 @@ def auto_rollover_recurring_expenses(household_id, selected_month):
     except Exception as e:
         print(f"Error rolling over expenses: {e}")
         return False
+
+def get_recurring_schedule(household_id, month_year, is_personal=False):
+    """Fetches recurring expenses to determine upcoming dates, filtered by scope."""
+    target_table = get_budget_table("expenses")
+    try:
+        res = supabase.table(target_table).select("category_id, date_logged") \
+            .eq("household_id", household_id) \
+            .eq("month_year", month_year) \
+            .eq("is_recurring", True) \
+            .eq("is_personal_spend", is_personal).execute()
+        
+        schedule = {}
+        for row in res.data:
+            cat_id = row.get("category_id")
+            date_str = row.get("date_logged")
+            # Only add to schedule if it's a valid date string
+            if date_str:
+                day = datetime.strptime(date_str, "%Y-%m-%d").day
+                schedule[cat_id] = day
+        return schedule
+    except Exception as e:
+        print(f"Error fetching recurring schedule: {e}")
+        return {}
