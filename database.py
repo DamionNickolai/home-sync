@@ -1711,7 +1711,7 @@ def ensure_allowance_categories(household_id):
         return False
 
 
-def add_project_purchase_expense(project_id, purchase_date, amount):
+def add_project_purchase_expense(project_id, purchase_date, amount, product_or_service=None):
     """
     Adds a dated purchase to a project (actual_cost + audit note) and logs a matching
     household budget expense under the Projects category.
@@ -1745,7 +1745,10 @@ def add_project_purchase_expense(project_id, purchase_date, amount):
         cleaned_notes = existing_notes.replace("[COMPLETED]", "").strip() if existing_notes else ""
         if isinstance(purchase_date, str):
             purchase_date = datetime.strptime(purchase_date[:10], "%Y-%m-%d").date()
+        product_label = str(product_or_service or "").strip()
         audit_line = f"[{purchase_date.isoformat()}] Expense logged: ${safe_amount:,.2f}"
+        if product_label:
+            audit_line = f"{audit_line} — {product_label}"
         new_notes = f"{cleaned_notes}\n{audit_line}".strip() if cleaned_notes else audit_line
 
         update_payload = {
@@ -1761,7 +1764,10 @@ def add_project_purchase_expense(project_id, purchase_date, amount):
             return True
 
         month_year = purchase_date.strftime("%Y-%m")
-        details = f"{project_name} — project purchase"
+        if product_label:
+            details = f"{project_name} — {product_label}"
+        else:
+            details = f"{project_name} — project purchase"
         expenses_table = get_budget_table("expenses")
         expense_payload = {
             "household_id": house_id,

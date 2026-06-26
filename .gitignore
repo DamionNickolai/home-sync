@@ -1,8 +1,11 @@
-# Streamlit Secrets (NEVER PUSH THIS)
+# Streamlit Secrets (NEVER PUSH REAL VALUES)
 .streamlit/secrets.toml
 .streamlit/secrets.*
+!.streamlit/secrets.toml.example
 secrets.toml
 secrets.*
+!secrets.toml.example
+*.secrets.toml
 
 .env
 .env.*
@@ -16,7 +19,6 @@ secrets.*
 *.pfx
 *.crt
 .envrc
-*.secrets.toml
 
 # Python Virtual Environments
 .venv/

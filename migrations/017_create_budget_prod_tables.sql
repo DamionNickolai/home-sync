@@ -5,7 +5,7 @@
 -- app_config.environment != "local".
 --
 -- Run this BEFORE migrations/016_add_income_pay_frequency.sql
--- (016 adds pay_frequency to household_incomes).
+-- (016 adds pay_frequency to household_incomes; run 017 first, then 016).
 -- ==========================================
 
 -- ------------------------------------------

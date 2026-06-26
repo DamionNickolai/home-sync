@@ -16,14 +16,19 @@ python -m venv venv
 CREATE LOCAL .ENV FROM TEMPLATE:
 Copy-Item maintenance/.env.example .env
 
+CREATE STREAMLIT SECRETS FROM TEMPLATE:
+Copy-Item .streamlit/secrets.toml.example .streamlit/secrets.toml
+
+SECRETS HYGIENE (never commit real values):
+- .env and .streamlit/secrets.toml are gitignored
+- Use *.example files as templates only
+- Rotate DB password if it appeared in terminal history or chat
+
 BACKFILL AUTH IDS:
 Run locally after setting SUPABASE_URL and SUPABASE_SERVICE_KEY:
 python maintenance/backfill_auth_user_ids.py
 python maintenance/backfill_auth_user_ids.py --apply
 
-VALIDATE LOCAL MATCHES CLOUD:
-git fetch origin dev
-git status
 VALIDATE ALL CLOUD:
 git fetch --all
 git branch -vv
@@ -46,15 +51,28 @@ git add auth.py
 git commit --amend --no-edit
 git push --force origin dev
 
-AUTO PUSH FROM LOCAL TO CLOUD:
-python push_to_dev.py
-python push_to_prod.py
-
-INSTALL PACKAGES:
-pip install -r requirements.txt
-
 RUN DATABASE MIGRATIONS:
 python maintenance/migrate_projects.py
+
+AUDIT PROD VS DEV SCHEMA (read-only):
+Add SUPABASE_DB_PASSWORD to .env (see maintenance/.env.example), then:
+python maintenance/audit_schema_parity.py
+python maintenance/audit_schema_parity.py --json
+PowerShell one-liner (prefer .env instead):
+$env:SUPABASE_DB_PASSWORD = "your-db-password"
+
+APPLY SCHEMA PARITY TO PROD (dry-run first, then --apply):
+python maintenance/apply_schema_parity.py
+python maintenance/apply_schema_parity.py --apply
+
+MIGRATION RUN ORDER FOR FRESH PROD DEPLOYMENT:
+  Supabase SQL Editor → run in this order:
+  1. migrations/017_create_budget_prod_tables.sql  (core budget tables)
+  2. migrations/016_add_income_pay_frequency.sql   (pay_frequency column)
+  3. migrations/018_add_income_payment_date.sql    (payment_date, safe no-op if 017 ran)
+  4. migrations/020_add_income_source_expense_id.sql
+  5. migrations/021_fix_source_expense_id_type.sql
+  Or: run migrations/022_prod_dev_schema_parity.sql (idempotent catch-all)
 
 BACKFILL ENCRYPTED SESSION TOKENS:
 .\venv\Scripts\python.exe maintenance/migrate_user_sessions_refresh_tokens.py
@@ -62,6 +80,17 @@ BACKFILL ENCRYPTED SESSION TOKENS:
 
 ENCRYPTION KEY NOTE:
 Home Sync and Get Fit Together must use the same ENCRYPTION_KEY in production because they share the user_sessions table.
+
+INSTALL PACKAGES:
+pip install -r requirements.txt
+
+VALIDATE LOCAL MATCHES CLOUD:
+git fetch origin dev
+git status
+
+AUTO PUSH FROM LOCAL TO CLOUD:
+python push_to_dev.py
+python push_to_prod.py
 
 ENTER VIRTUAL ENV:
 .\venv\Scripts\activate

@@ -3199,10 +3199,10 @@ def _render_budget_fragment(show_back_to_hub=False):
 
                 new_description = st.text_area("Description", placeholder="Scope, intent, or major deliverables", disabled=not can_edit_projects)
 
-                b1, b2, b3 = st.columns(3)
+                b1, b2 = st.columns(2)
                 new_est_low_raw = b1.text_input("Est. Low", value="", placeholder="Enter amount", disabled=not can_edit_projects)
                 new_est_high_raw = b2.text_input("Est. High", value="", placeholder="Enter amount", disabled=not can_edit_projects)
-                new_actual_raw = b3.text_input("Actual Spent", value="", placeholder="Enter amount", disabled=not can_edit_projects)
+                st.caption("Actual spent starts at $0.00 and is updated when you log purchases via Add Expense on each project.")
 
                 n1, n2 = st.columns(2)
                 new_vendors = n1.text_input("Vendors", placeholder="Contractor names, stores, links", disabled=not can_edit_projects)
@@ -3216,12 +3216,11 @@ def _render_budget_fragment(show_back_to_hub=False):
                 if save_clicked or complete_clicked:
                     parsed_low = _parse_currency_input(new_est_low_raw)
                     parsed_high = _parse_currency_input(new_est_high_raw)
-                    parsed_actual = _parse_currency_input(new_actual_raw)
 
                     if not new_item.strip():
                         st.warning("Project Name is required.")
-                    elif "invalid" in [parsed_low, parsed_high, parsed_actual]:
-                        st.warning("Est. Low, Est. High, and Actual Spent must be valid numbers.")
+                    elif "invalid" in [parsed_low, parsed_high]:
+                        st.warning("Est. Low and Est. High must be valid numbers.")
                     else:
                         payload = {
                             "item": new_item.strip(),
@@ -3230,7 +3229,7 @@ def _render_budget_fragment(show_back_to_hub=False):
                             "description": _clean_text(new_description) or None,
                             "est_low_cost": float(parsed_low) if parsed_low is not None else 0.0,
                             "est_high_cost": float(parsed_high) if parsed_high is not None else 0.0,
-                            "actual_cost": float(parsed_actual) if parsed_actual is not None else 0.0,
+                            "actual_cost": 0.0,
                             "veteran_discount": bool(new_vet_discount),
                             "vendors": _clean_text(new_vendors) or None,
                             "notes": _mark_completed_notes(new_notes) if complete_clicked else (_clean_text(new_notes) or None),
@@ -3333,6 +3332,11 @@ def _render_budget_fragment(show_back_to_hub=False):
                                         value=date.today(),
                                         key=f"proj_exp_date_{project_id}",
                                     )
+                                    exp_product = st.text_input(
+                                        "Product or Service",
+                                        placeholder="e.g., Lumber, paint, contractor labor",
+                                        key=f"proj_exp_product_{project_id}",
+                                    )
                                     exp_amount_raw = st.text_input(
                                         "Amount ($) *",
                                         placeholder="e.g., 125.00",
@@ -3348,7 +3352,12 @@ def _render_budget_fragment(show_back_to_hub=False):
                                     parsed_exp_amount = _parse_currency_input(exp_amount_raw)
                                     if parsed_exp_amount == "invalid" or parsed_exp_amount is None:
                                         st.error("Please enter a valid dollar amount.")
-                                    elif add_project_purchase_expense(project_id, exp_date, parsed_exp_amount):
+                                    elif add_project_purchase_expense(
+                                        project_id,
+                                        exp_date,
+                                        parsed_exp_amount,
+                                        product_or_service=exp_product,
+                                    ):
                                         finish_manage_popover("project_expense_write", project_popover_key)
                                     else:
                                         st.error("Could not log project expense.")
@@ -3369,7 +3378,7 @@ def _render_budget_fragment(show_back_to_hub=False):
 
                                     e_description = st.text_area("Description", value=description)
 
-                                    eb1, eb2, eb3 = st.columns(3)
+                                    eb1, eb2 = st.columns(2)
                                     e_est_low_raw = eb1.text_input(
                                         "Est. Low ($)",
                                         value=_format_currency_for_input(est_low),
@@ -3382,15 +3391,11 @@ def _render_budget_fragment(show_back_to_hub=False):
                                         placeholder="Enter amount",
                                         key=f"edit_est_high_{project_id}",
                                     )
-                                    e_actual_raw = eb3.text_input(
-                                        "Actual Spent ($)",
-                                        value=_format_currency_for_input(actual),
-                                        placeholder="Enter amount",
-                                        key=f"edit_actual_{project_id}",
-                                    )
+                                    st.markdown(f"**Actual Spent:** {_format_money(actual)}")
+                                    st.caption("Log purchases on the Add Expense tab to update actual spent.")
 
                                     if budget_cap > 0:
-                                        remaining_preview = budget_cap - _to_number(e_actual_raw if _clean_text(e_actual_raw) else actual, 0)
+                                        remaining_preview = budget_cap - actual
                                         preview_color = "#16A34A" if remaining_preview >= 0 else "#DC2626"
                                         st.markdown(
                                             f"**Remaining Budget:** <span style='color:{preview_color}; font-weight:700;'>{_format_money(remaining_preview)}</span>",
@@ -3411,12 +3416,11 @@ def _render_budget_fragment(show_back_to_hub=False):
                                 if save_clicked or complete_clicked:
                                     parsed_low = _parse_currency_input(e_est_low_raw)
                                     parsed_high = _parse_currency_input(e_est_high_raw)
-                                    parsed_actual = _parse_currency_input(e_actual_raw)
 
                                     if not e_item.strip():
                                         st.warning("Project Name is required.")
-                                    elif "invalid" in [parsed_low, parsed_high, parsed_actual]:
-                                        st.warning("Est. Low, Est. High, and Actual Spent must be valid numbers.")
+                                    elif "invalid" in [parsed_low, parsed_high]:
+                                        st.warning("Est. Low and Est. High must be valid numbers.")
                                     else:
                                         update_payload = {
                                             "item": e_item.strip(),
@@ -3425,7 +3429,6 @@ def _render_budget_fragment(show_back_to_hub=False):
                                             "description": _clean_text(e_description) or None,
                                             "est_low_cost": float(parsed_low) if parsed_low is not None else float(est_low),
                                             "est_high_cost": float(parsed_high) if parsed_high is not None else float(est_high),
-                                            "actual_cost": float(parsed_actual) if parsed_actual is not None else float(actual),
                                             "veteran_discount": bool(e_vet_discount),
                                             "vendors": _clean_text(e_vendors) or None,
                                             "notes": _mark_completed_notes(e_notes) if complete_clicked else (_clean_text(e_notes) or None),
