@@ -377,6 +377,50 @@ def _category_projected_amount(row, stream_projections, *, month_count=1) -> flo
     return target_budget
 
 
+def _sum_household_projected_expenses(merged_df, stream_projections, *, month_count=1) -> float:
+    """Sum projected household category targets for the selected month."""
+    if merged_df is None or merged_df.empty:
+        return 0.0
+    total = 0.0
+    for _, row in merged_df.iterrows():
+        total += _category_projected_amount(row, stream_projections, month_count=month_count)
+    return float(total)
+
+
+def _compute_household_projected_savings(monthly_income, merged_df, stream_projections) -> float:
+    """Unallocated projected income after all household category targets."""
+    projected_expenses = _sum_household_projected_expenses(merged_df, stream_projections)
+    return float(monthly_income or 0.0) - projected_expenses
+
+
+def _render_projected_savings_metric(amount: float) -> None:
+    """Red / green / white display for projected savings ($0.00 = on target)."""
+    safe_amount = float(amount or 0.0)
+    if abs(safe_amount) < 0.009:
+        st.markdown("**Projected Savings**")
+        st.markdown(
+            "<div style='display:inline-block;padding:0.35rem 0.75rem;border-radius:0.5rem;"
+            "background:#FFFFFF;border:1px solid #D1D5DB;'>"
+            f"<span style='color:#111827;font-size:1.75rem;font-weight:600;line-height:1.2;'>"
+            f"${safe_amount:,.2f}</span></div>",
+            unsafe_allow_html=True,
+        )
+        st.caption("On target — income fully assigned.")
+        return
+
+    color = "#21c354" if safe_amount > 0 else "#ff4b4b"
+    st.markdown("**Projected Savings**")
+    st.markdown(
+        f"<p style='color:{color};font-size:1.75rem;font-weight:600;margin:0;line-height:1.2;'>"
+        f"${safe_amount:,.2f}</p>",
+        unsafe_allow_html=True,
+    )
+    if safe_amount > 0:
+        st.caption("Unassigned projected income this month.")
+    else:
+        st.caption("Projected expenses exceed projected income.")
+
+
 def _render_household_budget_breakdown(
     merged_df,
     hh_expenses_df,
@@ -2410,6 +2454,16 @@ def _render_budget_fragment(show_back_to_hub=False):
                     filter_key="hh_breakdown_category",
                     stream_projections=stream_projections,
                 )
+
+                projected_income = sum_income_for_month(incomes_df, selected_month)
+                projected_savings = _compute_household_projected_savings(
+                    projected_income,
+                    merged_df,
+                    stream_projections,
+                )
+                _, savings_col = st.columns([3, 1])
+                with savings_col:
+                    _render_projected_savings_metric(projected_savings)
             st.divider()
             
             # 🟢 SINKING FUNDS TRACKER
