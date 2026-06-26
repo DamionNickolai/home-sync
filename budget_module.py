@@ -7,11 +7,6 @@ import html
 from zoneinfo import ZoneInfo
 from datetime import datetime, date
 
-try:
-    from streamlit_js_eval import streamlit_js_eval
-except Exception:
-    streamlit_js_eval = None
-
 from database import (
     get_project_budgets,
     update_project_budget_item,
@@ -1515,15 +1510,9 @@ def _render_annual_report_page(show_back_to_hub=False) -> None:
         if scope == "personal"
         else "⬅️ Back to Household Master Ledger"
     )
-    nav_col, print_col = st.columns([3, 1])
-    with nav_col:
-        if st.button(back_label, key="annual_report_back"):
-            close_annual_report()
-            rerun_app_with_reason("annual_report_close")
-    with print_col:
-        if st.button("🖨️ Print Report", key="annual_report_print", width="stretch"):
-            if streamlit_js_eval:
-                streamlit_js_eval(js_expressions="window.print()", key="annual_report_print_js")
+    if st.button(back_label, key="annual_report_back"):
+        close_annual_report()
+        rerun_app_with_reason("annual_report_close")
 
     period_label = "Year-to-Date Summary" if mode == "ytd" else "Full Year Summary"
     scope_label = (

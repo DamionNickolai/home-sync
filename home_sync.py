@@ -405,31 +405,6 @@ st.markdown("""
             min-width: 28rem;
         }
     }
-
-    /* Annual / YTD budget reports — print-friendly layout */
-    @media print {
-        [data-testid="stSidebar"],
-        [data-testid="stToolbar"],
-        header[data-testid="stHeader"],
-        [data-testid="stSidebarCollapsedControl"],
-        button,
-        [data-testid="stExpanderToggleIcon"] {
-            display: none !important;
-        }
-        [data-testid="stAppViewContainer"] {
-            max-width: 100% !important;
-            padding: 0.25in !important;
-        }
-        .hs-budget-table-wrap {
-            overflow: visible !important;
-        }
-        .hs-budget-table {
-            font-size: 10pt !important;
-        }
-        .js-plotly-plot {
-            break-inside: avoid;
-        }
-    }
     </style>
 """, unsafe_allow_html=True
 )
