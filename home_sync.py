@@ -71,6 +71,9 @@ def render_rerun_debug_panel() -> None:
         f"Last: {diagnostics.get('last_reason', 'initial_load')}"
     )
     st.sidebar.caption(f"Rerun buckets: {reason_text}")
+    app_reruns = st.session_state.get("app_rerun_count", 0)
+    fragment_reruns = st.session_state.get("fragment_rerun_count", 0)
+    st.sidebar.caption(f"Scoped reruns: app={app_reruns} | fragment={fragment_reruns}")
 
 
 def mark_top_nav_change() -> None:

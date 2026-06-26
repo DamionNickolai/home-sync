@@ -58,6 +58,7 @@ from database import (
 )
 from ui_helpers import (
     rerun_app_with_reason,
+    rerun_fragment_with_reason,
     manage_popover_key,
     finish_manage_popover,
     arm_delete_confirm,
@@ -78,7 +79,7 @@ def _maybe_auto_rollover(household_id, selected_month):
     income_rolled = auto_rollover_recurring_incomes(household_id, selected_month)
     st.session_state[guard_key] = True
     if expense_rolled or income_rolled:
-        rerun_app_with_reason("recurring_rollover")
+        rerun_fragment_with_reason("recurring_rollover")
 
 
 def _recurring_due_date_in_month(expense_row, selected_month):
@@ -653,18 +654,18 @@ def _render_expense_manage_rows(
             parsed_amt = _parse_currency_input(new_amt)
             if parsed_amt != "invalid":
                 if update_expense(exp_id, parsed_amt, new_det.strip(), new_recur, date_logged=new_date):
-                    st.rerun()
+                    rerun_fragment_with_reason("budget_nav")
             else:
                 st.error("Invalid amount.")
 
         expense_delete_key = f"expense_{key_prefix}_{exp_id}"
         if st.button("❌ Delete Expense", key=f"del_{key_prefix}_{exp_id}", type="secondary", width="stretch"):
             arm_delete_confirm(expense_delete_key)
-            rerun_app_with_reason("delete_arm")
+            rerun_fragment_with_reason("delete_arm")
 
-        if render_delete_confirmation(expense_delete_key, item_label=selected_label):
+        if render_delete_confirmation(expense_delete_key, item_label=selected_label, rerun_scope="fragment"):
             if delete_expense(exp_id):
-                rerun_app_with_reason("delete_expense")
+                rerun_fragment_with_reason("delete_expense")
 
 
 def _render_income_management(
@@ -736,7 +737,7 @@ def _render_income_management(
                         is_personal_income=is_personal,
                         payment_date=payment_date,
                     ):
-                        st.rerun()
+                        rerun_fragment_with_reason("budget_nav")
 
         with tab_edit:
             st.markdown(f"**✏️ Edit or Delete Income ({selected_month})**")
@@ -835,16 +836,16 @@ def _render_income_management(
                     edit_pay_frequency,
                     payment_date=edit_payment_date,
                 ):
-                    st.rerun()
+                    rerun_fragment_with_reason("budget_nav")
 
             income_delete_key = f"income_{form_key_prefix}_{target_income_id}"
             if delete_clicked:
                 arm_delete_confirm(income_delete_key)
-                rerun_app_with_reason("delete_arm")
+                rerun_fragment_with_reason("delete_arm")
 
-            if render_delete_confirmation(income_delete_key, item_label=edit_source):
+            if render_delete_confirmation(income_delete_key, item_label=edit_source, rerun_scope="fragment"):
                 if delete_household_income(target_income_id):
-                    rerun_app_with_reason("delete_income")
+                    rerun_fragment_with_reason("delete_income")
 
 
 def _render_family_member_budgets(household_id, selected_month, household_users):
@@ -1119,7 +1120,7 @@ def _render_two_col_selector(key: str, options: list, format_func=None):
             ):
                 if selected_value != left_opt:
                     st.session_state[key] = left_opt
-                    rerun_app_with_reason("selector_change")
+                    rerun_fragment_with_reason("selector_change")
 
             if col_right.button(
                 right_label,
@@ -1129,7 +1130,7 @@ def _render_two_col_selector(key: str, options: list, format_func=None):
             ):
                 if selected_value != right_opt:
                     st.session_state[key] = right_opt
-                    rerun_app_with_reason("selector_change")
+                    rerun_fragment_with_reason("selector_change")
         else:
             only_opt = row_options[0]
             only_label = format_func(only_opt) if format_func else str(only_opt)
@@ -1141,7 +1142,7 @@ def _render_two_col_selector(key: str, options: list, format_func=None):
             ):
                 if selected_value != only_opt:
                     st.session_state[key] = only_opt
-                    rerun_app_with_reason("selector_change")
+                    rerun_fragment_with_reason("selector_change")
 
     return st.session_state.get(key)
 
@@ -1179,7 +1180,7 @@ def open_annual_report(scope: str, year: int, mode: str) -> None:
     st.session_state[ANNUAL_REPORT_SCOPE_KEY] = scope
     st.session_state[ANNUAL_REPORT_YEAR_KEY] = int(year)
     st.session_state[ANNUAL_REPORT_MODE_KEY] = mode
-    rerun_app_with_reason("annual_report_open")
+    rerun_fragment_with_reason("annual_report_open")
 
 
 def close_annual_report() -> None:
@@ -1498,7 +1499,7 @@ def _render_annual_report_page(show_back_to_hub=False) -> None:
         st.warning("You do not have permission to view household annual reports.")
         if st.button("⬅️ Back to Budget Modules", key="annual_report_access_denied"):
             close_annual_report()
-            rerun_app_with_reason("annual_report_close")
+            rerun_fragment_with_reason("annual_report_close")
         return
 
     household_id = st.session_state.get("household_id")
@@ -1512,7 +1513,7 @@ def _render_annual_report_page(show_back_to_hub=False) -> None:
     )
     if st.button(back_label, key="annual_report_back"):
         close_annual_report()
-        rerun_app_with_reason("annual_report_close")
+        rerun_fragment_with_reason("annual_report_close")
 
     period_label = "Year-to-Date Summary" if mode == "ytd" else "Full Year Summary"
     scope_label = (
@@ -1666,6 +1667,7 @@ def render_budget_module(show_back_to_hub=False):
     _render_budget_fragment(show_back_to_hub)
 
 
+@st.fragment
 def _render_budget_fragment(show_back_to_hub=False):
     household_id = st.session_state.get("household_id")
     if household_id:
@@ -1673,7 +1675,10 @@ def _render_budget_fragment(show_back_to_hub=False):
         if not st.session_state.get(guard_key):
             ensure_project_expense_category(household_id)
             st.session_state[guard_key] = True
-        ensure_allowance_categories(household_id)
+        allowance_guard = f"allowance_categories_ready_{household_id}"
+        if not st.session_state.get(allowance_guard):
+            ensure_allowance_categories(household_id)
+            st.session_state[allowance_guard] = True
 
     if "budget_view" not in st.session_state:
         st.session_state["budget_view"] = "menu"
@@ -1721,7 +1726,7 @@ def _render_budget_fragment(show_back_to_hub=False):
                     st.caption("Shared household ledger, bills, and budget breakdown.")
                     if st.button("Open Household", key="btn_household", type="secondary", width="stretch"):
                         st.session_state["budget_view"] = "household"
-                        st.rerun()
+                        rerun_fragment_with_reason("budget_nav")
                 else:
                     st.caption("Household budget is limited to family admins and developers.")
                     st.button("Household Locked", disabled=True, width="stretch")
@@ -1737,7 +1742,7 @@ def _render_budget_fragment(show_back_to_hub=False):
                 
                 if st.button("Open Personal", key="btn_personal", type="secondary", width="stretch"):
                     st.session_state["budget_view"] = "personal"
-                    st.rerun()
+                    rerun_fragment_with_reason("budget_nav")
 
         # --- ROW 2: Projects & Wish List ---
         r2c1, r2c2 = st.columns(2)                  
@@ -1749,7 +1754,7 @@ def _render_budget_fragment(show_back_to_hub=False):
                     if st.button("Open Projects", key="btn_projects", type="secondary", width="stretch"):
                         st.session_state["budget_view"] = "projects"
                         st.session_state["projects_active_section"] = "workspace"
-                        st.rerun()
+                        rerun_fragment_with_reason("budget_nav")
                 else:
                     st.caption("Projects access is restricted.")
                     st.button("Projects Locked", disabled=True, width="stretch")
@@ -1760,13 +1765,13 @@ def _render_budget_fragment(show_back_to_hub=False):
                 st.caption("Track purchase ideas in a shared household list.")
                 if st.button("Open Wish List", key="btn_wish", type="secondary", width="stretch"):
                     st.session_state["budget_view"] = "wishlist"
-                    st.rerun()
+                    rerun_fragment_with_reason("budget_nav")
 
         return
 
     if st.button("⬅️ Back to Budget Modules", width="content"):
         st.session_state["budget_view"] = "menu"
-        st.rerun()
+        rerun_fragment_with_reason("budget_nav")
 
     st.divider()
 
@@ -1774,14 +1779,14 @@ def _render_budget_fragment(show_back_to_hub=False):
         st.warning("Projects access is currently disabled for your account. Ask your household admin to enable it.")
         if st.button("⬅️ Return to Budget Modules", key="projects_access_denied_return"):
             st.session_state["budget_view"] = "menu"
-            st.rerun()
+            rerun_fragment_with_reason("budget_nav")
         return
 
     if view == "monthly" and not can_access_monthly:
         st.warning("Monthly Budget access is currently disabled for your account. Ask your household admin to enable it.")
         if st.button("⬅️ Return to Budget Modules", key="monthly_access_denied_return"):
             st.session_state["budget_view"] = "menu"
-            st.rerun()
+            rerun_fragment_with_reason("budget_nav")
         return
 
     if view == "wishlist":
@@ -1906,7 +1911,7 @@ def _render_budget_fragment(show_back_to_hub=False):
                         if insert_wish_list_item(payload):
                             st.session_state["wishlist_pending_owner"] = new_owner_username
                             st.success("Wish list item added.")
-                            st.rerun()
+                            rerun_fragment_with_reason("budget_nav")
                         else:
                             st.error("Could not add wish list item.")
 
@@ -1990,27 +1995,27 @@ def _render_budget_fragment(show_back_to_hub=False):
                                     }
                                     if update_wish_list_item(str(row_id), update_payload):
                                         st.session_state["wishlist_pending_owner"] = owner_name
-                                        finish_manage_popover("wishlist_write", wishlist_popover_key)
+                                        finish_manage_popover("wishlist_write", wishlist_popover_key, scope="fragment")
                                     else:
                                         st.error("Could not update this wish list item.")
 
                             if complete_clicked:
                                 if complete_wish_list_item(str(row_id)):
-                                    finish_manage_popover("wishlist_write", wishlist_popover_key)
+                                    finish_manage_popover("wishlist_write", wishlist_popover_key, scope="fragment")
                                 else:
                                     st.error("Could not complete this wish list item.")
 
                             if delete_clicked:
                                 arm_delete_confirm(f"wishlist_{row_id}")
-                                finish_manage_popover("delete_arm", wishlist_popover_key)
+                                finish_manage_popover("delete_arm", wishlist_popover_key, scope="fragment")
 
                             if cancel_clicked:
-                                finish_manage_popover("wishlist_edit_cancel", wishlist_popover_key)
+                                finish_manage_popover("wishlist_edit_cancel", wishlist_popover_key, scope="fragment")
 
                     wishlist_delete_key = f"wishlist_{row_id}"
-                    if render_delete_confirmation(wishlist_delete_key, item_label=item_name):
+                    if render_delete_confirmation(wishlist_delete_key, item_label=item_name, rerun_scope="fragment"):
                         if delete_wish_list_item(str(row_id)):
-                            rerun_app_with_reason("wishlist_delete")
+                            rerun_fragment_with_reason("wishlist_delete")
                         else:
                             st.error("Could not delete this wish list item.")
 
@@ -2032,7 +2037,7 @@ def _render_budget_fragment(show_back_to_hub=False):
                         if col_action.button("↩️ Restore", key=f"restore_wishlist_{row.get('id')}", width="stretch"):
                             if restore_wish_list_item(str(row.get("id"))):
                                 st.success("Wish list item restored.")
-                                st.rerun()
+                                rerun_fragment_with_reason("budget_nav")
                             else:
                                 st.error("Could not restore this wish list item.")
 
@@ -2099,7 +2104,7 @@ def _render_budget_fragment(show_back_to_hub=False):
             st.warning("🔒 You do not have permission to view the Household Ledger.")
             if st.button("⬅️ Return to Menu"):
                 st.session_state["budget_view"] = "menu"
-                st.rerun()
+                rerun_fragment_with_reason("budget_nav")
             return
             
         st.subheader("🏦 Household Budget")
@@ -2259,7 +2264,7 @@ def _render_budget_fragment(show_back_to_hub=False):
                             )
                             if success:
                                 st.success(f"Logged ${_format_money(parsed_amount)} to Household Ledger.")
-                                st.rerun()
+                                rerun_fragment_with_reason("budget_nav")
                             else:
                                 st.error("Failed to log expense.")
             
@@ -2330,7 +2335,7 @@ def _render_budget_fragment(show_back_to_hub=False):
 
                             if insert_budget_category(household_id, final_parent, new_sub_cat, target_budget=parsed_target):
                                 st.success(f"Added {final_parent}!")
-                                st.rerun()
+                                rerun_fragment_with_reason("budget_nav")
 
                 with tab_edit:
                     st.markdown("**✏️ Edit or Delete Categories**")
@@ -2376,16 +2381,16 @@ def _render_budget_fragment(show_back_to_hub=False):
                                     parsed_target = parsed_target / 12.0
 
                                 if update_budget_category(target_cat_id, edit_parent, edit_sub, parsed_target):
-                                    rerun_app_with_reason("category_write")
+                                    rerun_fragment_with_reason("category_write")
 
                         hh_cat_delete_key = f"hh_category_{target_cat_id}"
                         if delete_clicked:
                             arm_delete_confirm(hh_cat_delete_key)
-                            rerun_app_with_reason("delete_arm")
+                            rerun_fragment_with_reason("delete_arm")
 
-                        if render_delete_confirmation(hh_cat_delete_key, item_label=selected_edit_str):
+                        if render_delete_confirmation(hh_cat_delete_key, item_label=selected_edit_str, rerun_scope="fragment"):
                             if delete_budget_category(target_cat_id):
-                                rerun_app_with_reason("category_delete")
+                                rerun_fragment_with_reason("category_delete")
                     else:
                         st.caption("No categories found to edit.")
 
@@ -2458,7 +2463,7 @@ def _render_budget_fragment(show_back_to_hub=False):
         
         if allow_family_view != current_share_status:
             if update_user_privacy_toggle(household_id, username, allow_family_view):
-                st.rerun()
+                rerun_fragment_with_reason("budget_nav")
                 
         personal_options = _personal_submodule_options(username)
         _sync_selector_option("personal_view_mode", personal_options)
@@ -2556,7 +2561,7 @@ def _render_budget_fragment(show_back_to_hub=False):
                             )
                             if success:
                                 st.success(f"Logged ${_format_money(parsed_amount)} to Personal Ledger.")
-                                st.rerun()
+                                rerun_fragment_with_reason("budget_nav")
                             else:
                                 st.error("Failed to log expense.")
                                 
@@ -2619,7 +2624,7 @@ def _render_budget_fragment(show_back_to_hub=False):
                                 
                             if insert_budget_category(household_id, final_parent, new_sub_cat, is_personal=True, username=username, target_budget=parsed_target):
                                 st.success(f"Added {final_parent} to your private list!")
-                                st.rerun()
+                                rerun_fragment_with_reason("budget_nav")
                                 
                 with tab_edit:
                     st.markdown("**✏️ Edit or Delete Personal Categories**")
@@ -2657,16 +2662,16 @@ def _render_budget_fragment(show_back_to_hub=False):
                                     parsed_target = parsed_target / 12.0
 
                                 if update_budget_category(target_cat_id, edit_parent, edit_sub, parsed_target):
-                                    rerun_app_with_reason("category_write")
+                                    rerun_fragment_with_reason("category_write")
 
                         pers_cat_delete_key = f"pers_category_{target_cat_id}"
                         if delete_clicked:
                             arm_delete_confirm(pers_cat_delete_key)
-                            rerun_app_with_reason("delete_arm")
+                            rerun_fragment_with_reason("delete_arm")
 
-                        if render_delete_confirmation(pers_cat_delete_key, item_label=selected_edit_str):
+                        if render_delete_confirmation(pers_cat_delete_key, item_label=selected_edit_str, rerun_scope="fragment"):
                             if delete_budget_category(target_cat_id):
-                                rerun_app_with_reason("category_delete")
+                                rerun_fragment_with_reason("category_delete")
                     else:
                         st.caption("No categories found to edit.")                    
                                 
@@ -2844,13 +2849,13 @@ def _render_budget_fragment(show_back_to_hub=False):
                 st.session_state["projects_overview_categories"] = list(category_options)
                 for category_name in category_options:
                     st.session_state[f"overview_cat_{_make_key_fragment(category_name)}"] = True
-                st.rerun()
+                rerun_fragment_with_reason("budget_nav")
 
             if clear_all_col.button("Clear All", key="overview_categories_clear_all", width="stretch"):
                 st.session_state["projects_overview_categories"] = []
                 for category_name in category_options:
                     st.session_state[f"overview_cat_{_make_key_fragment(category_name)}"] = False
-                st.rerun()
+                rerun_fragment_with_reason("budget_nav")
 
             category_rows = []
             for idx, category_name in enumerate(category_options):
@@ -3151,7 +3156,7 @@ def _render_budget_fragment(show_back_to_hub=False):
                     value_to_save = parsed_funds if parsed_funds is not None else None
                     if update_household_projects_funds(value_to_save, current_year):
                         st.success("Projects Funds saved.")
-                        st.rerun()
+                        rerun_fragment_with_reason("budget_nav")
                     else:
                         st.error("Could not save Projects Funds.")
 
@@ -3236,7 +3241,7 @@ def _render_budget_fragment(show_back_to_hub=False):
                         }
                         if insert_project_budget_item(payload):
                             st.success("Project completed and archived." if complete_clicked else "Project added.")
-                            st.rerun()
+                            rerun_fragment_with_reason("budget_nav")
                         else:
                             st.error("Could not save project.")
 
@@ -3358,7 +3363,7 @@ def _render_budget_fragment(show_back_to_hub=False):
                                         parsed_exp_amount,
                                         product_or_service=exp_product,
                                     ):
-                                        finish_manage_popover("project_expense_write", project_popover_key)
+                                        finish_manage_popover("project_expense_write", project_popover_key, scope="fragment")
                                     else:
                                         st.error("Could not log project expense.")
 
@@ -3434,18 +3439,18 @@ def _render_budget_fragment(show_back_to_hub=False):
                                             "notes": _mark_completed_notes(e_notes) if complete_clicked else (_clean_text(e_notes) or None),
                                         }
                                         if update_project_budget_item(project_id, update_payload):
-                                            finish_manage_popover("project_write", project_popover_key)
+                                            finish_manage_popover("project_write", project_popover_key, scope="fragment")
                                         else:
                                             st.error("Could not update project.")
 
                                 project_delete_key = f"project_{project_id}"
                                 if delete_clicked:
                                     arm_delete_confirm(project_delete_key)
-                                    rerun_app_with_reason("delete_arm")
+                                    rerun_fragment_with_reason("delete_arm")
 
-                                if render_delete_confirmation(project_delete_key, item_label=title):
+                                if render_delete_confirmation(project_delete_key, item_label=title, rerun_scope="fragment"):
                                     if delete_project_budget_item(project_id):
-                                        finish_manage_popover("project_delete", project_popover_key)
+                                        finish_manage_popover("project_delete", project_popover_key, scope="fragment")
                                     else:
                                         st.error("Could not delete this project.")
 
@@ -3543,10 +3548,10 @@ def _render_budget_fragment(show_back_to_hub=False):
                             st.session_state["pending_restore_project_id"] = None
                             if restored:
                                 st.success("Project restored to Active.")
-                                st.rerun()
+                                rerun_fragment_with_reason("budget_nav")
                             else:
                                 st.error("Could not restore this project.")
 
                         if cancel_col.button("❌ Cancel", key=f"cancel_restore_project_{project_id}", width="stretch"):
                             st.session_state["pending_restore_project_id"] = None
-                            st.rerun()
+                            rerun_fragment_with_reason("budget_nav")

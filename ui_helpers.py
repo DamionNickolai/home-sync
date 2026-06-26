@@ -6,13 +6,25 @@ def queue_rerun_reason(reason: str) -> None:
         st.session_state["pending_rerun_reason"] = reason
 
 
-def rerun_with_reason(reason: str) -> None:
+def _track_rerun_scope(scope: str) -> None:
+    counter_key = "fragment_rerun_count" if scope == "fragment" else "app_rerun_count"
+    st.session_state[counter_key] = int(st.session_state.get(counter_key, 0)) + 1
+
+
+def rerun_with_reason(reason: str, *, scope: str = "app") -> None:
     queue_rerun_reason(reason)
-    st.rerun()
+    _track_rerun_scope(scope)
+    st.rerun(scope=scope)
+
+
+def rerun_fragment_with_reason(reason: str) -> None:
+    """Rerun only the active @st.fragment container (not the full app)."""
+    rerun_with_reason(reason, scope="fragment")
 
 
 def rerun_app_with_reason(reason: str) -> None:
     queue_rerun_reason(reason)
+    _track_rerun_scope("app")
     st.rerun(scope="app")
 
 
@@ -31,10 +43,10 @@ def close_manage_popover(base_key: str) -> None:
     st.session_state[gen_key] = int(st.session_state.get(gen_key, 0)) + 1
 
 
-def finish_manage_popover(reason: str, base_key: str) -> None:
-    """Close a manage popover and rerun the app (matches backlog save behavior)."""
+def finish_manage_popover(reason: str, base_key: str, *, scope: str = "app") -> None:
+    """Close a manage popover and rerun (fragment or full app)."""
     close_manage_popover(base_key)
-    rerun_with_reason(reason)
+    rerun_with_reason(reason, scope=scope)
 
 
 DELETE_CONFIRM_PREFIX = "delete_confirm_pending::"
@@ -61,6 +73,7 @@ def render_delete_confirmation(
     *,
     item_label: str = "this item",
     warning: str | None = None,
+    rerun_scope: str = "app",
 ) -> bool:
     """When delete is armed, show confirm/cancel UI. Returns True if user confirmed."""
     if not is_delete_confirm_armed(action_key):
@@ -82,14 +95,14 @@ def render_delete_confirmation(
     )
     if cancelled:
         clear_delete_confirm(action_key)
-        rerun_with_reason("delete_cancel")
+        rerun_with_reason("delete_cancel", scope=rerun_scope)
     if confirmed:
         clear_delete_confirm(action_key)
         return True
     return False
 
 
-def render_two_col_selector(key: str, options: list, format_func=None):
+def render_two_col_selector(key: str, options: list, format_func=None, *, rerun_scope: str = "app"):
     if not options:
         return None
 
@@ -115,7 +128,7 @@ def render_two_col_selector(key: str, options: list, format_func=None):
             ):
                 if selected_value != left_opt:
                     st.session_state[key] = left_opt
-                    rerun_with_reason("selector_change")
+                    rerun_with_reason("selector_change", scope=rerun_scope)
 
             if col_right.button(
                 right_label,
@@ -125,7 +138,7 @@ def render_two_col_selector(key: str, options: list, format_func=None):
             ):
                 if selected_value != right_opt:
                     st.session_state[key] = right_opt
-                    rerun_with_reason("selector_change")
+                    rerun_with_reason("selector_change", scope=rerun_scope)
         else:
             only_opt = row_options[0]
             only_label = format_func(only_opt) if format_func else str(only_opt)
@@ -137,6 +150,6 @@ def render_two_col_selector(key: str, options: list, format_func=None):
             ):
                 if selected_value != only_opt:
                     st.session_state[key] = only_opt
-                    rerun_with_reason("selector_change")
+                    rerun_with_reason("selector_change", scope=rerun_scope)
 
     return st.session_state.get(key)

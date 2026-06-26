@@ -17,7 +17,7 @@ from ui_helpers import (
     render_two_col_selector,
     finish_manage_popover,
     manage_popover_key,
-    rerun_with_reason,
+    rerun_fragment_with_reason,
     arm_delete_confirm,
     render_delete_confirmation,
 )
@@ -109,6 +109,7 @@ def _get_due_bucket(task):
     return None
 
 
+@st.fragment
 def render_todo_view():
     st.subheader("📋 Active To-Do List")
     current_user = st.session_state.get("logged_in_user", "Unknown")
@@ -204,7 +205,7 @@ def render_todo_view():
                 )
                 if success:
                     st.success("Task added!")
-                    rerun_with_reason("task_write")
+                    rerun_fragment_with_reason("task_write")
                 else:
                     st.error("Could not save task.")
             elif submit and not new_task:
@@ -260,6 +261,7 @@ def render_todo_view():
                 key="todo_active_bucket",
                 options=task_bucket_keys,
                 format_func=task_bucket_label,
+                rerun_scope="fragment",
             )
 
             def due_sort_value(task_row):
@@ -410,22 +412,22 @@ def render_todo_view():
                                         recurrence_pattern=edit_recurrence_pattern if edit_is_recurring else None,
                                     )
                                     if success:
-                                        finish_manage_popover("task_write", task_popover_key)
+                                        finish_manage_popover("task_write", task_popover_key, scope="fragment")
                                     else:
                                         st.error("Could not update task.")
 
                             if delete_clicked:
                                 arm_delete_confirm(f"task_{task['id']}")
-                                rerun_with_reason("delete_arm")
+                                rerun_fragment_with_reason("delete_arm")
 
                             task_delete_key = f"task_{task['id']}"
-                            if render_delete_confirmation(task_delete_key, item_label=edit_task_name):
+                            if render_delete_confirmation(task_delete_key, item_label=edit_task_name, rerun_scope="fragment"):
                                 delete_task(task["id"])
-                                finish_manage_popover("task_write", task_popover_key)
+                                finish_manage_popover("task_write", task_popover_key, scope="fragment")
 
                             if complete_clicked:
                                 if batch_update_tasks([task["id"]], True):
-                                    finish_manage_popover("task_write", task_popover_key)
+                                    finish_manage_popover("task_write", task_popover_key, scope="fragment")
                                 else:
                                     st.error("Could not complete task.")
 
@@ -480,6 +482,6 @@ def render_todo_view():
                 if user_role in ["developer", "admin"] or current_user in assignees:
                     if col_recall.button("🔄 Recall", key=f"recall_{task['id']}"):
                         batch_update_tasks([task["id"]], False)
-                        rerun_with_reason("task_write")
+                        rerun_fragment_with_reason("task_write")
         else:
             st.caption("No recently completed tasks in the last 14 days.")

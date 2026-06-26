@@ -228,6 +228,7 @@ def init_connection() -> Client:
 
 supabase = init_connection()
 
+
 HOME_MGMT_PERMISSION_KEYS = (
     "can_view_home_solar",
     "can_edit_home_solar",
@@ -2228,6 +2229,14 @@ def clear_household_users_cache():
     clear_fn = getattr(_fetch_household_users_cached, "clear", None)
     if callable(clear_fn):
         clear_fn()
+    try:
+        import streamlit as st
+
+        household_id = st.session_state.get("household_id")
+        if household_id:
+            st.session_state.pop(f"allowance_categories_ready_{household_id}", None)
+    except Exception:
+        pass
 
 
 def get_household_users_for_admin():
