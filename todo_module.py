@@ -13,7 +13,14 @@ from database import (
     get_completed_tasks,
     update_task,
 )
-from ui_helpers import render_two_col_selector, finish_manage_popover, manage_popover_key, rerun_with_reason
+from ui_helpers import (
+    render_two_col_selector,
+    finish_manage_popover,
+    manage_popover_key,
+    rerun_with_reason,
+    arm_delete_confirm,
+    render_delete_confirmation,
+)
 
 FALLBACK_TIMEZONE = "America/Chicago"
 RECURRENCE_OPTIONS = ["Daily", "Weekly", "Biweekly", "Monthly", "Quarterly", "Every 6 Months", "Yearly"]
@@ -408,6 +415,11 @@ def render_todo_view():
                                         st.error("Could not update task.")
 
                             if delete_clicked:
+                                arm_delete_confirm(f"task_{task['id']}")
+                                rerun_with_reason("delete_arm")
+
+                            task_delete_key = f"task_{task['id']}"
+                            if render_delete_confirmation(task_delete_key, item_label=edit_task_name):
                                 delete_task(task["id"])
                                 finish_manage_popover("task_write", task_popover_key)
 

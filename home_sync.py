@@ -19,11 +19,17 @@ from admin_module import (
 from budget_module import render_budget_module
 from database import get_all_backlog_items, get_current_app_version, add_backlog_item, update_backlog_item, delete_backlog_item, cut_release, get_current_user_permissions
 from todo_module import render_todo_view
-from ui_helpers import queue_rerun_reason, rerun_with_reason, render_two_col_selector
+from ui_helpers import (
+    queue_rerun_reason,
+    rerun_with_reason,
+    render_two_col_selector,
+    arm_delete_confirm,
+    render_delete_confirmation,
+)
 from utils import calculate_next_version
 from supabase import create_client, Client
 
-APP_VERSION = "0.3.0"
+APP_VERSION = "1.0.0"
 GET_FIT_BASELINE_VERSION = "2.1.0"
 FALLBACK_TIMEZONE = "America/Chicago"
 
@@ -194,6 +200,53 @@ def get_supabase_client() -> Client:
     key = st.secrets["SUPABASE_SERVICE_KEY"]
     return create_client(url, key)
 
+
+def render_bug_radar() -> None:
+    """Show open bug counts across apps (excludes Staged/Done)."""
+    try:
+        radar_response = (
+            get_supabase_client()
+            .table("backlog")
+            .select("app_name, status")
+            .eq("category", "Bug")
+            .neq("status", "Staged")
+            .neq("status", "Done")
+            .execute()
+        )
+        bug_rows = radar_response.data or []
+        bug_counts = {"home_sync": 0, "get_fit": 0, "Global": 0, "unassigned": 0}
+
+        for row in bug_rows:
+            app_name = row.get("app_name") or "unassigned"
+            if app_name not in bug_counts:
+                bug_counts[app_name] = 0
+            bug_counts[app_name] += 1
+
+        total_bugs = sum(bug_counts.values())
+        if total_bugs > 0:
+            app_labels = {
+                "home_sync": "Home Sync",
+                "get_fit": "Get Fit Together",
+                "Global": "Global",
+                "unassigned": "Unassigned",
+            }
+            breakdown = " | ".join(
+                f"{app_labels.get(app, app)}: {count}"
+                for app, count in bug_counts.items()
+                if count > 0
+            )
+            st.markdown(
+                f"""
+                <div style="background-color: #fff7ed; border: 1px solid #fb923c; color: #9a3412; padding: 12px 14px; border-radius: 10px; margin: 8px 0 16px 0;">
+                    <strong>⚠️ Bug Radar:</strong> {total_bugs} open bugs across the ecosystem.<br/>
+                    <span style="font-size: 0.92em;">{breakdown}</span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+    except Exception:
+        pass
+
 # 1. Page Config must ALWAYS be the very first Streamlit command
 st.set_page_config(page_title="Home Sync Dashboard", page_icon="🏠", layout="wide")
 track_rerun_diagnostics()
@@ -217,6 +270,112 @@ st.markdown("""
         font-size: calc(1em + 2px);
     }
 
+    /* Budget tables — unified compact layout (desktop + mobile). */
+    .hs-budget-table-wrap {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+        width: 100%;
+        margin: 0.15rem 0;
+    }
+    .hs-budget-table {
+        width: 100%;
+        table-layout: fixed;
+        border-collapse: collapse;
+        font-size: 0.8125rem;
+        line-height: 1.4;
+    }
+    .hs-budget-table thead tr {
+        background: rgba(148, 163, 184, 0.12);
+    }
+    .hs-budget-table thead th {
+        font-weight: 700;
+        font-size: 0.68rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        white-space: nowrap;
+        padding: 0.45rem 0.35rem;
+        border-bottom: 2px solid rgba(148, 163, 184, 0.45);
+    }
+    .hs-budget-table th,
+    .hs-budget-table td {
+        padding: 0.28rem 0.35rem;
+        border-bottom: 1px solid rgba(128, 128, 128, 0.3);
+        vertical-align: top;
+    }
+    .hs-budget-table td.num,
+    .hs-budget-table th.num {
+        text-align: right;
+        white-space: nowrap;
+    }
+    .hs-budget-table tr.parent td:first-child {
+        font-weight: 600;
+    }
+    .hs-budget-table tr.indent td:first-child {
+        padding-left: 0.65rem;
+        font-size: 0.92em;
+        opacity: 0.92;
+    }
+    .hs-budget-table tr.indent td:first-child::before {
+        content: "• ";
+        opacity: 0.65;
+    }
+    .hs-budget-table tr.emphasis td {
+        font-weight: 600;
+        border-top: 1px solid rgba(148, 163, 184, 0.35);
+    }
+    /* Ledger breakdown */
+    .hs-budget-table-wrap.ledger .hs-budget-table th:first-child,
+    .hs-budget-table-wrap.ledger .hs-budget-table td:first-child {
+        width: 30%;
+        white-space: normal;
+        word-break: break-word;
+    }
+    .hs-budget-table-wrap.ledger .hs-budget-table th.num,
+    .hs-budget-table-wrap.ledger .hs-budget-table td.num {
+        width: 17.5%;
+    }
+    /* Sinking funds */
+    .hs-budget-table-wrap.sinking .hs-budget-table th:first-child,
+    .hs-budget-table-wrap.sinking .hs-budget-table td:first-child {
+        width: 44%;
+        white-space: normal;
+        word-break: break-word;
+    }
+    .hs-budget-table-wrap.sinking .hs-budget-table th.num,
+    .hs-budget-table-wrap.sinking .hs-budget-table td.num {
+        width: 28%;
+    }
+    /* Cash flow / income */
+    .hs-budget-table-wrap.income .hs-budget-table th:first-child,
+    .hs-budget-table-wrap.income .hs-budget-table td:first-child {
+        width: 22%;
+    }
+    .hs-budget-table-wrap.income .hs-budget-table th:nth-child(2),
+    .hs-budget-table-wrap.income .hs-budget-table td:nth-child(2) {
+        width: 14%;
+    }
+    /* Expense lists */
+    .hs-budget-table-wrap.expense .hs-budget-table th:nth-child(1),
+    .hs-budget-table-wrap.expense .hs-budget-table td:nth-child(1) {
+        width: 13%;
+    }
+    .hs-budget-table-wrap.expense .hs-budget-table th:nth-child(2),
+    .hs-budget-table-wrap.expense .hs-budget-table td:nth-child(2),
+    .hs-budget-table-wrap.expense .hs-budget-table th:nth-child(3),
+    .hs-budget-table-wrap.expense .hs-budget-table td:nth-child(3) {
+        width: 16%;
+    }
+    .hs-budget-table-wrap.expense .hs-budget-table th:nth-child(4),
+    .hs-budget-table-wrap.expense .hs-budget-table td:nth-child(4) {
+        width: 34%;
+        white-space: normal;
+        word-break: break-word;
+    }
+    .hs-budget-table-wrap.expense .hs-budget-table th:nth-child(5),
+    .hs-budget-table-wrap.expense .hs-budget-table td:nth-child(5) {
+        width: 13%;
+    }
+
     /* Mobile polish: readable tap targets for any remaining radio controls. */
     @media (max-width: 768px) {
         div[data-testid="stRadio"] [role="radiogroup"] > label {
@@ -229,6 +388,47 @@ st.markdown("""
             box-sizing: border-box;
         }
 
+        .hs-budget-table-wrap.ledger .hs-budget-table {
+            min-width: 24rem;
+        }
+        .hs-budget-table-wrap.ledger .hs-budget-table th:first-child,
+        .hs-budget-table-wrap.ledger .hs-budget-table td:first-child {
+            width: 26%;
+        }
+        .hs-budget-table-wrap.sinking .hs-budget-table {
+            min-width: 16rem;
+        }
+        .hs-budget-table-wrap.income .hs-budget-table {
+            min-width: 26rem;
+        }
+        .hs-budget-table-wrap.expense .hs-budget-table {
+            min-width: 28rem;
+        }
+    }
+
+    /* Annual / YTD budget reports — print-friendly layout */
+    @media print {
+        [data-testid="stSidebar"],
+        [data-testid="stToolbar"],
+        header[data-testid="stHeader"],
+        [data-testid="stSidebarCollapsedControl"],
+        button,
+        [data-testid="stExpanderToggleIcon"] {
+            display: none !important;
+        }
+        [data-testid="stAppViewContainer"] {
+            max-width: 100% !important;
+            padding: 0.25in !important;
+        }
+        .hs-budget-table-wrap {
+            overflow: visible !important;
+        }
+        .hs-budget-table {
+            font-size: 10pt !important;
+        }
+        .js-plotly-plot {
+            break-inside: avoid;
+        }
     }
     </style>
 """, unsafe_allow_html=True
@@ -751,49 +951,7 @@ elif user_role == "developer" and selected_dashboard_view == "🛠️ Developer 
             st.subheader("🛠️ Developer Dashboard")
             st.caption("Backlog management plus future-facing operational tooling for your app ecosystem.")
 
-            try:
-                radar_response = (
-                    get_supabase_client()
-                    .table("backlog")
-                    .select("app_name, status")
-                    .eq("category", "Bug")
-                    .neq("status", "Staged")
-                    .neq("status", "Done")
-                    .execute()
-                )
-                bug_rows = radar_response.data or []
-                bug_counts = {"home_sync": 0, "get_fit": 0, "Global": 0, "unassigned": 0}
-
-                for row in bug_rows:
-                    app_name = row.get("app_name") or "unassigned"
-                    if app_name not in bug_counts:
-                        bug_counts[app_name] = 0
-                    bug_counts[app_name] += 1
-
-                total_bugs = sum(bug_counts.values())
-                if total_bugs > 0:
-                    app_labels = {
-                        "home_sync": "Home Sync",
-                        "get_fit": "Get Fit Together",
-                        "Global": "Global",
-                        "unassigned": "Unassigned",
-                    }
-                    breakdown = " | ".join(
-                        f"{app_labels.get(app, app)}: {count}"
-                        for app, count in bug_counts.items()
-                        if count > 0
-                    )
-                    st.markdown(
-                        f"""
-                        <div style="background-color: #fff7ed; border: 1px solid #fb923c; color: #9a3412; padding: 12px 14px; border-radius: 10px; margin: 8px 0 16px 0;">
-                            <strong>⚠️ Bug Radar:</strong> {total_bugs} open bugs across the ecosystem.<br/>
-                            <span style="font-size: 0.92em;">{breakdown}</span>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
-            except Exception:
-                pass
+            render_bug_radar()
 
             card_col1, card_col2 = st.columns(2)
 
@@ -826,9 +984,8 @@ elif user_role == "developer" and selected_dashboard_view == "🛠️ Developer 
 
             st.divider()
 
-            st.subheader("🎟️ Backlog & Release Management")
             if dev_view == "overview":
-                st.markdown("### Developer Overview")
+                st.subheader("🧭 Developer Overview")
                 dev_col1, dev_col2 = st.columns(2)
                 with dev_col1.container(border=True):
                     st.markdown("#### System Health")
@@ -864,6 +1021,9 @@ elif user_role == "developer" and selected_dashboard_view == "🛠️ Developer 
                     st.caption("Current tracked migrations: user sessions, backlog release management, release ledger, to-do metadata/recurrence.")
 
             elif dev_view == "backlog_release":
+                render_bug_radar()
+                st.subheader("🎟️ Backlog & Release Management")
+
                 backlog_status_options = ["In Progress", "Blocked", "Backlog", "Staged", "Done"]
                 backlog_category_options = ["Bug", "Core", "UI", "Ops"]
                 backlog_priority_options = ["High", "Medium", "Low"]
@@ -1046,6 +1206,11 @@ elif user_role == "developer" and selected_dashboard_view == "🛠️ Developer 
                         rerun_with_reason("backlog_write")
 
                     if delete_clicked:
+                        arm_delete_confirm(f"backlog_{item['id']}")
+                        rerun_with_reason("delete_arm")
+
+                    backlog_delete_key = f"backlog_{item['id']}"
+                    if render_delete_confirmation(backlog_delete_key, item_label=e_feature):
                         deleted = delete_backlog_item(item["id"])
                         if deleted:
                             st.session_state["backlog_flash"] = {

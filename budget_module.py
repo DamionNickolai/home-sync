@@ -3,13 +3,20 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import calendar
+import html
 from zoneinfo import ZoneInfo
 from datetime import datetime, date
+
+try:
+    from streamlit_js_eval import streamlit_js_eval
+except Exception:
+    streamlit_js_eval = None
 
 from database import (
     get_project_budgets,
     update_project_budget_item,
     insert_project_budget_item,
+    delete_project_budget_item,
     add_project_purchase_expense,
     ensure_project_expense_category,
     ensure_allowance_categories,
@@ -23,7 +30,10 @@ from database import (
     complete_wish_list_item,
     restore_wish_list_item,
     get_household_incomes, 
-    get_monthly_expenses, 
+    get_monthly_expenses,
+    get_expenses_for_period,
+    get_household_incomes_for_period,
+    get_distinct_budget_years,
     get_cash_flow_routing, 
     calculate_spend_money,
     get_user_finance_settings,
@@ -38,6 +48,7 @@ from database import (
     income_pay_frequency_label,
     INCOME_PAY_FREQUENCY_LABELS,
     normalize_income_pay_frequency,
+    normalize_income_amount_for_month,
     school_year_active_month,
     get_individual_expenses,
     update_user_privacy_toggle,
@@ -50,7 +61,14 @@ from database import (
     auto_rollover_recurring_incomes,
     get_recurring_schedule
 )
-from ui_helpers import rerun_app_with_reason, manage_popover_key, finish_manage_popover
+from ui_helpers import (
+    rerun_app_with_reason,
+    manage_popover_key,
+    finish_manage_popover,
+    arm_delete_confirm,
+    is_delete_confirm_armed,
+    render_delete_confirmation,
+)
 from constants import is_system_project_expense_category, is_system_managed_allowance_category, is_allowance_subcategory
 
 
@@ -258,38 +276,40 @@ def _enrich_expenses_with_categories(expenses_df, categories_df):
     return enriched
 
 
-LEDGER_COL_WIDTHS = [3.5, 0.65, 1.25, 1.25, 1.35]
-SINKING_COL_WIDTHS = [2.6, 1.5, 1.5]
-INCOME_COL_WIDTHS = [1.7, 1.0, 1.0, 1.0, 1.0, 1.0]
-INCOME_COL_WIDTHS_PERSONAL = [2.2, 1.1, 1.1, 1.1, 1.1]
-EXPENSE_COL_WIDTHS = [1.0, 1.2, 1.2, 2.1, 0.9]
-EXPENSE_ACTION_COL_WIDTH = 0.65
 INCOME_FREQUENCY_OPTIONS = list(INCOME_PAY_FREQUENCY_LABELS.keys())
 
 
-def _grid_cell(column, text, *, align="left", emphasize=False):
-    content = f"**{text}**" if emphasize else str(text)
-    if align == "right":
-        column.markdown(
-            f'<div style="text-align:right;font-size:0.875rem;line-height:1.4;">{content}</div>',
-            unsafe_allow_html=True,
-        )
-    else:
-        column.caption(content)
-
-
-def _render_plain_grid_header(labels, widths, *, right_from_index=1):
-    cols = st.columns(widths)
-    for idx, (col, label) in enumerate(zip(cols, labels)):
-        align = "right" if idx >= right_from_index else "left"
-        _grid_cell(col, label, align=align, emphasize=False)
-
-
-def _render_plain_grid_row(values, widths, *, right_from_index=1, emphasize=False):
-    cols = st.columns(widths)
-    for idx, (col, value) in enumerate(zip(cols, values)):
-        align = "right" if idx >= right_from_index else "left"
-        _grid_cell(col, value, align=align, emphasize=emphasize)
+def _render_html_scroll_table(headers, rows, *, right_align_from: int = 1, variant: str = "") -> None:
+    """Render a budget grid as one HTML table (works on narrow mobile screens)."""
+    wrap_classes = "hs-budget-table-wrap"
+    if variant:
+        wrap_classes += f" {html.escape(variant)}"
+    head_cells = []
+    for idx, label in enumerate(headers):
+        cls = "num" if idx >= right_align_from else ""
+        head_cells.append(f'<th class="{cls}">{html.escape(str(label))}</th>')
+    body_parts = []
+    for row in rows:
+        cells = row.get("cells", [])
+        tr_classes = []
+        if row.get("emphasize"):
+            tr_classes.append("emphasis")
+        if row.get("parent"):
+            tr_classes.append("parent")
+        if row.get("indent"):
+            tr_classes.append("indent")
+        tr_attr = f' class="{" ".join(tr_classes)}"' if tr_classes else ""
+        td_parts = []
+        for idx, cell in enumerate(cells):
+            cls = "num" if idx >= right_align_from else ""
+            td_parts.append(f'<td class="{cls}">{html.escape(str(cell))}</td>')
+        body_parts.append(f"<tr{tr_attr}>{''.join(td_parts)}</tr>")
+    st.markdown(
+        f'<div class="{wrap_classes}"><table class="hs-budget-table">'
+        f"<thead><tr>{''.join(head_cells)}</tr></thead>"
+        f"<tbody>{''.join(body_parts)}</tbody></table></div>",
+        unsafe_allow_html=True,
+    )
 
 
 def _format_ledger_amount(amount) -> str:
@@ -326,29 +346,6 @@ def _purchase_counts_by_category(expenses_df, selected_month) -> dict:
     if filtered.empty:
         return {}
     return filtered.groupby("category_id").size().to_dict()
-
-
-def _render_ledger_column_header() -> None:
-    _render_plain_grid_header(
-        ["Category", "Qty", "Projected", "Actual", "Difference"],
-        LEDGER_COL_WIDTHS,
-    )
-
-
-def _render_ledger_line(name, projected, actual, *, purchase_count=0, indent=False, emphasize=False) -> None:
-    prefix = "↳ " if indent else ""
-    _render_plain_grid_row(
-        [
-            f"{prefix}{name}",
-            _format_purchase_count(purchase_count),
-            _format_ledger_amount(projected),
-            _format_ledger_amount(actual),
-            _format_ledger_diff(projected, actual),
-        ],
-        LEDGER_COL_WIDTHS,
-        right_from_index=1,
-        emphasize=emphasize,
-    )
 
 
 def _render_household_budget_breakdown(
@@ -438,39 +435,55 @@ def _render_household_budget_breakdown(
         st.info("No budget data for the selected category.")
         return
 
-    _render_ledger_column_header()
-    _compact_divider()
-
+    table_rows = []
     for index, group in enumerate(visible_groups):
-        _render_ledger_line(
-            group["name"],
-            group["projected"],
-            group["actual"],
-            purchase_count=group.get("purchase_count", 0),
-            emphasize=False,
+        table_rows.append(
+            {
+                "cells": [
+                    group["name"],
+                    _format_purchase_count(group.get("purchase_count", 0)),
+                    _format_ledger_amount(group["projected"]),
+                    _format_ledger_amount(group["actual"]),
+                    _format_ledger_diff(group["projected"], group["actual"]),
+                ],
+                "parent": True,
+            }
         )
         for sub in group["subs"]:
-            _render_ledger_line(
-                sub["name"],
-                sub["projected"],
-                sub["actual"],
-                purchase_count=sub.get("purchase_count", 0),
-                indent=True,
+            table_rows.append(
+                {
+                    "cells": [
+                        sub["name"],
+                        _format_purchase_count(sub.get("purchase_count", 0)),
+                        _format_ledger_amount(sub["projected"]),
+                        _format_ledger_amount(sub["actual"]),
+                        _format_ledger_diff(sub["projected"], sub["actual"]),
+                    ],
+                    "indent": True,
+                }
             )
-
-        if index < len(visible_groups) - 1:
-            _compact_divider()
 
     total_projected = sum(float(group["projected"]) for group in visible_groups)
     total_actual = sum(float(group["actual"]) for group in visible_groups)
     total_purchases = sum(int(group.get("purchase_count", 0)) for group in visible_groups)
-    _compact_divider()
-    _render_ledger_line(
-        "Total",
-        total_projected,
-        total_actual,
-        purchase_count=total_purchases,
-        emphasize=True,
+    table_rows.append(
+        {
+            "cells": [
+                "Total",
+                _format_purchase_count(total_purchases),
+                _format_ledger_amount(total_projected),
+                _format_ledger_amount(total_actual),
+                _format_ledger_diff(total_projected, total_actual),
+            ],
+            "emphasize": True,
+        }
+    )
+
+    _render_html_scroll_table(
+        ["Category", "Qty", "Projected", "Actual", "Difference"],
+        table_rows,
+        right_align_from=1,
+        variant="ledger",
     )
 
 
@@ -509,25 +522,28 @@ def _render_income_streams_list(incomes_df, *, is_personal=False, annual_totals=
 
     if is_personal:
         headers = ["Source", "Net (Per Payment)", "Gross (Per Payment)", "Frequency", "Payment Date"]
-        widths = INCOME_COL_WIDTHS_PERSONAL
     else:
         headers = ["Source", "Earner", "Net (Per Payment)", "Gross (Per Payment)", "Frequency", "Payment Date"]
-        widths = INCOME_COL_WIDTHS
 
-    _render_plain_grid_header(headers, widths, right_from_index=1)
-    _compact_divider()
-
+    table_rows = []
     for _, row in incomes_df.iterrows():
-        values = [row.get("source_name", "—")]
+        cells = [row.get("source_name", "—")]
         if not is_personal:
-            values.append(row.get("owner_username", "—"))
-        values.extend([
+            cells.append(row.get("owner_username", "—"))
+        cells.extend([
             _format_ledger_amount(row.get("take_home_amount", 0)),
             _format_ledger_amount(row.get("gross_amount", 0)),
             income_pay_frequency_label(row.get("pay_frequency")),
             _format_payment_date(row.get("payment_date")),
         ])
-        _render_plain_grid_row(values, widths, right_from_index=1)
+        table_rows.append({"cells": cells})
+
+    _render_html_scroll_table(
+        headers,
+        table_rows,
+        right_align_from=1 if is_personal else 2,
+        variant="income",
+    )
 
     if annual_totals:
         st.divider()
@@ -538,12 +554,11 @@ def _render_sinking_funds_list(annual_df) -> None:
     if annual_df.empty:
         return
 
-    _render_plain_grid_header(["Subscription", "Monthly set-aside", "Annual cost"], SINKING_COL_WIDTHS)
     st.caption(
         "Monthly set-aside is the amount budgeted each month. Annual cost is that monthly amount × 12."
     )
-    st.divider()
 
+    table_rows = []
     for _, row in annual_df.iterrows():
         sub = row["sub_category_name"]
         if sub is None or (isinstance(sub, float) and pd.isna(sub)) or str(sub).strip() == "":
@@ -552,21 +567,22 @@ def _render_sinking_funds_list(annual_df) -> None:
             sub = str(sub)
         monthly_target = float(row["target_budget"])
         annual_target = monthly_target * 12
-        _render_plain_grid_row(
-            [sub, _format_ledger_amount(monthly_target), _format_ledger_amount(annual_target)],
-            SINKING_COL_WIDTHS,
-            right_from_index=1,
+        table_rows.append(
+            {
+                "cells": [
+                    sub,
+                    _format_ledger_amount(monthly_target),
+                    _format_ledger_amount(annual_target),
+                ],
+            }
         )
 
-
-def _render_expense_column_header(*, can_edit: bool) -> None:
-    widths = EXPENSE_COL_WIDTHS + ([EXPENSE_ACTION_COL_WIDTH] if can_edit else [])
-    cols = st.columns(widths)
-    headers = ["Date", "Category", "Sub-category", "Details", "Amount"]
-    for col, label in zip(cols[:5], headers):
-        _grid_cell(col, label, emphasize=False)
-    if can_edit:
-        _grid_cell(cols[5], "", emphasize=False)
+    _render_html_scroll_table(
+        ["Subscription", "Monthly set-aside", "Annual cost"],
+        table_rows,
+        right_align_from=1,
+        variant="sinking",
+    )
 
 
 def _render_expense_manage_rows(
@@ -583,46 +599,77 @@ def _render_expense_manage_rows(
     enriched = _enrich_expenses_with_categories(expenses_df, categories_df)
     sorted_df = enriched.sort_values("date_logged", ascending=False)
 
-    _render_expense_column_header(can_edit=can_edit)
-    _compact_divider()
-
-    row_widths = EXPENSE_COL_WIDTHS + ([EXPENSE_ACTION_COL_WIDTH] if can_edit else [])
-
+    table_rows = []
     for _, row in sorted_df.iterrows():
-        exp_id = row["id"]
         recurring_tag = " 🔄" if row.get("is_recurring", False) else ""
-        cols = st.columns(row_widths)
-        _grid_cell(cols[0], row["date_logged"])
-        _grid_cell(cols[1], row.get("category_name", "—"))
-        _grid_cell(cols[2], row.get("sub_category_name", "—"))
-        _grid_cell(cols[3], f"{row['details']}{recurring_tag}")
-        _grid_cell(cols[4], _format_ledger_amount(row["amount"]))
+        details_text = f"{row.get('details', '') or ''}{recurring_tag}".strip() or "—"
+        table_rows.append(
+            {
+                "cells": [
+                    row["date_logged"],
+                    row.get("category_name", "—"),
+                    row.get("sub_category_name", "—"),
+                    details_text,
+                    _format_ledger_amount(row["amount"]),
+                ],
+            }
+        )
 
-        if can_edit:
-            expense_popover_key = f"{key_prefix}_{exp_id}"
-            form_key = f"edit_form_{key_prefix}_{exp_id}"
-            with cols[5].popover("⚙️ Manage", key=manage_popover_key(expense_popover_key)):
-                st.markdown(f"**Edit: {row['details']}**")
-                with st.form(form_key):
-                    new_date = st.date_input("Date", value=datetime.strptime(row["date_logged"], "%Y-%m-%d"))
-                    new_amt = st.text_input("Amount ($)", value=str(row["amount"]))
-                    new_det = st.text_input("Details", value=row["details"])
-                    new_recur = st.checkbox("🔄 Is Recurring?", value=bool(row.get("is_recurring", False)))
-                    save_clicked = st.form_submit_button("💾 Save Changes", type="primary", width="stretch")
+    _render_html_scroll_table(
+        ["Date", "Category", "Sub-category", "Details", "Amount"],
+        table_rows,
+        right_align_from=4,
+        variant="expense",
+    )
 
-                if save_clicked:
-                    parsed_amt = _parse_currency_input(new_amt)
-                    if parsed_amt != "invalid" and new_det.strip():
-                        if update_expense(exp_id, parsed_amt, new_det, new_recur, date_logged=new_date):
-                            finish_manage_popover("expense_write", expense_popover_key)
-                        else:
-                            st.error("Could not update expense.")
-                    else:
-                        st.error("Invalid input.")
+    if not can_edit:
+        return
 
-                if st.button("❌ Delete Expense", key=f"del_{key_prefix}_{exp_id}", type="secondary", width="stretch"):
-                    if delete_expense(exp_id):
-                        finish_manage_popover("expense_write", expense_popover_key)
+    def _expense_label(row):
+        cat = row.get("category_name", "—")
+        amt = _format_ledger_amount(row.get("amount", 0))
+        det = (row.get("details") or "").strip()
+        base = f"{row.get('date_logged', '—')} · {cat} · {amt}"
+        return f"{base} · {det}" if det else base
+
+    edit_options = sorted_df.apply(_expense_label, axis=1).tolist()
+    with st.expander("🛠️ Edit or Delete Expense", expanded=False):
+        selected_label = st.selectbox(
+            "Select expense",
+            edit_options,
+            key=f"{key_prefix}_edit_select",
+        )
+        selected_idx = edit_options.index(selected_label)
+        target_row = sorted_df.iloc[selected_idx]
+        exp_id = target_row["id"]
+        form_key = f"edit_form_{key_prefix}_{exp_id}"
+
+        with st.form(form_key):
+            new_date = st.date_input(
+                "Date",
+                value=datetime.strptime(str(target_row["date_logged"])[:10], "%Y-%m-%d"),
+            )
+            new_amt = st.text_input("Amount ($)", value=str(target_row["amount"]))
+            new_det = st.text_input("Details", value=target_row.get("details") or "")
+            new_recur = st.checkbox("🔄 Is Recurring?", value=bool(target_row.get("is_recurring", False)))
+            save_clicked = st.form_submit_button("💾 Save Changes", type="primary", width="stretch")
+
+        if save_clicked:
+            parsed_amt = _parse_currency_input(new_amt)
+            if parsed_amt != "invalid":
+                if update_expense(exp_id, parsed_amt, new_det.strip(), new_recur, date_logged=new_date):
+                    st.rerun()
+            else:
+                st.error("Invalid amount.")
+
+        expense_delete_key = f"expense_{key_prefix}_{exp_id}"
+        if st.button("❌ Delete Expense", key=f"del_{key_prefix}_{exp_id}", type="secondary", width="stretch"):
+            arm_delete_confirm(expense_delete_key)
+            rerun_app_with_reason("delete_arm")
+
+        if render_delete_confirmation(expense_delete_key, item_label=selected_label):
+            if delete_expense(exp_id):
+                rerun_app_with_reason("delete_expense")
 
 
 def _render_income_management(
@@ -795,9 +842,14 @@ def _render_income_management(
                 ):
                     st.rerun()
 
+            income_delete_key = f"income_{form_key_prefix}_{target_income_id}"
             if delete_clicked:
+                arm_delete_confirm(income_delete_key)
+                rerun_app_with_reason("delete_arm")
+
+            if render_delete_confirmation(income_delete_key, item_label=edit_source):
                 if delete_household_income(target_income_id):
-                    st.rerun()
+                    rerun_app_with_reason("delete_income")
 
 
 def _render_family_member_budgets(household_id, selected_month, household_users):
@@ -1013,6 +1065,39 @@ def _plotly_chart_locked(fig, **kwargs):
     st.plotly_chart(fig, config=config, **kwargs)
 
 
+def _project_over_budget_amount(row) -> float:
+    est_high = _to_number(row.get("_est_high"), 0)
+    actual = _to_number(row.get("_actual"), 0)
+    if est_high <= 0:
+        return 0.0
+    return max(actual - est_high, 0.0)
+
+
+def _add_chart_corner_total(fig, total: float, *, label: str = "Total Over Budget") -> None:
+    if total <= 0:
+        return
+    fig.add_annotation(
+        xref="paper",
+        yref="paper",
+        x=0.99,
+        y=0.99,
+        xanchor="right",
+        yanchor="top",
+        text=f"{label}<br><b>{_format_money(total)}</b>",
+        showarrow=False,
+        bgcolor="rgba(255,255,255,0.92)",
+        bordercolor="#DC2626",
+        borderwidth=1,
+        borderpad=6,
+        font=dict(size=12, color="#991B1B"),
+    )
+
+
+def _apply_chart_currency_format(fig):
+    fig.update_yaxes(tickformat="$,.0f")
+    return fig
+
+
 def _render_two_col_selector(key: str, options: list, format_func=None):
     if not options:
         return None
@@ -1084,6 +1169,492 @@ def _extract_project_year(row, fallback_year):
     return fallback_year
 
 
+ANNUAL_REPORT_ACTIVE_KEY = "annual_report_active"
+ANNUAL_REPORT_SCOPE_KEY = "annual_report_scope"
+ANNUAL_REPORT_YEAR_KEY = "annual_report_year"
+ANNUAL_REPORT_MODE_KEY = "annual_report_mode"
+
+
+def is_annual_report_active() -> bool:
+    return bool(st.session_state.get(ANNUAL_REPORT_ACTIVE_KEY))
+
+
+def open_annual_report(scope: str, year: int, mode: str) -> None:
+    st.session_state[ANNUAL_REPORT_ACTIVE_KEY] = True
+    st.session_state[ANNUAL_REPORT_SCOPE_KEY] = scope
+    st.session_state[ANNUAL_REPORT_YEAR_KEY] = int(year)
+    st.session_state[ANNUAL_REPORT_MODE_KEY] = mode
+    rerun_app_with_reason("annual_report_open")
+
+
+def close_annual_report() -> None:
+    st.session_state.pop(ANNUAL_REPORT_ACTIVE_KEY, None)
+    st.session_state.pop(ANNUAL_REPORT_SCOPE_KEY, None)
+    st.session_state.pop(ANNUAL_REPORT_YEAR_KEY, None)
+    st.session_state.pop(ANNUAL_REPORT_MODE_KEY, None)
+
+
+def _period_month_list(year: int, mode: str) -> list:
+    today = date.today()
+    if mode == "ytd":
+        end_month = today.month if year == today.year else 12
+        return [f"{year}-{month:02d}" for month in range(1, end_month + 1)]
+    return [f"{year}-{month:02d}" for month in range(1, 13)]
+
+
+def _as_of_for_month(month_year: str, mode: str) -> date:
+    today = date.today()
+    year, month = map(int, month_year.split("-"))
+    _, last_day = calendar.monthrange(year, month)
+    if year == today.year and month == today.month:
+        return today
+    return date(year, month, last_day)
+
+
+def _build_period_summary(household_id, year, mode, scope, username=None, auth_user_id=None) -> dict:
+    months = _period_month_list(year, mode)
+    if not months:
+        months = [f"{year}-01"]
+
+    start_month = months[0]
+    end_month = months[-1]
+    is_personal = scope == "personal"
+
+    expenses_df = get_expenses_for_period(household_id, start_month, end_month)
+    incomes_df = get_household_incomes_for_period(
+        household_id,
+        start_month,
+        end_month,
+        is_personal_income=is_personal,
+        username=username if is_personal else None,
+    )
+    categories_df = get_budget_categories(
+        household_id,
+        is_personal=is_personal,
+        username=username if is_personal else None,
+    )
+
+    monthly_rows = []
+    total_income = 0.0
+    total_expenses = 0.0
+    total_project_spending = 0.0
+    income_by_source = {}
+    period_expense_frames = []
+
+    auth_user_id_str = str(auth_user_id) if auth_user_id else None
+
+    for month_year in months:
+        as_of = _as_of_for_month(month_year, mode)
+
+        if not expenses_df.empty and "month_year" in expenses_df.columns:
+            month_expenses = expenses_df[expenses_df["month_year"] == month_year].copy()
+        else:
+            month_expenses = pd.DataFrame()
+
+        if is_personal:
+            if not month_expenses.empty and "is_personal_spend" in month_expenses.columns:
+                month_expenses = month_expenses[month_expenses["is_personal_spend"] == True]
+            if not month_expenses.empty and auth_user_id_str and "auth_user_id" in month_expenses.columns:
+                month_expenses = month_expenses[
+                    month_expenses["auth_user_id"].astype(str) == auth_user_id_str
+                ]
+            expense_actual = _filter_expenses_for_actual_totals(month_expenses, month_year, as_of)
+        else:
+            if not month_expenses.empty and "is_personal_spend" in month_expenses.columns:
+                month_expenses = month_expenses[month_expenses["is_personal_spend"] == False]
+            hh_no_project = _exclude_system_category_expenses(month_expenses, categories_df)
+            expense_actual = _filter_expenses_for_actual_totals(hh_no_project, month_year, as_of)
+            hh_all = _filter_expenses_for_actual_totals(month_expenses, month_year, as_of)
+            _, project_df = _split_project_household_expenses(hh_all, categories_df)
+            total_project_spending += (
+                float(project_df["amount"].sum()) if not project_df.empty else 0.0
+            )
+
+        if not incomes_df.empty and "month_year" in incomes_df.columns:
+            month_incomes = incomes_df[incomes_df["month_year"] == month_year].copy()
+        else:
+            month_incomes = pd.DataFrame()
+
+        incomes_actual = _filter_incomes_for_actual_totals(month_incomes, month_year, as_of)
+        month_income = sum_income_for_month(incomes_actual, month_year)
+        month_expense_total = (
+            float(expense_actual["amount"].sum()) if not expense_actual.empty else 0.0
+        )
+
+        total_income += month_income
+        total_expenses += month_expense_total
+
+        monthly_rows.append(
+            {
+                "month_year": month_year,
+                "label": datetime.strptime(month_year, "%Y-%m").strftime("%b %Y"),
+                "income": month_income,
+                "expenses": month_expense_total,
+                "net": month_income - month_expense_total,
+            }
+        )
+
+        if not expense_actual.empty:
+            period_expense_frames.append(expense_actual)
+
+        if not incomes_actual.empty:
+            for _, row in incomes_actual.iterrows():
+                source = row.get("source_name") or "—"
+                freq = row.get("pay_frequency") or "monthly"
+                amt = normalize_income_amount_for_month(
+                    row.get("take_home_amount"), freq, month_year=month_year
+                )
+                income_by_source[source] = income_by_source.get(source, 0.0) + amt
+
+    all_period_expenses = (
+        pd.concat(period_expense_frames, ignore_index=True)
+        if period_expense_frames
+        else pd.DataFrame()
+    )
+    month_count = len(months)
+    exp_summary = (
+        all_period_expenses.groupby("category_id")["amount"].sum().reset_index()
+        if not all_period_expenses.empty
+        else pd.DataFrame(columns=["category_id", "amount"])
+    )
+    purchase_counts = (
+        all_period_expenses.groupby("category_id").size().to_dict()
+        if not all_period_expenses.empty
+        else {}
+    )
+
+    merged_df = pd.merge(
+        categories_df, exp_summary, left_on="id", right_on="category_id", how="left"
+    )
+    merged_df["actual_amount"] = merged_df["amount"].fillna(0.0)
+    merged_df = _exclude_system_categories(merged_df)
+
+    category_groups = []
+    for parent in merged_df["category_name"].unique():
+        parent_mask = merged_df["category_name"] == parent
+        parent_target = float(merged_df.loc[parent_mask, "target_budget"].sum()) * month_count
+        parent_actual = float(merged_df.loc[parent_mask, "actual_amount"].sum())
+        if parent_target == 0 and parent_actual == 0:
+            continue
+
+        sub_rows = []
+        parent_purchase_count = 0
+        for _, row in merged_df[parent_mask].iterrows():
+            target = float(row["target_budget"]) * month_count
+            actual = float(row["actual_amount"])
+            if target == 0 and actual == 0:
+                continue
+            cat_id = row["id"]
+            sub_purchase_count = int(purchase_counts.get(cat_id, 0))
+            parent_purchase_count += sub_purchase_count
+            sub_name = row.get("sub_category_name")
+            if (
+                sub_name is None
+                or (isinstance(sub_name, float) and pd.isna(sub_name))
+                or str(sub_name).strip() == ""
+            ):
+                sub_name = "(General)"
+            else:
+                sub_name = str(sub_name)
+            sub_rows.append(
+                {
+                    "name": sub_name,
+                    "projected": target,
+                    "actual": actual,
+                    "purchase_count": sub_purchase_count,
+                }
+            )
+
+        category_groups.append(
+            {
+                "name": parent,
+                "projected": parent_target,
+                "actual": parent_actual,
+                "purchase_count": parent_purchase_count,
+                "subs": sub_rows,
+            }
+        )
+
+    category_groups.sort(key=lambda group: group["name"].lower())
+
+    return {
+        "months": months,
+        "monthly_rows": monthly_rows,
+        "total_income": total_income,
+        "total_expenses": total_expenses,
+        "net_cash_flow": total_income - total_expenses,
+        "project_spending": total_project_spending if not is_personal else 0.0,
+        "category_groups": category_groups,
+        "income_by_source": income_by_source,
+        "month_count": month_count,
+    }
+
+
+def _render_period_category_breakdown(category_groups, filter_key: str) -> None:
+    if not category_groups:
+        st.info("No category activity for this period.")
+        return
+
+    category_options = ["All categories"] + [group["name"] for group in category_groups]
+    selected_category = st.selectbox("Category", category_options, key=filter_key)
+    visible_groups = (
+        category_groups
+        if selected_category == "All categories"
+        else [group for group in category_groups if group["name"] == selected_category]
+    )
+    if not visible_groups:
+        st.info("No budget data for the selected category.")
+        return
+
+    table_rows = []
+    for group in visible_groups:
+        table_rows.append(
+            {
+                "cells": [
+                    group["name"],
+                    _format_purchase_count(group.get("purchase_count", 0)),
+                    _format_ledger_amount(group["projected"]),
+                    _format_ledger_amount(group["actual"]),
+                    _format_ledger_diff(group["projected"], group["actual"]),
+                ],
+                "parent": True,
+            }
+        )
+        for sub in group["subs"]:
+            table_rows.append(
+                {
+                    "cells": [
+                        sub["name"],
+                        _format_purchase_count(sub.get("purchase_count", 0)),
+                        _format_ledger_amount(sub["projected"]),
+                        _format_ledger_amount(sub["actual"]),
+                        _format_ledger_diff(sub["projected"], sub["actual"]),
+                    ],
+                    "indent": True,
+                }
+            )
+
+    total_projected = sum(float(group["projected"]) for group in visible_groups)
+    total_actual = sum(float(group["actual"]) for group in visible_groups)
+    total_purchases = sum(int(group.get("purchase_count", 0)) for group in visible_groups)
+    table_rows.append(
+        {
+            "cells": [
+                "Total",
+                _format_purchase_count(total_purchases),
+                _format_ledger_amount(total_projected),
+                _format_ledger_amount(total_actual),
+                _format_ledger_diff(total_projected, total_actual),
+            ],
+            "emphasize": True,
+        }
+    )
+
+    _render_html_scroll_table(
+        ["Category", "Qty", "Projected", "Actual", "Difference"],
+        table_rows,
+        right_align_from=1,
+        variant="ledger",
+    )
+
+
+def _render_annual_report_launcher(scope: str, key_prefix: str) -> None:
+    if scope == "household" and not _can_access_monthly_module():
+        st.caption("Annual household reports are limited to family admins.")
+        return
+
+    household_id = st.session_state.get("household_id")
+    app_tz = ZoneInfo(st.secrets.get("app_config", {}).get("timezone", "America/New_York"))
+    current_year = pd.Timestamp.now(tz=app_tz).year
+    available_years = get_distinct_budget_years(household_id) if household_id else [current_year]
+    full_year_options = [year for year in available_years if year != current_year]
+
+    st.markdown("##### Year-to-Date Performance")
+    if st.button(
+        f"Open YTD {current_year}",
+        key=f"{key_prefix}_ytd_{current_year}",
+        type="primary",
+        width="stretch",
+    ):
+        open_annual_report(scope, current_year, "ytd")
+
+    st.markdown("##### Full Calendar Years")
+    if not full_year_options:
+        st.caption("Full-year reports are available for prior calendar years once data is logged.")
+        return
+
+    cols_per_row = 4
+    for row_start in range(0, len(full_year_options), cols_per_row):
+        row_years = full_year_options[row_start : row_start + cols_per_row]
+        year_cols = st.columns(len(row_years))
+        for col, year in zip(year_cols, row_years):
+            with col:
+                if st.button(str(year), key=f"{key_prefix}_year_{year}", width="stretch"):
+                    open_annual_report(scope, year, "full")
+
+
+def _render_annual_report_page(show_back_to_hub=False) -> None:
+    scope = st.session_state.get(ANNUAL_REPORT_SCOPE_KEY, "household")
+    year = int(st.session_state.get(ANNUAL_REPORT_YEAR_KEY, date.today().year))
+    mode = st.session_state.get(ANNUAL_REPORT_MODE_KEY, "ytd")
+    can_access_monthly = _can_access_monthly_module()
+
+    if scope == "household" and not can_access_monthly:
+        st.warning("You do not have permission to view household annual reports.")
+        if st.button("⬅️ Back to Budget Modules", key="annual_report_access_denied"):
+            close_annual_report()
+            rerun_app_with_reason("annual_report_close")
+        return
+
+    household_id = st.session_state.get("household_id")
+    username = st.session_state.get("username", "User")
+    auth_user_id = st.session_state.get("auth_user_id")
+
+    back_label = (
+        "⬅️ Back to Personal Ledger"
+        if scope == "personal"
+        else "⬅️ Back to Household Master Ledger"
+    )
+    nav_col, print_col = st.columns([3, 1])
+    with nav_col:
+        if st.button(back_label, key="annual_report_back"):
+            close_annual_report()
+            rerun_app_with_reason("annual_report_close")
+    with print_col:
+        if st.button("🖨️ Print Report", key="annual_report_print", width="stretch"):
+            if streamlit_js_eval:
+                streamlit_js_eval(js_expressions="window.print()", key="annual_report_print_js")
+
+    period_label = "Year-to-Date Summary" if mode == "ytd" else "Full Year Summary"
+    scope_label = (
+        f"👤 {username.title()}'s Personal Budget"
+        if scope == "personal"
+        else "🏦 Household Budget"
+    )
+    st.subheader(f"📈 {year} {period_label}")
+    st.caption(scope_label)
+
+    if not household_id:
+        st.info("No household selected.")
+        return
+
+    summary = _build_period_summary(
+        household_id,
+        year,
+        mode,
+        scope,
+        username=username if scope == "personal" else None,
+        auth_user_id=auth_user_id,
+    )
+
+    if scope == "household":
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Total Income", f"${summary['total_income']:,.2f}")
+        m2.metric("Total Shared Expenses", f"${summary['total_expenses']:,.2f}")
+        _render_signed_currency_metric(m3, "Net Cash Flow", summary["net_cash_flow"])
+        m4.metric(
+            "Project Spending",
+            f"${summary['project_spending']:,.2f}",
+            help="Informational only — not included in shared expenses or net cash flow.",
+        )
+    else:
+        p1, p2, p3 = st.columns(3)
+        p1.metric("Total Income", f"${summary['total_income']:,.2f}")
+        p2.metric("Total Personal Spend", f"${summary['total_expenses']:,.2f}")
+        _render_signed_currency_metric(p3, "Net Personal Cash Flow", summary["net_cash_flow"])
+
+    st.divider()
+    st.markdown("#### Monthly Trend")
+
+    monthly_rows = summary["monthly_rows"]
+    if monthly_rows:
+        labels = [row["label"] for row in monthly_rows]
+        fig = go.Figure(
+            data=[
+                go.Bar(name="Income", x=labels, y=[row["income"] for row in monthly_rows], marker_color="#21c354"),
+                go.Bar(
+                    name="Expenses",
+                    x=labels,
+                    y=[row["expenses"] for row in monthly_rows],
+                    marker_color="#ff4b4b",
+                ),
+            ]
+        )
+        fig.update_layout(
+            barmode="group",
+            xaxis_title="Month",
+            yaxis_title="Amount ($)",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            margin=dict(l=20, r=20, t=40, b=20),
+            height=360,
+        )
+        _plotly_chart_locked(fig, width="stretch")
+    else:
+        st.info("No monthly data for this period.")
+
+    st.markdown("#### Monthly Summary")
+    if monthly_rows:
+        month_table_rows = [
+            {
+                "cells": [
+                    row["label"],
+                    _format_ledger_amount(row["income"]),
+                    _format_ledger_amount(row["expenses"]),
+                    _format_ledger_diff(row["income"], row["expenses"]),
+                ],
+            }
+            for row in monthly_rows
+        ]
+        month_table_rows.append(
+            {
+                "cells": [
+                    "Total",
+                    _format_ledger_amount(summary["total_income"]),
+                    _format_ledger_amount(summary["total_expenses"]),
+                    _format_ledger_diff(summary["total_income"], summary["total_expenses"]),
+                ],
+                "emphasize": True,
+            }
+        )
+        _render_html_scroll_table(
+            ["Month", "Income", "Expenses", "Net"],
+            month_table_rows,
+            right_align_from=1,
+            variant="ledger",
+        )
+    else:
+        st.info("No monthly summary available.")
+
+    st.divider()
+    st.markdown("#### Category Breakdown")
+    filter_key = "annual_report_hh_category" if scope == "household" else "annual_report_pers_category"
+    _render_period_category_breakdown(summary["category_groups"], filter_key)
+
+    income_by_source = summary.get("income_by_source") or {}
+    if income_by_source:
+        st.divider()
+        st.markdown("#### Income by Source")
+        source_rows = [
+            {
+                "cells": [source, _format_ledger_amount(amount)],
+            }
+            for source, amount in sorted(income_by_source.items(), key=lambda item: item[0].lower())
+        ]
+        source_total = sum(income_by_source.values())
+        source_rows.append(
+            {
+                "cells": ["Total", _format_ledger_amount(source_total)],
+                "emphasize": True,
+            }
+        )
+        _render_html_scroll_table(
+            ["Source", "Total"],
+            source_rows,
+            right_align_from=1,
+            variant="income",
+        )
+
+
 def _can_access_projects_module():
     role = st.session_state.get("user_role", "member")
     if role in ["admin", "developer"]:
@@ -1131,8 +1702,10 @@ def _render_budget_fragment(show_back_to_hub=False):
         st.session_state["wishlist_active_owner"] = None
     if "wishlist_pending_owner" not in st.session_state:
         st.session_state["wishlist_pending_owner"] = None
-    if "wishlist_active_section" not in st.session_state:
-        st.session_state["wishlist_active_section"] = "active"
+
+    if is_annual_report_active():
+        _render_annual_report_page(show_back_to_hub)
+        return
 
     view = st.session_state["budget_view"]
     can_access_projects = _can_access_projects_module()
@@ -1301,21 +1874,6 @@ def _render_budget_fragment(show_back_to_hub=False):
         filtered_active_rows = [r for r in active_rows if get_row_owner_username(r) == selected_owner]
         filtered_completed_rows = [r for r in completed_rows if get_row_owner_username(r) == selected_owner]
 
-        wishlist_section_keys = ["active", "completed"]
-        if st.session_state.get("wishlist_active_section") not in wishlist_section_keys:
-            st.session_state["wishlist_active_section"] = "active"
-
-        def wishlist_section_label(section_key):
-            if section_key == "active":
-                return f"🛍️ Active ({len(filtered_active_rows)})"
-            return f"✅ Completed ({len(filtered_completed_rows)})"
-
-        selected_wishlist_section = _render_two_col_selector(
-            key="wishlist_active_section",
-            options=wishlist_section_keys,
-            format_func=wishlist_section_label,
-        )
-
         with st.expander("➕ Add Wish List Item", expanded=False):
             with st.form("add_wishlist_item_form", clear_on_submit=True):
                 a1, a2 = st.columns([2, 1])
@@ -1363,11 +1921,9 @@ def _render_budget_fragment(show_back_to_hub=False):
                         else:
                             st.error("Could not add wish list item.")
 
-        if selected_wishlist_section == "active":
-            if not filtered_active_rows:
-                st.info(f"No active wish list items for {selected_owner} yet.")
-                return
-
+        if not filtered_active_rows:
+            st.info(f"No active wish list items for {selected_owner} yet.")
+        else:
             for row in filtered_active_rows:
                 row_id = row.get("id")
                 if row_id is None:
@@ -1456,35 +2012,40 @@ def _render_budget_fragment(show_back_to_hub=False):
                                     st.error("Could not complete this wish list item.")
 
                             if delete_clicked:
-                                if delete_wish_list_item(str(row_id)):
-                                    finish_manage_popover("wishlist_write", wishlist_popover_key)
-                                else:
-                                    st.error("Could not delete this wish list item.")
+                                arm_delete_confirm(f"wishlist_{row_id}")
+                                finish_manage_popover("delete_arm", wishlist_popover_key)
 
                             if cancel_clicked:
                                 finish_manage_popover("wishlist_edit_cancel", wishlist_popover_key)
 
+                    wishlist_delete_key = f"wishlist_{row_id}"
+                    if render_delete_confirmation(wishlist_delete_key, item_label=item_name):
+                        if delete_wish_list_item(str(row_id)):
+                            rerun_app_with_reason("wishlist_delete")
+                        else:
+                            st.error("Could not delete this wish list item.")
+
                 st.divider()
-        else:
+
+        with st.expander(f"✅ Completed ({len(filtered_completed_rows)})", expanded=False):
             if not filtered_completed_rows:
                 st.info(f"No completed wish list items for {selected_owner} yet.")
-                return
-
-            for row in filtered_completed_rows:
-                completed_name = row.get("item") or "Unnamed Item"
-                completed_actual = row.get("actual_cost")
-                completed_editable = can_edit_wish_row(row)
-                col_text, col_action = st.columns([6, 1])
-                col_text.caption(f"{completed_name}")
-                if completed_actual is not None:
-                    col_text.caption(f"Actual: {_format_money(completed_actual)}")
-                if completed_editable:
-                    if col_action.button("↩️ Restore", key=f"restore_wishlist_{row.get('id')}", width="stretch"):
-                        if restore_wish_list_item(str(row.get("id"))):
-                            st.success("Wish list item restored.")
-                            st.rerun()
-                        else:
-                            st.error("Could not restore this wish list item.")
+            else:
+                for row in filtered_completed_rows:
+                    completed_name = row.get("item") or "Unnamed Item"
+                    completed_actual = row.get("actual_cost")
+                    completed_editable = can_edit_wish_row(row)
+                    col_text, col_action = st.columns([6, 1])
+                    col_text.caption(f"{completed_name}")
+                    if completed_actual is not None:
+                        col_text.caption(f"Actual: {_format_money(completed_actual)}")
+                    if completed_editable:
+                        if col_action.button("↩️ Restore", key=f"restore_wishlist_{row.get('id')}", width="stretch"):
+                            if restore_wish_list_item(str(row.get("id"))):
+                                st.success("Wish list item restored.")
+                                st.rerun()
+                            else:
+                                st.error("Could not restore this wish list item.")
 
         return
 
@@ -1645,9 +2206,7 @@ def _render_budget_fragment(show_back_to_hub=False):
 
             # 🟢 NEW: Annual Reports Footer
             with st.expander("📈 Annual Reports & YTD Summary"):
-                st.markdown("##### Year-to-Date Performance")
-                st.caption("YTD aggregations and charting logic will go here.")
-                # We will write the complex SQL lookbacks for this next!
+                _render_annual_report_launcher("household", "hh_annual")
                 
         # --- TAB 2: LOG EXPENSE (HOUSEHOLD) ---
         elif household_view_mode == "💳 Expenses":
@@ -1830,9 +2389,14 @@ def _render_budget_fragment(show_back_to_hub=False):
                                 if update_budget_category(target_cat_id, edit_parent, edit_sub, parsed_target):
                                     rerun_app_with_reason("category_write")
 
+                        hh_cat_delete_key = f"hh_category_{target_cat_id}"
                         if delete_clicked:
+                            arm_delete_confirm(hh_cat_delete_key)
+                            rerun_app_with_reason("delete_arm")
+
+                        if render_delete_confirmation(hh_cat_delete_key, item_label=selected_edit_str):
                             if delete_budget_category(target_cat_id):
-                                rerun_app_with_reason("category_write")
+                                rerun_app_with_reason("category_delete")
                     else:
                         st.caption("No categories found to edit.")
 
@@ -1963,8 +2527,7 @@ def _render_budget_fragment(show_back_to_hub=False):
                         _render_sinking_funds_list(annual_df)
 
             with st.expander("📈 Annual Reports & YTD Summary"):
-                st.markdown("##### Year-to-Date Performance")
-                st.caption("YTD aggregations and charting logic will go here.")
+                _render_annual_report_launcher("personal", "pers_annual")
 
             st.divider()
 
@@ -2107,9 +2670,14 @@ def _render_budget_fragment(show_back_to_hub=False):
                                 if update_budget_category(target_cat_id, edit_parent, edit_sub, parsed_target):
                                     rerun_app_with_reason("category_write")
 
+                        pers_cat_delete_key = f"pers_category_{target_cat_id}"
                         if delete_clicked:
+                            arm_delete_confirm(pers_cat_delete_key)
+                            rerun_app_with_reason("delete_arm")
+
+                        if render_delete_confirmation(pers_cat_delete_key, item_label=selected_edit_str):
                             if delete_budget_category(target_cat_id):
-                                rerun_app_with_reason("category_write")
+                                rerun_app_with_reason("category_delete")
                     else:
                         st.caption("No categories found to edit.")                    
                                 
@@ -2329,53 +2897,44 @@ def _render_budget_fragment(show_back_to_hub=False):
 
         st.caption(f"Dashboard is scoped to calendar year {selected_year} ({app_tz.key}). Other years are available in archive below.")
 
-        if yearly_active_projects:
-            overview_df = pd.DataFrame(yearly_active_projects)
-            category_df = overview_df.groupby("category", as_index=False)["_est_high"].sum()
+        yearly_total_est_low = sum(r.get("_est_low", 0) for r in yearly_projects)
+        yearly_total_est_high = sum(r.get("_est_high", 0) for r in yearly_projects)
+        yearly_total_actual = yearly_active_total_actual + yearly_completed_total_actual
+        yearly_budget_utilization = (
+            (yearly_total_actual / yearly_total_est_high * 100) if yearly_total_est_high > 0 else None
+        )
 
-            chart_col1, chart_col2 = st.columns(2)
+        active_over_total = sum(_project_over_budget_amount(r) for r in yearly_active_projects)
+        completed_over_total = sum(_project_over_budget_amount(r) for r in yearly_completed_projects)
+        active_over_count = sum(1 for r in yearly_active_projects if _project_over_budget_amount(r) > 0)
+        completed_over_count = sum(1 for r in yearly_completed_projects if _project_over_budget_amount(r) > 0)
 
-            with chart_col1:
-                if not category_df.empty and category_df["_est_high"].sum() > 0:
-                    fig_donut = px.pie(
-                        category_df,
-                        values="_est_high",
-                        names="category",
-                        hole=0.45,
-                        title="Active Est. High by Category",
-                    )
-                    fig_donut.update_traces(textposition="inside", textinfo="percent+label")
-                    _plotly_chart_locked(fig_donut)
-                else:
-                    st.info("Add estimated high values to render category distribution.")
+        st.markdown(f"#### {selected_year} Year at a Glance")
+        y1, y2, y3, y4 = st.columns(4)
+        y1.metric(f"{selected_year} Est. Low (All)", _format_money(yearly_total_est_low))
+        y2.metric(f"{selected_year} Est. High (All)", _format_money(yearly_total_est_high))
+        y3.metric(f"{selected_year} Actual Spent (All)", _format_money(yearly_total_actual))
+        y4.metric(
+            f"{selected_year} Completed Final",
+            _format_money(yearly_completed_total_actual),
+            help="Final actual spend on projects completed during this calendar year.",
+        )
 
-            with chart_col2:
-                tree_df = overview_df[overview_df["_est_high"] > 0]
-                if not tree_df.empty:
-                    fig_tree = px.treemap(
-                        tree_df,
-                        path=["category", "item"],
-                        values="_est_high",
-                        title="Active Project Cost Hierarchy",
-                        color="category",
-                    )
-                    _plotly_chart_locked(fig_tree)
-                else:
-                    st.info("Treemap appears once active projects have estimated high values.")
+        y5, y6, y7, y8 = st.columns(4)
+        y5.metric("Active Projects", len(yearly_active_projects))
+        y6.metric("Completed Projects", len(yearly_completed_projects))
+        y7.metric(
+            "Budget Utilization",
+            f"{yearly_budget_utilization:.0f}%" if yearly_budget_utilization is not None else "—",
+            help="Actual spent divided by total estimated high across all projects in this year.",
+        )
+        y8.metric(
+            "Over Budget Projects",
+            f"{active_over_count + completed_over_count}",
+            help=f"{active_over_count} active · {completed_over_count} completed",
+        )
 
-            category_costs = overview_df.groupby("category", as_index=False)[["_est_low", "_est_high", "_actual"]].sum()
-            if not category_costs.empty:
-                fig_bar = go.Figure(
-                    data=[
-                        go.Bar(name="Est. Low", x=category_costs["category"], y=category_costs["_est_low"], marker_color="#22C55E"),
-                        go.Bar(name="Est. High", x=category_costs["category"], y=category_costs["_est_high"], marker_color="#DC2626"),
-                        go.Bar(name="Actual", x=category_costs["category"], y=category_costs["_actual"], marker_color="#0EA5E9"),
-                    ]
-                )
-                fig_bar.update_layout(title=f"Active Projects ({selected_year}): Estimates vs Actual", barmode="group")
-                _plotly_chart_locked(fig_bar)
-        else:
-            st.info(f"No active projects found for {selected_year}.")
+        st.divider()
 
         status_counts_df = pd.DataFrame(
             [
@@ -2399,18 +2958,69 @@ def _render_budget_fragment(show_back_to_hub=False):
         else:
             st.info(f"No projects found for {selected_year}.")
 
-        # Over-budget rollups for the selected year
-        active_over_budget_rows = []
-        for r in yearly_active_projects:
-            over_amt = max(r.get("_actual", 0) - r.get("_est_high", 0), 0)
-            if over_amt > 0:
-                active_over_budget_rows.append({"Project": r.get("item") or "Unnamed", "Over Budget": over_amt})
+        if yearly_projects:
+            overview_all_df = pd.DataFrame(yearly_projects)
+            category_costs = overview_all_df.groupby("category", as_index=False)[["_est_low", "_est_high", "_actual"]].sum()
+            if not category_costs.empty:
+                fig_bar = go.Figure(
+                    data=[
+                        go.Bar(
+                            name="Est. Low",
+                            x=category_costs["category"],
+                            y=category_costs["_est_low"],
+                            marker_color="#22C55E",
+                            text=[_format_money(v) for v in category_costs["_est_low"]],
+                            textposition="outside",
+                        ),
+                        go.Bar(
+                            name="Est. High",
+                            x=category_costs["category"],
+                            y=category_costs["_est_high"],
+                            marker_color="#DC2626",
+                            text=[_format_money(v) for v in category_costs["_est_high"]],
+                            textposition="outside",
+                        ),
+                        go.Bar(
+                            name="Actual",
+                            x=category_costs["category"],
+                            y=category_costs["_actual"],
+                            marker_color="#0EA5E9",
+                            text=[_format_money(v) for v in category_costs["_actual"]],
+                            textposition="outside",
+                        ),
+                    ]
+                )
+                fig_bar.update_layout(
+                    title=f"{selected_year} Projects (Active + Completed): Estimates vs Actual by Category",
+                    barmode="group",
+                    xaxis_title="Category",
+                    yaxis_title="Amount ($)",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    margin=dict(t=60, b=40),
+                )
+                _apply_chart_currency_format(fig_bar)
+                _plotly_chart_locked(fig_bar, width="stretch")
+        else:
+            st.info(f"No projects in scope for {selected_year} with the selected categories.")
 
-        completed_over_budget_rows = []
-        for r in yearly_completed_projects:
-            over_amt = max(r.get("_actual", 0) - r.get("_est_high", 0), 0)
-            if over_amt > 0:
-                completed_over_budget_rows.append({"Project": r.get("item") or "Unnamed", "Over Budget": over_amt})
+        active_over_budget_rows = [
+            {
+                "Project": r.get("item") or "Unnamed",
+                "Over Budget": _project_over_budget_amount(r),
+            }
+            for r in yearly_active_projects
+            if _project_over_budget_amount(r) > 0
+        ]
+
+        completed_over_budget_rows = [
+            {
+                "category": r.get("category") or "Uncategorized",
+                "Project": r.get("item") or "Unnamed",
+                "Over Budget": _project_over_budget_amount(r),
+            }
+            for r in yearly_completed_projects
+            if _project_over_budget_amount(r) > 0
+        ]
 
         over_col1, over_col2 = st.columns(2)
         with over_col1:
@@ -2423,8 +3033,12 @@ def _render_budget_fragment(show_back_to_hub=False):
                     y="Over Budget",
                     color_discrete_sequence=["#DC2626"],
                     title="Active Projects Over Budget",
+                    text="Over Budget",
                 )
-                fig_active_over.update_layout(xaxis_title="", yaxis_title="Over Budget ($)")
+                fig_active_over.update_traces(texttemplate="$%{y:,.0f}", textposition="outside")
+                fig_active_over.update_layout(xaxis_title="", yaxis_title="Over Budget ($)", margin=dict(t=60, b=80))
+                _apply_chart_currency_format(fig_active_over)
+                _add_chart_corner_total(fig_active_over, active_over_total)
                 _plotly_chart_locked(fig_active_over, width="stretch")
             else:
                 st.info("No active projects are over budget for this year.")
@@ -2432,26 +3046,80 @@ def _render_budget_fragment(show_back_to_hub=False):
         with over_col2:
             st.markdown(f"#### Completed Over Budget ({selected_year})")
             if completed_over_budget_rows:
-                completed_over_df = pd.DataFrame(completed_over_budget_rows).sort_values(by="Over Budget", ascending=False)
+                completed_over_df = pd.DataFrame(completed_over_budget_rows)
                 fig_completed_over = px.bar(
                     completed_over_df,
-                    x="Project",
+                    x="category",
                     y="Over Budget",
-                    color_discrete_sequence=["#B91C1C"],
-                    title="Completed Projects Over Budget",
+                    color="Project",
+                    title="Completed Over Budget by Category",
+                    text="Over Budget",
+                    barmode="stack",
                 )
-                fig_completed_over.update_layout(xaxis_title="", yaxis_title="Over Budget ($)")
+                fig_completed_over.update_traces(texttemplate="$%{y:,.0f}", textposition="inside")
+                fig_completed_over.update_layout(
+                    xaxis_title="Category",
+                    yaxis_title="Over Budget ($)",
+                    legend=dict(title="Project", orientation="v"),
+                    margin=dict(t=60, b=40),
+                )
+                _apply_chart_currency_format(fig_completed_over)
+                _add_chart_corner_total(fig_completed_over, completed_over_total)
                 _plotly_chart_locked(fig_completed_over, width="stretch")
             else:
                 st.info("No completed projects are over budget for this year.")
 
-        st.divider()
-        o1, o2, o3 = st.columns(3)
-        o1.metric(f"{selected_year} Active Est. Low", f"${yearly_active_total_low:,.2f}")
-        o2.metric(f"{selected_year} Active Est. High", f"${yearly_active_total_high:,.2f}")
-        o3.metric(f"{selected_year} Active Actual Spent", f"${yearly_active_total_actual:,.2f}")
-        st.metric(f"{selected_year} Completed Projects (Final Dollars)", f"${yearly_completed_total_actual:,.2f}")
+        if yearly_active_projects:
+            overview_df = pd.DataFrame(yearly_active_projects)
+            chart_col1, chart_col2 = st.columns(2)
 
+            with chart_col1:
+                category_df = overview_df.groupby("category", as_index=False)["_est_high"].sum()
+                if not category_df.empty and category_df["_est_high"].sum() > 0:
+                    fig_donut = px.pie(
+                        category_df,
+                        values="_est_high",
+                        names="category",
+                        hole=0.45,
+                        title=f"Active Est. High by Category ({selected_year})",
+                    )
+                    fig_donut.update_traces(
+                        textposition="inside",
+                        textinfo="percent+label",
+                        hovertemplate="%{label}<br>Est. High: $%{value:,.0f}<br>%{percent}<extra></extra>",
+                    )
+                    _plotly_chart_locked(fig_donut)
+                else:
+                    st.info("Add estimated high values to render category distribution.")
+
+            with chart_col2:
+                tree_df = overview_df[overview_df["_est_high"] > 0].copy()
+                if not tree_df.empty:
+                    tree_df["remaining"] = tree_df["_est_high"] - tree_df["_actual"]
+                    fig_tree = px.treemap(
+                        tree_df,
+                        path=["category", "item"],
+                        values="_est_high",
+                        title=f"Active Project Cost Hierarchy ({selected_year})",
+                        color="category",
+                        custom_data=["_est_low", "_est_high", "_actual", "remaining"],
+                    )
+                    fig_tree.update_traces(
+                        hovertemplate=(
+                            "<b>%{label}</b><br>"
+                            "Est. Low: $%{customdata[0]:,.0f}<br>"
+                            "Est. High: $%{customdata[1]:,.0f}<br>"
+                            "Actual: $%{customdata[2]:,.0f}<br>"
+                            "Remaining: $%{customdata[3]:,.0f}<extra></extra>"
+                        )
+                    )
+                    _plotly_chart_locked(fig_tree)
+                else:
+                    st.info("Treemap appears once active projects have estimated high values.")
+        else:
+            st.info(f"No active projects found for {selected_year}.")
+
+        st.divider()
         with st.expander("🗂️ Previous Years Archive", expanded=False):
             st.caption("Review historical calendar-year totals.")
 
@@ -2512,17 +3180,16 @@ def _render_budget_fragment(show_back_to_hub=False):
                     pass
             st.caption(history_line)
 
-        st.divider()
-
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Est. Total Low", f"${active_total_low:,.2f}")
-        k2.metric("Est. Total High", f"${active_total_high:,.2f}")
-        k3.metric(f"{current_year} Actual Spent", f"${current_year_total_actual:,.2f}")
         remaining_color = "#16A34A" if remaining_funds >= 0 else "#DC2626"
-        k4.markdown("**Remaining Funds**")
-        k4.markdown(
-            f"<div style='font-size:1.5rem; font-weight:700; color:{remaining_color};'>{_format_money(remaining_funds)}</div>",
+        st.markdown(
+            f"**Remaining Project Funds ({current_year}):** "
+            f"<span style='font-size:1.25rem; font-weight:700; color:{remaining_color};'>"
+            f"{_format_money(remaining_funds)}</span>",
             unsafe_allow_html=True,
+        )
+        st.caption(
+            f"Based on {_format_money(current_year_total_actual)} spent across all "
+            f"{current_year} projects (active + completed)."
         )
 
         st.divider()
@@ -2628,6 +3295,22 @@ def _render_budget_fragment(show_back_to_hub=False):
                         f"Actual: {_format_money(actual)}",
                         unsafe_allow_html=True,
                     )
+                    if est_high > 0:
+                        pct_used = min(actual / est_high * 100, 999)
+                        left_col.caption(f"Budget used: {pct_used:.0f}% of est. high ({_format_money(actual)} / {_format_money(est_high)})")
+                        if actual > est_high:
+                            left_col.markdown(
+                                f"**Over budget by:** <span style='color:#DC2626; font-weight:700;'>{_format_money(actual - est_high)}</span>",
+                                unsafe_allow_html=True,
+                            )
+                        else:
+                            left_col.markdown(
+                                f"**Under budget by:** <span style='color:#16A34A; font-weight:700;'>{_format_money(est_high - actual)}</span>",
+                                unsafe_allow_html=True,
+                            )
+                    elif est_low > 0:
+                        left_col.caption(f"Tracking against est. low: {_format_money(actual)} / {_format_money(est_low)}")
+
                     if remaining_balance is not None:
                         remaining_color = "#16A34A" if remaining_balance >= 0 else "#DC2626"
                         left_col.markdown(
@@ -2731,9 +3414,10 @@ def _render_budget_fragment(show_back_to_hub=False):
                                     cleaned_edit_notes = notes.replace(COMPLETED_TAG, "").strip()
                                     e_notes = st.text_area("Notes", value=cleaned_edit_notes)
 
-                                    save_col, complete_col = st.columns(2)
+                                    save_col, complete_col, delete_col = st.columns([2, 1, 1])
                                     save_clicked = save_col.form_submit_button("💾 Save", type="primary", width="stretch")
                                     complete_clicked = complete_col.form_submit_button("✅ Complete Project", width="stretch")
+                                    delete_clicked = delete_col.form_submit_button("🗑️ Delete", width="stretch")
 
                                 if save_clicked or complete_clicked:
                                     parsed_low = _parse_currency_input(e_est_low_raw)
@@ -2761,6 +3445,17 @@ def _render_budget_fragment(show_back_to_hub=False):
                                             finish_manage_popover("project_write", project_popover_key)
                                         else:
                                             st.error("Could not update project.")
+
+                                project_delete_key = f"project_{project_id}"
+                                if delete_clicked:
+                                    arm_delete_confirm(project_delete_key)
+                                    rerun_app_with_reason("delete_arm")
+
+                                if render_delete_confirmation(project_delete_key, item_label=title):
+                                    if delete_project_budget_item(project_id):
+                                        finish_manage_popover("project_delete", project_popover_key)
+                                    else:
+                                        st.error("Could not delete this project.")
 
             def render_tab_totals(project_rows):
                 tab_est_low = sum(p.get("_est_low", 0) for p in project_rows)

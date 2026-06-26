@@ -888,6 +888,108 @@ def get_monthly_expenses(household_id, month_year, include_private_members=True)
         print(f"Error fetching expenses: {e}")
         return pd.DataFrame()
 
+
+def get_expenses_for_period(household_id, start_month, end_month, include_private_members=True):
+    """Fetch and decrypt expenses whose month_year falls within [start_month, end_month]."""
+    target_table = get_budget_table("expenses")
+    try:
+        response = (
+            supabase.table(target_table)
+            .select("*")
+            .eq("household_id", household_id)
+            .gte("month_year", start_month)
+            .lte("month_year", end_month)
+            .execute()
+        )
+        if not response.data:
+            return pd.DataFrame()
+
+        if not include_private_members:
+            pass
+
+        for row in response.data:
+            row["amount"] = decrypt_float(row.get("amount"))
+            row["details"] = decrypt_text(row.get("details"))
+
+        return pd.DataFrame(response.data)
+    except Exception as e:
+        print(f"Error fetching expenses for period: {e}")
+        return pd.DataFrame()
+
+
+def get_household_incomes_for_period(
+    household_id,
+    start_month,
+    end_month,
+    is_personal_income=False,
+    username=None,
+):
+    """Fetch and decrypt incomes whose month_year falls within [start_month, end_month]."""
+    target_table = get_budget_table("household_incomes")
+    try:
+        query = (
+            supabase.table(target_table)
+            .select("*")
+            .eq("household_id", household_id)
+            .gte("month_year", start_month)
+            .lte("month_year", end_month)
+            .eq("is_personal_income", is_personal_income)
+        )
+        if is_personal_income and username:
+            query = query.eq("owner_username", username)
+
+        response = query.execute()
+        if not response.data:
+            return pd.DataFrame()
+
+        for row in response.data:
+            if row.get("source_name"):
+                row["source_name"] = decrypt_text(row.get("source_name"))
+            if row.get("take_home_amount") is not None:
+                row["take_home_amount"] = decrypt_float(row.get("take_home_amount"))
+            if row.get("gross_amount") is not None:
+                row["gross_amount"] = decrypt_float(row.get("gross_amount"))
+            row["pay_frequency"] = normalize_income_pay_frequency(
+                row.get("pay_frequency")
+                or ("monthly" if row.get("is_recurring") else "one_time")
+            )
+            if row.get("payment_date") and not isinstance(row.get("payment_date"), str):
+                row["payment_date"] = row["payment_date"].isoformat()
+
+        return pd.DataFrame(response.data)
+    except Exception as e:
+        print(f"Error fetching incomes for period: {e}")
+        return pd.DataFrame()
+
+
+def get_distinct_budget_years(household_id) -> list:
+    """Return calendar years with logged budget data, newest first; always includes current year."""
+    years = set()
+    current_year = date.today().year
+    years.add(current_year)
+
+    for table_key in ("expenses", "household_incomes"):
+        target_table = get_budget_table(table_key)
+        try:
+            response = (
+                supabase.table(target_table)
+                .select("month_year")
+                .eq("household_id", household_id)
+                .execute()
+            )
+            for row in response.data or []:
+                month_year = row.get("month_year")
+                if month_year and len(str(month_year)) >= 4:
+                    try:
+                        years.add(int(str(month_year)[:4]))
+                    except ValueError:
+                        pass
+        except Exception as e:
+            print(f"Error fetching budget years from {table_key}: {e}")
+
+    return sorted(years, reverse=True)
+
+
 def log_expense_and_check_project(auth_user_id, username, household_id, month_year, date_logged, category_id, amount, details, is_personal_spend=False, is_recurring=False):
     """Logs an expense, now tracking if it is a recurring monthly bill."""
     if not is_personal_spend:
@@ -1731,6 +1833,19 @@ def insert_project_budget_item(data: dict):
         return True
     except Exception as e:
         print(f"Error inserting budget item: {e}")
+        return False
+
+
+def delete_project_budget_item(item_id: str) -> bool:
+    """Permanently deletes a project budget record for the active household."""
+    try:
+        if not _can_edit_projects_server_side():
+            return False
+        house_id = get_current_household_id()
+        supabase.table(PROJECT_BUDGETS_TABLE).delete().eq("id", item_id).eq("household_id", house_id).execute()
+        return True
+    except Exception as e:
+        print(f"Error deleting project budget item: {e}")
         return False
 
 

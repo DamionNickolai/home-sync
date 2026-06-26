@@ -37,6 +37,58 @@ def finish_manage_popover(reason: str, base_key: str) -> None:
     rerun_with_reason(reason)
 
 
+DELETE_CONFIRM_PREFIX = "delete_confirm_pending::"
+
+
+def delete_confirm_key(action_key: str) -> str:
+    return f"{DELETE_CONFIRM_PREFIX}{action_key}"
+
+
+def arm_delete_confirm(action_key: str) -> None:
+    st.session_state[delete_confirm_key(action_key)] = True
+
+
+def clear_delete_confirm(action_key: str) -> None:
+    st.session_state.pop(delete_confirm_key(action_key), None)
+
+
+def is_delete_confirm_armed(action_key: str) -> bool:
+    return bool(st.session_state.get(delete_confirm_key(action_key)))
+
+
+def render_delete_confirmation(
+    action_key: str,
+    *,
+    item_label: str = "this item",
+    warning: str | None = None,
+) -> bool:
+    """When delete is armed, show confirm/cancel UI. Returns True if user confirmed."""
+    if not is_delete_confirm_armed(action_key):
+        return False
+
+    message = warning or f"Are you sure you want to delete **{item_label}**? This cannot be undone."
+    st.warning(message)
+    confirm_col, cancel_col = st.columns(2)
+    confirmed = confirm_col.button(
+        "✅ Confirm Delete",
+        key=f"delete_confirm_yes::{action_key}",
+        type="primary",
+        width="stretch",
+    )
+    cancelled = cancel_col.button(
+        "Cancel",
+        key=f"delete_confirm_no::{action_key}",
+        width="stretch",
+    )
+    if cancelled:
+        clear_delete_confirm(action_key)
+        rerun_with_reason("delete_cancel")
+    if confirmed:
+        clear_delete_confirm(action_key)
+        return True
+    return False
+
+
 def render_two_col_selector(key: str, options: list, format_func=None):
     if not options:
         return None
