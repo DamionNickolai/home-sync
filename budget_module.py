@@ -79,6 +79,10 @@ from ui_helpers import (
     arm_delete_confirm,
     is_delete_confirm_armed,
     render_delete_confirmation,
+    render_metrics_grid,
+    render_signed_currency_metric,
+    render_checkbox_grid,
+    render_two_col_selector,
 )
 from constants import (
     allowance_recipient_username,
@@ -580,21 +584,17 @@ def _format_payment_date(value) -> str:
 
 def _render_signed_currency_metric(column, label: str, amount: float) -> None:
     """Metric-style display with green for positive and red for negative amounts."""
-    color = "#21c354" if amount >= 0 else "#ff4b4b"
-    column.markdown(f"**{label}**")
-    column.markdown(
-        f'<p style="color:{color};font-size:1.75rem;font-weight:600;margin:0;line-height:1.2;">'
-        f"${amount:,.2f}</p>",
-        unsafe_allow_html=True,
-    )
+    with column:
+        render_signed_currency_metric(label, amount)
 
 
 def _render_annual_income_metrics(annual_totals: dict) -> None:
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Annual Take-Home", f"${annual_totals['annual_takehome']:,.2f}")
-    c2.metric("Annual Gross", f"${annual_totals['annual_gross']:,.2f}")
-    c3.metric("Annual Taxable", f"${annual_totals['annual_taxable']:,.2f}")
-    c4.metric("Annual Non-Taxable", f"${annual_totals['annual_non_taxable']:,.2f}")
+    render_metrics_grid([
+        {"label": "Annual Take-Home", "value": f"${annual_totals['annual_takehome']:,.2f}"},
+        {"label": "Annual Gross", "value": f"${annual_totals['annual_gross']:,.2f}"},
+        {"label": "Annual Taxable", "value": f"${annual_totals['annual_taxable']:,.2f}"},
+        {"label": "Annual Non-Taxable", "value": f"${annual_totals['annual_non_taxable']:,.2f}"},
+    ], desktop_columns=4)
 
 
 def _render_income_streams_list(incomes_df, *, is_personal=False, annual_totals=None):
@@ -1142,10 +1142,11 @@ def _render_family_member_budgets(household_id, selected_month, household_users)
     total_member_spend = member_actual_df["amount"].sum() if not member_actual_df.empty else 0.0
     net_member_cash = total_member_income - total_member_spend
 
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Est. Monthly Income", f"${total_member_income:,.2f}")
-    m2.metric("Total Personal Spend", f"${total_member_spend:,.2f}")
-    _render_signed_currency_metric(m3, "Net Personal Cash Flow", net_member_cash)
+    render_metrics_grid([
+        {"label": "Est. Monthly Income", "value": f"${total_member_income:,.2f}"},
+        {"label": "Total Personal Spend", "value": f"${total_member_spend:,.2f}"},
+        {"label": "Net Personal Cash Flow", "signed_amount": net_member_cash},
+    ], desktop_columns=3)
     st.divider()
 
     st.markdown(f"##### {selected_member.title()}'s Budget Breakdown")
@@ -1351,59 +1352,6 @@ def _add_chart_corner_total(fig, total: float, *, label: str = "Total Over Budge
 def _apply_chart_currency_format(fig):
     fig.update_yaxes(tickformat="$,.0f")
     return fig
-
-
-def _render_two_col_selector(key: str, options: list, format_func=None):
-    if not options:
-        return None
-
-    if st.session_state.get(key) not in options:
-        st.session_state[key] = options[0]
-
-    selected_value = st.session_state.get(key)
-
-    for idx in range(0, len(options), 2):
-        row_options = options[idx:idx + 2]
-
-        if len(row_options) == 2:
-            left_opt, right_opt = row_options
-            left_label = format_func(left_opt) if format_func else str(left_opt)
-            right_label = format_func(right_opt) if format_func else str(right_opt)
-            col_left, col_right = st.columns(2)
-
-            if col_left.button(
-                left_label,
-                key=f"{key}_btn_{idx}_left",
-                type="primary" if selected_value == left_opt else "secondary",
-                width="stretch",
-            ):
-                if selected_value != left_opt:
-                    st.session_state[key] = left_opt
-                    rerun_fragment_with_reason("selector_change")
-
-            if col_right.button(
-                right_label,
-                key=f"{key}_btn_{idx}_right",
-                type="primary" if selected_value == right_opt else "secondary",
-                width="stretch",
-            ):
-                if selected_value != right_opt:
-                    st.session_state[key] = right_opt
-                    rerun_fragment_with_reason("selector_change")
-        else:
-            only_opt = row_options[0]
-            only_label = format_func(only_opt) if format_func else str(only_opt)
-            if st.button(
-                only_label,
-                key=f"{key}_btn_{idx}_full",
-                type="primary" if selected_value == only_opt else "secondary",
-                width="stretch",
-            ):
-                if selected_value != only_opt:
-                    st.session_state[key] = only_opt
-                    rerun_fragment_with_reason("selector_change")
-
-    return st.session_state.get(key)
 
 
 def _extract_project_year(row, fallback_year):
@@ -1812,20 +1760,22 @@ def _render_annual_report_page(show_back_to_hub=False) -> None:
     )
 
     if scope == "household":
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Total Income", f"${summary['total_income']:,.2f}")
-        m2.metric("Total Shared Expenses", f"${summary['total_expenses']:,.2f}")
-        _render_signed_currency_metric(m3, "Net Cash Flow", summary["net_cash_flow"])
-        m4.metric(
-            "Project Spending",
-            f"${summary['project_spending']:,.2f}",
-            help="Informational only — not included in shared expenses or net cash flow.",
-        )
+        render_metrics_grid([
+            {"label": "Total Income", "value": f"${summary['total_income']:,.2f}"},
+            {"label": "Total Shared Expenses", "value": f"${summary['total_expenses']:,.2f}"},
+            {"label": "Net Cash Flow", "signed_amount": summary["net_cash_flow"]},
+            {
+                "label": "Project Spending",
+                "value": f"${summary['project_spending']:,.2f}",
+                "help": "Informational only — not included in shared expenses or net cash flow.",
+            },
+        ], desktop_columns=4)
     else:
-        p1, p2, p3 = st.columns(3)
-        p1.metric("Total Income", f"${summary['total_income']:,.2f}")
-        p2.metric("Total Personal Spend", f"${summary['total_expenses']:,.2f}")
-        _render_signed_currency_metric(p3, "Net Personal Cash Flow", summary["net_cash_flow"])
+        render_metrics_grid([
+            {"label": "Total Income", "value": f"${summary['total_income']:,.2f}"},
+            {"label": "Total Personal Spend", "value": f"${summary['total_expenses']:,.2f}"},
+            {"label": "Net Personal Cash Flow", "signed_amount": summary["net_cash_flow"]},
+        ], desktop_columns=3)
 
     st.divider()
     st.markdown("#### Monthly Trend")
@@ -2130,10 +2080,11 @@ def _render_budget_fragment(show_back_to_hub=False):
         if st.session_state.get("wishlist_active_owner") not in available_owner_names:
             st.session_state["wishlist_active_owner"] = active_username if active_username in available_owner_names else available_owner_names[0]
 
-        selected_owner = _render_two_col_selector(
+        selected_owner = render_two_col_selector(
             key="wishlist_active_owner",
             options=available_owner_names,
             format_func=lambda owner: f"👤 {owner}",
+            rerun_scope="fragment",
         )
 
         active_rows = [r for r in visible_rows if not bool(r.get("is_completed", False))]
@@ -2412,18 +2363,24 @@ def _render_budget_fragment(show_back_to_hub=False):
 
         household_options = _household_submodule_options()
         _sync_selector_option("household_view_mode", household_options)
-        household_view_mode = _render_two_col_selector(
+        household_view_mode = render_two_col_selector(
             key="household_view_mode",
             options=household_options,
+            rerun_scope="fragment",
         )
         
         # --- TAB 1: MASTER LEDGER ---
         if household_view_mode == "📊 Master Ledger":
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("Est. Monthly Take-Home", f"${total_take_home:,.2f}")
-            col2.metric("Total Shared Expenses", f"${total_expenses:,.2f}")
-            _render_signed_currency_metric(col3, "Net Cash Flow", net_cash_flow)
-            col4.metric("Project Spending", f"${project_spending:,.2f}", help="Informational only — not included in shared expenses or net cash flow.")
+            render_metrics_grid([
+                {"label": "Est. Monthly Take-Home", "value": f"${total_take_home:,.2f}"},
+                {"label": "Total Shared Expenses", "value": f"${total_expenses:,.2f}"},
+                {"label": "Net Cash Flow", "signed_amount": net_cash_flow},
+                {
+                    "label": "Project Spending",
+                    "value": f"${project_spending:,.2f}",
+                    "help": "Informational only — not included in shared expenses or net cash flow.",
+                },
+            ], desktop_columns=4)
             st.divider()
             
             st.markdown("#### Household Budget Breakdown")
@@ -2742,6 +2699,7 @@ def _render_budget_fragment(show_back_to_hub=False):
             
         my_actual_df = _filter_expenses_for_actual_totals(my_personal_df, selected_month)
         total_personal_spend = my_actual_df["amount"].sum() if not my_actual_df.empty else 0.0
+        net_personal_cash = total_personal_income - total_personal_spend
 
         if _is_budget_admin():
             toggle_text = "Allow other Family Admins to view my Personal Budget"
@@ -2756,21 +2714,21 @@ def _render_budget_fragment(show_back_to_hub=False):
                 
         personal_options = _personal_submodule_options(username)
         _sync_selector_option("personal_view_mode", personal_options)
-        personal_view_mode = _render_two_col_selector(
+        personal_view_mode = render_two_col_selector(
             key="personal_view_mode",
             options=personal_options,
+            rerun_scope="fragment",
         )
         st.divider()
 
         # --- TAB 1: MASTER LEDGER (PERSONAL) ---
         if personal_view_mode == f"📊 {username.title()}'s Ledger":
             
-            p_col1, p_col2, p_col3 = st.columns(3)
-            p_col1.metric("Est. Monthly Income", f"${total_personal_income:,.2f}")
-            p_col2.metric("Total Personal Spend", f"${total_personal_spend:,.2f}")
-            
-            net_personal_cash = total_personal_income - total_personal_spend
-            _render_signed_currency_metric(p_col3, "Net Personal Cash Flow", net_personal_cash)
+            render_metrics_grid([
+                {"label": "Est. Monthly Income", "value": f"${total_personal_income:,.2f}"},
+                {"label": "Total Personal Spend", "value": f"${total_personal_spend:,.2f}"},
+                {"label": "Net Personal Cash Flow", "signed_amount": net_personal_cash},
+            ], desktop_columns=3)
             st.divider()
 
             st.markdown("**Income this month**")
@@ -3126,19 +3084,21 @@ def _render_budget_fragment(show_back_to_hub=False):
             return "🧭 Projects Workspace"
         return "✅ Completed Projects"
 
-    selected_projects_section = _render_two_col_selector(
+    selected_projects_section = render_two_col_selector(
         key="projects_active_section",
         options=projects_section_keys,
         format_func=projects_section_label,
+        rerun_scope="fragment",
     )
 
     if selected_projects_section == "overview":
         with st.expander("🎛️ Overview Filters", expanded=False):
             st.caption("Overview Year")
-            selected_year = _render_two_col_selector(
+            selected_year = render_two_col_selector(
                 key="projects_overview_year",
                 options=available_years,
                 format_func=lambda year_value: f"🗓️ {year_value}",
+                rerun_scope="fragment",
             )
 
             yearly_projects = [r for r in normalized if r.get("_year") == selected_year]
@@ -3163,22 +3123,18 @@ def _render_budget_fragment(show_back_to_hub=False):
                     st.session_state[f"overview_cat_{_make_key_fragment(category_name)}"] = False
                 rerun_fragment_with_reason("budget_nav")
 
-            category_rows = []
-            for idx, category_name in enumerate(category_options):
+            category_pairs = []
+            for category_name in category_options:
                 key_name = f"overview_cat_{_make_key_fragment(category_name)}"
                 if key_name not in st.session_state:
                     st.session_state[key_name] = category_name in st.session_state["projects_overview_categories"]
-                category_rows.append((idx, category_name, key_name))
+                category_pairs.append((category_name, key_name))
 
-            category_columns = st.columns(2)
-            for idx, category_name, key_name in category_rows:
-                column = category_columns[idx % len(category_columns)]
-                with column:
-                    st.checkbox(category_name, key=key_name)
+            render_checkbox_grid(category_pairs)
 
             selected_categories = [
                 category_name
-                for _, category_name, key_name in category_rows
+                for category_name, key_name in category_pairs
                 if st.session_state.get(key_name, False)
             ]
             st.session_state["projects_overview_categories"] = selected_categories or category_options
@@ -3210,29 +3166,28 @@ def _render_budget_fragment(show_back_to_hub=False):
         completed_over_count = sum(1 for r in yearly_completed_projects if _project_over_budget_amount(r) > 0)
 
         st.markdown(f"#### {selected_year} Year at a Glance")
-        y1, y2, y3, y4 = st.columns(4)
-        y1.metric(f"{selected_year} Est. Low (All)", _format_money(yearly_total_est_low))
-        y2.metric(f"{selected_year} Est. High (All)", _format_money(yearly_total_est_high))
-        y3.metric(f"{selected_year} Actual Spent (All)", _format_money(yearly_total_actual))
-        y4.metric(
-            f"{selected_year} Completed Final",
-            _format_money(yearly_completed_total_actual),
-            help="Final actual spend on projects completed during this calendar year.",
-        )
-
-        y5, y6, y7, y8 = st.columns(4)
-        y5.metric("Active Projects", len(yearly_active_projects))
-        y6.metric("Completed Projects", len(yearly_completed_projects))
-        y7.metric(
-            "Budget Utilization",
-            f"{yearly_budget_utilization:.0f}%" if yearly_budget_utilization is not None else "—",
-            help="Actual spent divided by total estimated high across all projects in this year.",
-        )
-        y8.metric(
-            "Over Budget Projects",
-            f"{active_over_count + completed_over_count}",
-            help=f"{active_over_count} active · {completed_over_count} completed",
-        )
+        render_metrics_grid([
+            {"label": f"{selected_year} Est. Low (All)", "value": _format_money(yearly_total_est_low)},
+            {"label": f"{selected_year} Est. High (All)", "value": _format_money(yearly_total_est_high)},
+            {"label": f"{selected_year} Actual Spent (All)", "value": _format_money(yearly_total_actual)},
+            {
+                "label": f"{selected_year} Completed Final",
+                "value": _format_money(yearly_completed_total_actual),
+                "help": "Final actual spend on projects completed during this calendar year.",
+            },
+            {"label": "Active Projects", "value": str(len(yearly_active_projects))},
+            {"label": "Completed Projects", "value": str(len(yearly_completed_projects))},
+            {
+                "label": "Budget Utilization",
+                "value": f"{yearly_budget_utilization:.0f}%" if yearly_budget_utilization is not None else "—",
+                "help": "Actual spent divided by total estimated high across all projects in this year.",
+            },
+            {
+                "label": "Over Budget Projects",
+                "value": f"{active_over_count + completed_over_count}",
+                "help": f"{active_over_count} active · {completed_over_count} completed",
+            },
+        ], desktop_columns=4)
 
         st.divider()
 
@@ -3792,10 +3747,11 @@ def _render_budget_fragment(show_back_to_hub=False):
                 tab_est_low = sum(p.get("_est_low", 0) for p in project_rows)
                 tab_est_high = sum(p.get("_est_high", 0) for p in project_rows)
                 tab_spent = sum(p.get("_actual", 0) for p in project_rows)
-                t1, t2, t3 = st.columns(3)
-                t1.metric("Est Low", _format_money(tab_est_low))
-                t2.metric("Estimated High", _format_money(tab_est_high))
-                t3.metric("Spent", _format_money(tab_spent))
+                render_metrics_grid([
+                    {"label": "Est Low", "value": _format_money(tab_est_low)},
+                    {"label": "Estimated High", "value": _format_money(tab_est_high)},
+                    {"label": "Spent", "value": _format_money(tab_spent)},
+                ], desktop_columns=3)
                 st.divider()
 
             priority_projects.sort(key=lambda x: (str(x.get("category") or "Uncategorized").lower(), -x.get("_est_high", 0), str(x.get("item", "")).lower()))
@@ -3815,10 +3771,11 @@ def _render_budget_fragment(show_back_to_hub=False):
                 category_name = section_key.split("::", 1)[1]
                 return f"📁 {category_name} ({len(grouped_active.get(category_name, []))})"
 
-            selected_workspace_section = _render_two_col_selector(
+            selected_workspace_section = render_two_col_selector(
                 key="projects_workspace_active_category",
                 options=workspace_section_keys,
                 format_func=workspace_section_label,
+                rerun_scope="fragment",
             )
 
             if selected_workspace_section == "priority":

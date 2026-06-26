@@ -379,6 +379,43 @@ st.markdown("""
         width: 13%;
     }
 
+    /* Responsive metric cards — desktop N-up, mobile 2-up (matches budget table approach). */
+    .hs-metrics-grid {
+        display: grid;
+        gap: 0.65rem;
+        margin: 0.35rem 0 0.85rem;
+        width: 100%;
+    }
+    .hs-metrics-grid.cols-4 {
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+    }
+    .hs-metrics-grid.cols-3 {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+    .hs-metrics-grid.cols-2 {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .hs-metric-cell {
+        background: rgba(128, 128, 128, 0.08);
+        border: 1px solid rgba(128, 128, 128, 0.22);
+        border-radius: 0.5rem;
+        padding: 0.6rem 0.7rem;
+        min-width: 0;
+    }
+    .hs-metric-label {
+        font-size: 0.82rem;
+        line-height: 1.25;
+        opacity: 0.78;
+        margin-bottom: 0.2rem;
+        word-break: break-word;
+    }
+    .hs-metric-value {
+        font-size: 1.35rem;
+        font-weight: 600;
+        line-height: 1.15;
+        word-break: break-word;
+    }
+
     /* Mobile polish: readable tap targets for any remaining radio controls. */
     @media (max-width: 768px) {
         div[data-testid="stRadio"] [role="radiogroup"] > label {
@@ -389,6 +426,56 @@ st.markdown("""
             margin: 0.08rem 0;
             background: rgba(15, 23, 42, 0.08);
             box-sizing: border-box;
+        }
+
+        .hs-metrics-grid.cols-4,
+        .hs-metrics-grid.cols-3 {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+
+        /* Checkbox / filter pairs stay 2-up. */
+        [data-testid="stHorizontalBlock"]:has([data-testid="stCheckbox"]) {
+            flex-direction: row !important;
+            flex-wrap: wrap !important;
+            gap: 0.15rem 0.35rem !important;
+        }
+        [data-testid="stHorizontalBlock"]:has([data-testid="stCheckbox"]) > [data-testid="column"] {
+            flex: 0 0 calc(50% - 0.25rem) !important;
+            width: calc(50% - 0.25rem) !important;
+            min-width: 0 !important;
+        }
+
+        /* Backlog form fields: 4-up desktop rows become 2-up on mobile. */
+        [data-testid="stForm"] [data-testid="stHorizontalBlock"]:has(> [data-testid="column"]:nth-child(4):last-child) {
+            flex-wrap: wrap !important;
+            gap: 0.25rem 0.35rem !important;
+        }
+        [data-testid="stForm"] [data-testid="stHorizontalBlock"]:has(> [data-testid="column"]:nth-child(4):last-child) > [data-testid="column"] {
+            flex: 0 0 calc(50% - 0.25rem) !important;
+            width: calc(50% - 0.25rem) !important;
+            min-width: 0 !important;
+        }
+
+        /* 3-up select rows (add ticket) become 2-up on mobile. */
+        [data-testid="stForm"] [data-testid="stHorizontalBlock"]:has(> [data-testid="column"]:nth-child(3):last-child .stSelectbox) {
+            flex-wrap: wrap !important;
+            gap: 0.25rem 0.35rem !important;
+        }
+        [data-testid="stForm"] [data-testid="stHorizontalBlock"]:has(> [data-testid="column"]:nth-child(3):last-child .stSelectbox) > [data-testid="column"] {
+            flex: 0 0 calc(50% - 0.25rem) !important;
+            width: calc(50% - 0.25rem) !important;
+            min-width: 0 !important;
+        }
+
+        /* Year picker rows: 4 buttons become 2-up. */
+        [data-testid="stHorizontalBlock"]:has(> [data-testid="column"]:nth-child(4):last-child .stButton) {
+            flex-wrap: wrap !important;
+            gap: 0.35rem !important;
+        }
+        [data-testid="stHorizontalBlock"]:has(> [data-testid="column"]:nth-child(4):last-child .stButton) > [data-testid="column"] {
+            flex: 0 0 calc(50% - 0.25rem) !important;
+            width: calc(50% - 0.25rem) !important;
+            min-width: 0 !important;
         }
 
         .hs-budget-table-wrap.ledger .hs-budget-table {

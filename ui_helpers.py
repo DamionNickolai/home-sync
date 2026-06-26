@@ -102,7 +102,75 @@ def render_delete_confirmation(
     return False
 
 
+def render_signed_currency_metric(label: str, amount: float) -> None:
+    """Metric-style display with green for positive and red for negative amounts."""
+    color = "#21c354" if amount >= 0 else "#ff4b4b"
+    st.markdown(f"**{label}**")
+    st.markdown(
+        f'<p style="color:{color};font-size:1.75rem;font-weight:600;margin:0;line-height:1.2;">'
+        f"${amount:,.2f}</p>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_metrics_grid(metrics: list, *, desktop_columns: int = 4) -> None:
+    """Responsive HTML metric grid: desktop_columns on wide screens, 2-up on mobile.
+
+    Each item is a dict with:
+      - label (str, required)
+      - value (str, optional) for plain metrics
+      - help (str, optional)
+      - signed_amount (float, optional) — colored currency display
+    """
+    import html as html_lib
+
+    if not metrics:
+        return
+
+    cells = []
+    for item in metrics:
+        label = html_lib.escape(item["label"])
+        help_text = item.get("help")
+        help_attr = ""
+        if help_text:
+            help_attr = f' title="{html_lib.escape(help_text)}"'
+
+        signed_amount = item.get("signed_amount")
+        if signed_amount is not None:
+            color = "#21c354" if signed_amount >= 0 else "#ff4b4b"
+            value_html = (
+                f'<div class="hs-metric-value signed" style="color:{color}">'
+                f"${signed_amount:,.2f}</div>"
+            )
+        else:
+            value_html = (
+                f'<div class="hs-metric-value">{html_lib.escape(str(item.get("value", "")))}</div>'
+            )
+
+        cells.append(
+            f'<div class="hs-metric-cell"{help_attr}>'
+            f'<div class="hs-metric-label">{label}</div>{value_html}</div>'
+        )
+
+    desktop_columns = max(1, min(int(desktop_columns), 4))
+    st.markdown(
+        f'<div class="hs-metrics-grid cols-{desktop_columns}">{"".join(cells)}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_checkbox_grid(pairs: list[tuple[str, str]]) -> None:
+    """Lay out checkboxes in paired rows (2 per row). CSS keeps side-by-side on mobile."""
+    for row_start in range(0, len(pairs), 2):
+        row_items = pairs[row_start : row_start + 2]
+        cols = st.columns(2, gap="small")
+        for col, (label, key) in zip(cols, row_items):
+            with col:
+                st.checkbox(label, key=key)
+
+
 def render_two_col_selector(key: str, options: list, format_func=None, *, rerun_scope: str = "app"):
+    """Exclusive option picker rendered as 2-column rows of buttons."""
     if not options:
         return None
 
@@ -118,7 +186,7 @@ def render_two_col_selector(key: str, options: list, format_func=None, *, rerun_
             left_opt, right_opt = row_options
             left_label = format_func(left_opt) if format_func else str(left_opt)
             right_label = format_func(right_opt) if format_func else str(right_opt)
-            col_left, col_right = st.columns(2)
+            col_left, col_right = st.columns(2, gap="small")
 
             if col_left.button(
                 left_label,

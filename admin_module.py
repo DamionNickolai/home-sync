@@ -58,11 +58,12 @@ def _current_bool(user: dict, key: str, fallback_key: str | None = None, default
     return bool(user.get(key, default))
 
 
-def _render_matrix_header(col1_label: str, col2_label: str) -> None:
-    label_col, col1_col, col2_col = st.columns([3.2, 1, 1])
-    label_col.markdown("")
-    col1_col.markdown(f"**{col1_label}**")
-    col2_col.markdown(f"**{col2_label}**")
+def _render_section_header(label: str) -> None:
+    st.markdown(
+        f'<p style="margin:0.6rem 0 0.2rem;font-size:0.78rem;font-weight:700;'
+        f'text-transform:uppercase;letter-spacing:0.06em;opacity:0.6;">{label}</p>',
+        unsafe_allow_html=True,
+    )
 
 
 def _render_view_edit_row(
@@ -74,19 +75,16 @@ def _render_view_edit_row(
     can_view: bool,
     can_edit: bool,
 ) -> tuple[bool, bool]:
-    row_label, view_col, edit_col = st.columns([3.2, 1, 1])
-    row_label.markdown(label)
-    new_view = view_col.toggle(
-        f"{label} view",
+    """Render a View + Edit toggle pair with module label embedded for mobile clarity."""
+    new_view = st.toggle(
+        f"View — {label}",
         value=can_view,
         key=f"admin_{view_key}_{user_id}",
-        label_visibility="collapsed",
     )
-    new_edit = edit_col.toggle(
-        f"{label} edit",
+    new_edit = st.toggle(
+        f"Edit — {label}",
         value=can_edit,
         key=f"admin_{edit_key}_{user_id}",
-        label_visibility="collapsed",
         disabled=not new_view,
     )
     return _normalize_view_edit_pair(new_view, new_edit)
@@ -226,8 +224,7 @@ def render_admin_module_access_page() -> None:
 
         with st.form(key=f"admin_module_access_form_{user_id}", clear_on_submit=False):
             with st.expander("Budget", expanded=True):
-                _render_matrix_header("View", "Edit")
-
+                _render_section_header("Projects")
                 for row in BUDGET_PERMISSION_ROWS:
                     view_key = row["view_key"]
                     edit_key = row["edit_key"]
@@ -247,28 +244,26 @@ def render_admin_module_access_page() -> None:
                         can_edit=current_edit,
                     )
 
-                _render_matrix_header("Members", "Admin")
-
-                wish_label, wish_members_col, wish_admin_col = st.columns([3.2, 1, 1])
-                wish_label.markdown("Wish List")
-                wish_members_col.toggle(
-                    "Wish List members",
+                st.divider()
+                _render_section_header("Wish List")
+                st.toggle(
+                    "Wish List — Members",
                     value=bool(user.get("can_view_wishlist_members", True)),
                     key=f"admin_can_view_wishlist_members_{user_id}",
-                    label_visibility="collapsed",
                 )
-                wish_admin_col.toggle(
-                    "Wish List admin",
+                st.toggle(
+                    "Wish List — Admin",
                     value=bool(user.get("can_view_wishlist_admin", False)),
                     key=f"admin_can_view_wishlist_admin_{user_id}",
-                    label_visibility="collapsed",
                 )
 
             if home_mgmt_ready:
                 with st.expander("Home Management", expanded=False):
-                    _render_matrix_header("View", "Edit")
-                    for module_key in HOME_MGMT_MODULE_ORDER:
+                    for idx, module_key in enumerate(HOME_MGMT_MODULE_ORDER):
                         perm = HOME_MGMT_PERMISSIONS[module_key]
+                        if idx > 0:
+                            st.divider()
+                        _render_section_header(perm["label"])
                         view_key = perm["view_key"]
                         edit_key = perm["edit_key"]
                         current_view = bool(user.get(view_key, False))
