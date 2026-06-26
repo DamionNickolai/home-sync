@@ -18,6 +18,7 @@ from database import (
     allowance_categories_in_sync,
     get_household_finance_settings,
     update_household_projects_funds,
+    adjust_household_projects_funds,
     get_household_users_for_admin,
     get_wish_list_items,
     insert_wish_list_item,
@@ -1917,8 +1918,6 @@ def _render_budget_fragment(show_back_to_hub=False):
         st.session_state["projects_funds"] = None
     if "pending_restore_project_id" not in st.session_state:
         st.session_state["pending_restore_project_id"] = None
-    if "projects_funds_input" not in st.session_state:
-        st.session_state["projects_funds_input"] = ""
     if "projects_active_section" not in st.session_state:
         st.session_state["projects_active_section"] = "workspace"
     if "projects_workspace_active_category" not in st.session_state:
@@ -2322,10 +2321,6 @@ def _render_budget_fragment(show_back_to_hub=False):
         saved_projects_funds = None
         saved_projects_funds_year = current_year
         saved_projects_funds_updated_at = None
-        st.session_state["projects_funds_input"] = ""
-
-    if st.session_state.get("projects_funds_input") == "" and saved_projects_funds is not None:
-        st.session_state["projects_funds_input"] = _format_currency_for_input(saved_projects_funds)
 
     # ==========================================
     # 🏦 TOP-LEVEL: HOUSEHOLD BUDGET (Admin)
@@ -3392,37 +3387,65 @@ def _render_budget_fragment(show_back_to_hub=False):
         if not can_edit_projects:
             st.info("You have view-only access to Projects. Editing is restricted by your household admin.")
 
+        current_funds_value = _to_number(saved_projects_funds, 0.0)
+
         with st.expander("💼 Project Funds", expanded=False):
-            funds_input = st.text_input(
-                "Projects Funds",
-                key="projects_funds_input",
-                placeholder="Enter available project funds",
-                disabled=not can_edit_projects,
-            )
-            parsed_funds = _parse_currency_input(funds_input)
-            if parsed_funds == "invalid":
-                st.warning("Projects Funds must be a valid dollar amount.")
-                active_funds_value = _to_number(saved_projects_funds, 0)
-            else:
-                active_funds_value = _to_number(parsed_funds if parsed_funds is not None else saved_projects_funds, 0)
+            st.metric(f"Current Project Funds ({current_year})", _format_money(current_funds_value))
 
-            if st.button("💾 Save Funds", key="save_projects_funds", width="stretch", disabled=not can_edit_projects):
-                if parsed_funds == "invalid":
-                    st.error("Cannot save: Projects Funds must be a valid dollar amount.")
-                else:
-                    value_to_save = parsed_funds if parsed_funds is not None else None
-                    if update_household_projects_funds(value_to_save, current_year):
-                        st.success("Projects Funds saved.")
-                        rerun_fragment_with_reason("budget_nav")
+            if can_edit_projects:
+                with st.form("projects_funds_adjustment", clear_on_submit=True):
+                    adj_type_col, adj_amount_col = st.columns([1, 2])
+                    with adj_type_col:
+                        adjustment_type = st.radio(
+                            "Adjustment",
+                            ["Add", "Subtract"],
+                            horizontal=True,
+                            key="projects_funds_adj_type",
+                        )
+                    with adj_amount_col:
+                        adjustment_amount = st.text_input(
+                            "Amount ($)",
+                            placeholder="0.00",
+                        )
+
+                    submitted = st.form_submit_button(
+                        "Apply Adjustment",
+                        width="stretch",
+                    )
+
+                if submitted:
+                    parsed_adjustment = _parse_currency_input(adjustment_amount)
+                    if parsed_adjustment == "invalid" or parsed_adjustment is None:
+                        st.error("Enter a valid dollar amount before applying an adjustment.")
+                    elif parsed_adjustment <= 0:
+                        st.error("Adjustment amount must be greater than zero.")
                     else:
-                        st.error("Could not save Projects Funds.")
+                        delta = (
+                            float(parsed_adjustment)
+                            if adjustment_type == "Add"
+                            else -float(parsed_adjustment)
+                        )
+                        if current_funds_value + delta < 0:
+                            st.error(
+                                "Cannot subtract more than the current project fund balance."
+                            )
+                        elif adjust_household_projects_funds(delta, current_year):
+                            st.success(
+                                f"Project funds updated to {_format_money(current_funds_value + delta)}."
+                            )
+                            rerun_fragment_with_reason("budget_nav")
+                        else:
+                            st.error("Could not update project funds.")
 
-            st.caption(f"Projects Funds is annual and automatically resets on Jan 1. Remaining Funds is based on {current_year} actual project spend.")
+            st.caption(
+                f"Projects Funds is annual and automatically resets on Jan 1. "
+                f"Remaining Funds is based on {current_year} actual project spend."
+            )
 
-        remaining_funds = float(active_funds_value or 0.0) - float(current_year_total_actual)
+        remaining_funds = float(current_funds_value or 0.0) - float(current_year_total_actual)
 
         if saved_projects_funds is not None:
-            history_line = f"Last saved funds ({current_year}): {_format_money(saved_projects_funds)}"
+            history_line = f"Last updated ({current_year}): {_format_money(saved_projects_funds)}"
             if saved_projects_funds_updated_at:
                 try:
                     updated_local = pd.to_datetime(saved_projects_funds_updated_at, utc=True).tz_convert(app_tz)

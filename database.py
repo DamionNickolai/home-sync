@@ -4088,6 +4088,28 @@ def get_household_finance_settings():
         return {}
 
 
+def adjust_household_projects_funds(delta, projects_funds_year=None) -> bool:
+    """Add or subtract from the household project fund balance."""
+    try:
+        if not _can_edit_projects_server_side():
+            return False
+        safe_delta = float(delta)
+        if safe_delta == 0:
+            return False
+
+        settings = get_household_finance_settings()
+        current = settings.get("projects_funds")
+        current_val = float(current) if current is not None else 0.0
+        new_val = current_val + safe_delta
+        if new_val < 0:
+            return False
+
+        return update_household_projects_funds(new_val, projects_funds_year)
+    except Exception as e:
+        print(f"Error adjusting projects funds: {e}")
+        return False
+
+
 def update_household_projects_funds(projects_funds, projects_funds_year=None):
     """Encrypts and upserts projects_funds for the active household."""
     try:
