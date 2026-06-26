@@ -5,7 +5,9 @@ migrations/023_household_income_streams.sql,
 migrations/024_income_paycheck_occurrences.sql,
 migrations/025_household_expense_streams.sql, and
 migrations/026_expense_paycheck_occurrences.sql,
-migrations/027_expense_stream_category_id_dev.sql (all idempotent), and if prod
+migrations/027_expense_stream_category_id_dev.sql (all idempotent), and
+migrations/028_project_funds_rollover.sql, and
+migrations/029_projects_funds_opening_text.sql (all idempotent), and if prod
 budget tables are entirely absent, migrations/017_create_budget_prod_tables.sql
 first.
 
@@ -44,6 +46,8 @@ MIGRATION_024 = ROOT / "migrations" / "024_income_paycheck_occurrences.sql"
 MIGRATION_025 = ROOT / "migrations" / "025_household_expense_streams.sql"
 MIGRATION_026 = ROOT / "migrations" / "026_expense_paycheck_occurrences.sql"
 MIGRATION_027 = ROOT / "migrations" / "027_expense_stream_category_id_dev.sql"
+MIGRATION_028 = ROOT / "migrations" / "028_project_funds_rollover.sql"
+MIGRATION_029 = ROOT / "migrations" / "029_projects_funds_opening_text.sql"
 
 BUDGET_PROD_TABLES = [
     "budget_categories",
@@ -106,6 +110,14 @@ def _print_migration_plan(need_017: bool) -> None:
     print()
     print(f"  Step {step}: {MIGRATION_027.name}")
     print("          Dev expense-stream category_id UUID (matches budget_categories_dev).")
+    step += 1
+    print()
+    print(f"  Step {step}: {MIGRATION_028.name}")
+    print("          Project funds opening balance + expense project_budget_id link.")
+    step += 1
+    print()
+    print(f"  Step {step}: {MIGRATION_029.name}")
+    print("          projects_funds_opening TEXT (encrypted ciphertext, like projects_funds).")
     print()
     print("To apply, re-run with --apply:")
     print("  python maintenance/apply_schema_parity.py --apply")
@@ -218,6 +230,18 @@ def main() -> int:
             with conn.cursor() as cur2:
                 cur2.execute(sql_027)
             print(f"  ✓  {MIGRATION_027.name} applied.")
+
+            sql_028 = MIGRATION_028.read_text(encoding="utf-8")
+            print(f"Applying {MIGRATION_028.name} ...")
+            with conn.cursor() as cur2:
+                cur2.execute(sql_028)
+            print(f"  ✓  {MIGRATION_028.name} applied.")
+
+            sql_029 = MIGRATION_029.read_text(encoding="utf-8")
+            print(f"Applying {MIGRATION_029.name} ...")
+            with conn.cursor() as cur2:
+                cur2.execute(sql_029)
+            print(f"  ✓  {MIGRATION_029.name} applied.")
 
             # 4. Re-audit to confirm
             print()

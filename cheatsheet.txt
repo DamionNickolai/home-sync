@@ -81,6 +81,11 @@ INCOME STREAMS (migrations 023 + 024 + backfill):
 
 EXPENSE STREAMS (migrations 025 + 026 + 027 + backfill):
   apply_schema_parity.py --apply includes 025, 026, and 027 (027 fixes dev category_id UUID).
+
+PROJECT FUNDS ROLLOVER (migrations 028 + 029):
+  apply_schema_parity.py --apply includes 028 and 029.
+  029 fixes projects_funds_opening TEXT if 028 created it as NUMERIC (encrypted values).
+  Or run migrations/029_projects_funds_opening_text.sql in Supabase SQL Editor (dev).
   Test bill schedule logic locally (no DB):
   python -m unittest tests.test_expense_bill_occurrences -v
   Backfill legacy recurring expense rows:

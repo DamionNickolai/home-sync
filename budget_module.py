@@ -17,8 +17,10 @@ from database import (
     ensure_allowance_categories,
     allowance_categories_in_sync,
     get_household_finance_settings,
-    update_household_projects_funds,
     adjust_household_projects_funds,
+    apply_projects_funds_year_rollover,
+    reconstruct_projects_funds_opening,
+    get_project_expense_totals_for_year,
     get_household_users_for_admin,
     get_wish_list_items,
     insert_wish_list_item,
@@ -1372,6 +1374,34 @@ def _extract_project_year(row, fallback_year):
     return fallback_year
 
 
+def _project_visible_in_overview_year(project, year, spend_by_id):
+    """Include projects created in a year or with ledger spend in that year."""
+    pid = str(project.get("id") or "")
+    if project.get("_year") == year:
+        return True
+    return spend_by_id.get(pid, 0) > 0
+
+
+def _format_project_funds_rollover_message(rollover_result, current_year):
+    prior_year = rollover_result.get("prior_year")
+    opening = rollover_result.get("opening")
+    prior_remaining = rollover_result.get("prior_remaining")
+    if prior_year is None or opening is None or prior_remaining is None:
+        return None
+    opening_label = _format_money(opening)
+    remaining_label = _format_money(prior_remaining)
+    if prior_remaining < 0:
+        return (
+            f"**{prior_year} → {current_year} rollover:** Prior-year pool was overspent by "
+            f"{_format_money(abs(prior_remaining))}; {current_year} opening balance set to "
+            f"{opening_label}."
+        )
+    return (
+        f"**{prior_year} → {current_year} rollover:** Unspent balance carried forward as "
+        f"{opening_label} (prior remaining: {remaining_label})."
+    )
+
+
 ANNUAL_REPORT_ACTIVE_KEY = "annual_report_active"
 ANNUAL_REPORT_SCOPE_KEY = "annual_report_scope"
 ANNUAL_REPORT_YEAR_KEY = "annual_report_year"
@@ -2303,19 +2333,21 @@ def _render_budget_fragment(show_back_to_hub=False):
     completed_projects = [r for r in normalized if r.get("_completed", False)]
 
     finance_settings = get_household_finance_settings()
+    rollover_result = apply_projects_funds_year_rollover(current_year)
+    if rollover_result.get("applied") or rollover_result.get("backfilled"):
+        finance_settings = get_household_finance_settings()
     saved_projects_funds = finance_settings.get("projects_funds")
+    saved_projects_funds_opening = finance_settings.get("projects_funds_opening")
     saved_projects_funds_year = finance_settings.get("projects_funds_year")
     saved_projects_funds_updated_at = finance_settings.get("updated_at")
 
-    if saved_projects_funds is not None and saved_projects_funds_year is None:
-        update_household_projects_funds(saved_projects_funds, current_year)
-        saved_projects_funds_year = current_year
-
-    if saved_projects_funds_year not in [None, current_year]:
-        update_household_projects_funds(None, current_year)
-        saved_projects_funds = None
-        saved_projects_funds_year = current_year
-        saved_projects_funds_updated_at = None
+    projects_household_id = st.session_state.get("household_id")
+    current_year_expense_totals = get_project_expense_totals_for_year(
+        projects_household_id,
+        current_year,
+    )
+    current_year_total_actual = current_year_expense_totals["pool_total"]
+    current_year_spend_by_project = current_year_expense_totals["by_project_id"]
 
     # ==========================================
     # 🏦 TOP-LEVEL: HOUSEHOLD BUDGET (Admin)
@@ -2975,6 +3007,7 @@ def _render_budget_fragment(show_back_to_hub=False):
         
         household_id = st.session_state.get("household_id")
         auth_user_id = st.session_state.get("auth_user_id")
+        username = st.session_state.get("username")
         
         categories_df = get_budget_categories(household_id)
         user_categories_df = _exclude_system_categories(categories_df)
@@ -3026,10 +3059,17 @@ def _render_budget_fragment(show_back_to_hub=False):
                     month_year_tag = date_logged.strftime("%Y-%m")
                     # We will update the log_expense_and_check_project function to handle the recurring flag next!
                     success = log_expense_and_check_project(
-                        auth_user_id=auth_user_id, household_id=household_id,
-                        month_year=month_year_tag, date_logged=date_logged,
-                        category_id=category_id, category_type=category_type,
-                        amount=parsed_amount, details=details, project_id=selected_project_id
+                        auth_user_id=auth_user_id,
+                        username=username,
+                        household_id=household_id,
+                        month_year=month_year_tag,
+                        date_logged=date_logged,
+                        category_id=category_id,
+                        amount=parsed_amount,
+                        details=details,
+                        is_personal_spend=False,
+                        is_recurring=is_recurring_expense,
+                        project_id=selected_project_id,
                     )
                     if success:
                         st.success(f"Successfully logged ${_format_money(parsed_amount)} to {selected_display_name}.")
@@ -3059,16 +3099,26 @@ def _render_budget_fragment(show_back_to_hub=False):
         st.session_state["projects_overview_year"] = current_year
     selected_year = st.session_state["projects_overview_year"]
 
-    yearly_projects = [r for r in normalized if r.get("_year") == selected_year]
+    selected_year_expense_totals = get_project_expense_totals_for_year(
+        projects_household_id,
+        selected_year,
+    )
+    selected_year_spend_by_project = selected_year_expense_totals["by_project_id"]
+
+    yearly_projects = [
+        r
+        for r in normalized
+        if _project_visible_in_overview_year(r, selected_year, selected_year_spend_by_project)
+    ]
     yearly_active_projects = [r for r in yearly_projects if not r.get("_completed", False)]
     yearly_completed_projects = [r for r in yearly_projects if r.get("_completed", False)]
     yearly_active_total_low = sum(r.get("_est_low", 0) for r in yearly_active_projects)
     yearly_active_total_high = sum(r.get("_est_high", 0) for r in yearly_active_projects)
-    yearly_active_total_actual = sum(r.get("_actual", 0) for r in yearly_active_projects)
+    yearly_active_total_actual = sum(
+        selected_year_spend_by_project.get(str(r.get("id") or ""), 0)
+        for r in yearly_active_projects
+    )
     yearly_completed_total_actual = sum(r.get("_actual", 0) for r in yearly_completed_projects)
-
-    current_year_projects = [r for r in normalized if r.get("_year") == current_year]
-    current_year_total_actual = sum(r.get("_actual", 0) for r in current_year_projects)
 
     archive_years = [y for y in available_years if y != selected_year]
 
@@ -3139,7 +3189,17 @@ def _render_budget_fragment(show_back_to_hub=False):
             ]
             st.session_state["projects_overview_categories"] = selected_categories or category_options
 
-        yearly_projects = [r for r in normalized if r.get("_year") == selected_year]
+        overview_year_expense_totals = get_project_expense_totals_for_year(
+            projects_household_id,
+            selected_year,
+        )
+        overview_year_spend_by_project = overview_year_expense_totals["by_project_id"]
+
+        yearly_projects = [
+            r
+            for r in normalized
+            if _project_visible_in_overview_year(r, selected_year, overview_year_spend_by_project)
+        ]
         selected_categories = st.session_state.get("projects_overview_categories", category_options)
 
         yearly_projects = [r for r in yearly_projects if (r.get("category") or "Uncategorized") in selected_categories]
@@ -3147,15 +3207,21 @@ def _render_budget_fragment(show_back_to_hub=False):
         yearly_completed_projects = [r for r in yearly_projects if r.get("_completed", False)]
         yearly_active_total_low = sum(r.get("_est_low", 0) for r in yearly_active_projects)
         yearly_active_total_high = sum(r.get("_est_high", 0) for r in yearly_active_projects)
-        yearly_active_total_actual = sum(r.get("_actual", 0) for r in yearly_active_projects)
+        yearly_active_total_actual = sum(
+            overview_year_spend_by_project.get(str(r.get("id") or ""), 0)
+            for r in yearly_active_projects
+        )
         yearly_completed_total_actual = sum(r.get("_actual", 0) for r in yearly_completed_projects)
         archive_years = [y for y in available_years if y != selected_year]
 
-        st.caption(f"Dashboard is scoped to calendar year {selected_year} ({app_tz.key}). Other years are available in archive below.")
+        st.caption(
+            f"Dashboard is scoped to calendar year {selected_year} ({app_tz.key}). "
+            f"Actual spent metrics use ledger expenses by calendar year; projects stay active across years."
+        )
 
         yearly_total_est_low = sum(r.get("_est_low", 0) for r in yearly_projects)
         yearly_total_est_high = sum(r.get("_est_high", 0) for r in yearly_projects)
-        yearly_total_actual = yearly_active_total_actual + yearly_completed_total_actual
+        yearly_total_actual = overview_year_expense_totals["pool_total"]
         yearly_budget_utilization = (
             (yearly_total_actual / yearly_total_est_high * 100) if yearly_total_est_high > 0 else None
         )
@@ -3169,7 +3235,11 @@ def _render_budget_fragment(show_back_to_hub=False):
         render_metrics_grid([
             {"label": f"{selected_year} Est. Low (All)", "value": _format_money(yearly_total_est_low)},
             {"label": f"{selected_year} Est. High (All)", "value": _format_money(yearly_total_est_high)},
-            {"label": f"{selected_year} Actual Spent (All)", "value": _format_money(yearly_total_actual)},
+            {
+                "label": f"{selected_year} Actual Spent (All)",
+                "value": _format_money(yearly_total_actual),
+                "help": "Sum of project-linked ledger expenses logged in this calendar year.",
+            },
             {
                 "label": f"{selected_year} Completed Final",
                 "value": _format_money(yearly_completed_total_actual),
@@ -3180,7 +3250,7 @@ def _render_budget_fragment(show_back_to_hub=False):
             {
                 "label": "Budget Utilization",
                 "value": f"{yearly_budget_utilization:.0f}%" if yearly_budget_utilization is not None else "—",
-                "help": "Actual spent divided by total estimated high across all projects in this year.",
+                "help": "Ledger spend in this year divided by total estimated high for projects in scope.",
             },
             {
                 "label": "Over Budget Projects",
@@ -3382,9 +3452,21 @@ def _render_budget_fragment(show_back_to_hub=False):
                 st.info("No archived years found yet.")
             else:
                 for year_value in archive_years:
-                    year_rows = [r for r in normalized if r.get("_year") == year_value]
+                    archive_totals = get_project_expense_totals_for_year(
+                        projects_household_id,
+                        year_value,
+                    )
+                    year_rows = [
+                        r
+                        for r in normalized
+                        if _project_visible_in_overview_year(
+                            r,
+                            year_value,
+                            archive_totals["by_project_id"],
+                        )
+                    ]
                     year_project_count = len(year_rows)
-                    year_spent = sum(r.get("_actual", 0) for r in year_rows)
+                    year_spent = archive_totals["pool_total"]
 
                     y1, y2 = st.columns([2, 2])
                     y1.metric(f"{year_value} Projects", f"{year_project_count}")
@@ -3396,10 +3478,26 @@ def _render_budget_fragment(show_back_to_hub=False):
         if not can_edit_projects:
             st.info("You have view-only access to Projects. Editing is restricted by your household admin.")
 
-        current_funds_value = _to_number(saved_projects_funds, 0.0)
+        rollover_message = _format_project_funds_rollover_message(rollover_result, current_year)
+        if rollover_message:
+            st.info(rollover_message)
+
+        working_funds_value = _to_number(saved_projects_funds, 0.0)
+        if (
+            saved_projects_funds_opening is not None
+            and float(saved_projects_funds_opening) != 0.0
+        ):
+            opening_funds_value = float(saved_projects_funds_opening)
+        elif working_funds_value > 0 or current_year_total_actual > 0:
+            opening_funds_value = reconstruct_projects_funds_opening(
+                working_funds_value,
+                current_year_total_actual,
+            )
+        else:
+            opening_funds_value = 0.0
 
         with st.expander("💼 Project Funds", expanded=False):
-            st.metric(f"Current Project Funds ({current_year})", _format_money(current_funds_value))
+            st.metric(f"Current Project Funds ({current_year})", _format_money(opening_funds_value))
 
             if can_edit_projects:
                 with st.form("projects_funds_adjustment", clear_on_submit=True):
@@ -3434,27 +3532,29 @@ def _render_budget_fragment(show_back_to_hub=False):
                             if adjustment_type == "Add"
                             else -float(parsed_adjustment)
                         )
-                        if current_funds_value + delta < 0:
+                        if working_funds_value + delta < 0:
                             st.error(
                                 "Cannot subtract more than the current project fund balance."
                             )
                         elif adjust_household_projects_funds(delta, current_year):
                             st.success(
-                                f"Project funds updated to {_format_money(current_funds_value + delta)}."
+                                f"Project funds updated to {_format_money(working_funds_value + delta)}."
                             )
                             rerun_fragment_with_reason("budget_nav")
                         else:
                             st.error("Could not update project funds.")
 
             st.caption(
-                f"Projects Funds is annual and automatically resets on Jan 1. "
-                f"Remaining Funds is based on {current_year} actual project spend."
+                f"Current Project Funds is your {current_year} opening allocation (fixed for the year; "
+                f"backfilled from your balance + spend if Jan 1 was not recorded). It does not decrease "
+                f"when expenses are logged. Add/Subtract updates your working balance only. "
+                f"Remaining Funds subtracts {current_year} ledger spend from the working balance."
             )
 
-        remaining_funds = float(current_funds_value or 0.0) - float(current_year_total_actual)
+        remaining_funds = float(working_funds_value or 0.0) - float(current_year_total_actual)
 
         if saved_projects_funds is not None:
-            history_line = f"Last updated ({current_year}): {_format_money(saved_projects_funds)}"
+            history_line = f"Working balance ({current_year}): {_format_money(working_funds_value)}"
             if saved_projects_funds_updated_at:
                 try:
                     updated_local = pd.to_datetime(saved_projects_funds_updated_at, utc=True).tz_convert(app_tz)
@@ -3471,8 +3571,8 @@ def _render_budget_fragment(show_back_to_hub=False):
             unsafe_allow_html=True,
         )
         st.caption(
-            f"Based on {_format_money(current_year_total_actual)} spent across all "
-            f"{current_year} projects (active + completed)."
+            f"Based on {_format_money(current_year_total_actual)} spent from the project fund pool "
+            f"in {current_year} (ledger expenses)."
         )
 
         st.divider()
@@ -3556,6 +3656,8 @@ def _render_budget_fragment(show_back_to_hub=False):
                 est_low = item.get("_est_low", 0)
                 est_high = item.get("_est_high", 0)
                 actual = item.get("_actual", 0)
+                spent_in_year = current_year_spend_by_project.get(str(project_id or ""), 0)
+                project_start_year = item.get("_year")
                 budget_cap = est_high if est_high > 0 else est_low
                 remaining_balance = budget_cap - actual if budget_cap > 0 else None
                 has_vet_discount = bool(item.get("veteran_discount", False))
@@ -3569,12 +3671,16 @@ def _render_budget_fragment(show_back_to_hub=False):
                 with st.container(border=True):
                     left_col, right_col = st.columns([6, 1])
                     left_col.markdown(f"**{title}**")
-                    left_col.caption(f"Priority: {priority} | Category: {category} | Status: {budget_status}")
+                    status_caption = f"Priority: {priority} | Category: {category} | Status: {budget_status}"
+                    if project_start_year and project_start_year < current_year and not item.get("_completed"):
+                        status_caption = f"{status_caption} | Started {project_start_year}"
+                    left_col.caption(status_caption)
                     left_col.markdown(
                         "Estimated: "
                         f"<span style='color:#16A34A; font-weight:600;'>&#36;{est_low:,.2f}</span> - "
                         f"<span style='color:#DC2626; font-weight:600;'>&#36;{est_high:,.2f}</span> | "
-                        f"Actual: {_format_money(actual)}",
+                        f"Spent in {current_year}: {_format_money(spent_in_year)} | "
+                        f"Lifetime: {_format_money(actual)}",
                         unsafe_allow_html=True,
                     )
                     if est_high > 0:

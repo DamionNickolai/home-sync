@@ -2554,6 +2554,7 @@ def log_expense_and_check_project(
     is_personal_spend=False,
     is_recurring=False,
     pay_frequency=None,
+    project_id=None,
 ):
     """Logs an expense; recurring bills use expense streams + materialized ledger rows."""
     if not is_personal_spend:
@@ -2591,10 +2592,20 @@ def log_expense_and_check_project(
                 "is_recurring": False,
                 "pay_frequency": freq,
             }
+            if project_id and not is_personal_spend:
+                payload["project_budget_id"] = str(project_id)
             response = supabase.table(target_table).insert(payload).execute()
             if not response.data:
                 return False
             expense_id = response.data[0].get("id")
+            if project_id and not is_personal_spend:
+                if _increment_project_actual_from_purchase(
+                    project_id,
+                    float(amount),
+                    date_logged,
+                    product_or_service=details,
+                ) is None:
+                    return False
         else:
             if isinstance(date_logged, str):
                 date_logged = datetime.strptime(date_logged[:10], "%Y-%m-%d").date()
@@ -3477,6 +3488,116 @@ def _resolve_project_expense_category_id(household_id):
     return None
 
 
+def _fetch_household_expenses_for_aggregation(household_id, year=None):
+    """Lightweight expense rows for project-fund and year-spend aggregation."""
+    expenses_table = get_budget_table("expenses")
+    try:
+        response = (
+            supabase.table(expenses_table)
+            .select("amount, month_year, project_budget_id, category_id")
+            .eq("household_id", household_id)
+            .execute()
+        )
+        rows = response.data or []
+    except Exception as e:
+        print(f"Error fetching expenses for aggregation: {e}")
+        return []
+
+    if year is None:
+        return rows
+
+    year_prefix = f"{int(year)}-"
+    return [
+        row
+        for row in rows
+        if str(row.get("month_year") or "").startswith(year_prefix)
+    ]
+
+
+def _expense_counts_toward_project_pool(row, project_category_id):
+    """True when a ledger row reduces the household project-fund pool for a year."""
+    if row.get("project_budget_id"):
+        return True
+    if project_category_id is None:
+        return False
+    return str(row.get("category_id") or "") == str(project_category_id)
+
+
+def sum_project_pool_expenses_for_year(household_id, year):
+    """Sum project-linked ledger spend for a calendar year (fund pool deduction)."""
+    project_category_id = _resolve_project_expense_category_id(household_id)
+    total = 0.0
+    for row in _fetch_household_expenses_for_aggregation(household_id, year):
+        if not _expense_counts_toward_project_pool(row, project_category_id):
+            continue
+        total += decrypt_float(row.get("amount")) or 0.0
+    return total
+
+
+def get_project_expense_totals_for_year(household_id, year):
+    """
+    Returns {"pool_total": float, "by_project_id": {str: float}} for a calendar year.
+    pool_total includes all project-category and project-linked expenses.
+    by_project_id only includes rows with project_budget_id set.
+    """
+    project_category_id = _resolve_project_expense_category_id(household_id)
+    pool_total = 0.0
+    by_project_id: dict[str, float] = {}
+    for row in _fetch_household_expenses_for_aggregation(household_id, year):
+        if not _expense_counts_toward_project_pool(row, project_category_id):
+            continue
+        amount = decrypt_float(row.get("amount")) or 0.0
+        pool_total += amount
+        project_id = row.get("project_budget_id")
+        if project_id:
+            key = str(project_id)
+            by_project_id[key] = by_project_id.get(key, 0.0) + amount
+    return {"pool_total": pool_total, "by_project_id": by_project_id}
+
+
+def _increment_project_actual_from_purchase(
+    project_id,
+    amount,
+    purchase_date,
+    *,
+    product_or_service=None,
+):
+    """Update a project's lifetime actual_cost and audit notes from a purchase."""
+    house_id = get_current_household_id()
+    project_res = (
+        supabase.table(PROJECT_BUDGETS_TABLE)
+        .select("*")
+        .eq("id", project_id)
+        .eq("household_id", house_id)
+        .limit(1)
+        .execute()
+    )
+    if not project_res.data:
+        return None
+
+    row = project_res.data[0]
+    safe_amount = float(amount)
+    current_actual = decrypt_float(row.get("actual_cost")) or 0.0
+    new_actual = current_actual + safe_amount
+
+    existing_notes = decrypt_text(row.get("notes")) or ""
+    cleaned_notes = existing_notes.replace("[COMPLETED]", "").strip() if existing_notes else ""
+    if isinstance(purchase_date, str):
+        purchase_date = datetime.strptime(purchase_date[:10], "%Y-%m-%d").date()
+    product_label = str(product_or_service or "").strip()
+    audit_line = f"[{purchase_date.isoformat()}] Expense logged: ${safe_amount:,.2f}"
+    if product_label:
+        audit_line = f"{audit_line} — {product_label}"
+    new_notes = f"{cleaned_notes}\n{audit_line}".strip() if cleaned_notes else audit_line
+
+    if not update_project_budget_item(
+        project_id,
+        {"actual_cost": new_actual, "notes": new_notes},
+    ):
+        return None
+    return decrypt_text(row.get("item")) or "Project"
+
+
 def ensure_project_expense_category(household_id):
     """
     Ensure the household has a Projects budget category for project purchase logging.
@@ -3705,37 +3826,13 @@ def add_project_purchase_expense(project_id, purchase_date, amount, product_or_s
         username = st.session_state.get("username")
         safe_amount = float(amount)
 
-        project_res = (
-            supabase.table(PROJECT_BUDGETS_TABLE)
-            .select("*")
-            .eq("id", project_id)
-            .eq("household_id", house_id)
-            .limit(1)
-            .execute()
+        project_name = _increment_project_actual_from_purchase(
+            project_id,
+            safe_amount,
+            purchase_date,
+            product_or_service=product_or_service,
         )
-        if not project_res.data:
-            return False
-
-        row = project_res.data[0]
-        project_name = decrypt_text(row.get("item")) or "Project"
-        current_actual = decrypt_float(row.get("actual_cost")) or 0.0
-        new_actual = current_actual + safe_amount
-
-        existing_notes = decrypt_text(row.get("notes")) or ""
-        cleaned_notes = existing_notes.replace("[COMPLETED]", "").strip() if existing_notes else ""
-        if isinstance(purchase_date, str):
-            purchase_date = datetime.strptime(purchase_date[:10], "%Y-%m-%d").date()
-        product_label = str(product_or_service or "").strip()
-        audit_line = f"[{purchase_date.isoformat()}] Expense logged: ${safe_amount:,.2f}"
-        if product_label:
-            audit_line = f"{audit_line} — {product_label}"
-        new_notes = f"{cleaned_notes}\n{audit_line}".strip() if cleaned_notes else audit_line
-
-        update_payload = {
-            "actual_cost": new_actual,
-            "notes": new_notes,
-        }
-        if not update_project_budget_item(project_id, update_payload):
+        if project_name is None:
             return False
 
         category_id = ensure_project_expense_category(house_id)
@@ -3743,7 +3840,10 @@ def add_project_purchase_expense(project_id, purchase_date, amount, product_or_s
             print("Could not resolve Projects budget category; project actual updated but expense not logged.")
             return True
 
+        if isinstance(purchase_date, str):
+            purchase_date = datetime.strptime(purchase_date[:10], "%Y-%m-%d").date()
         month_year = purchase_date.strftime("%Y-%m")
+        product_label = str(product_or_service or "").strip()
         if product_label:
             details = f"{project_name} — {product_label}"
         else:
@@ -3760,6 +3860,7 @@ def add_project_purchase_expense(project_id, purchase_date, amount, product_or_s
             "details": encrypt_data(details),
             "is_personal_spend": False,
             "is_recurring": False,
+            "project_budget_id": str(project_id),
         }
         supabase.table(expenses_table).insert(expense_payload).execute()
         return True
@@ -4072,20 +4173,156 @@ def get_household_finance_settings():
         response = (
             supabase
             .table(HOUSEHOLD_FINANCE_SETTINGS_TABLE)
-            .select("household_id, projects_funds, projects_funds_year, updated_at")
+            .select(
+                "household_id, projects_funds, projects_funds_opening, "
+                "projects_funds_year, updated_at"
+            )
             .eq("household_id", house_id)
             .limit(1)
             .execute()
         )
         if response.data:
             data = response.data[0]
-            # 🟢 DECRYPT DOLLAR VALUE
             data["projects_funds"] = decrypt_float(data.get("projects_funds"))
+            data["projects_funds_opening"] = decrypt_float(data.get("projects_funds_opening"))
             return data
         return {}
     except Exception as e:
         print(f"Error fetching household finance settings: {e}")
         return {}
+
+
+_PROJECT_FUNDS_OPENING_UNSET = object()
+
+
+def _upsert_household_projects_funds_row(
+    *,
+    projects_funds,
+    projects_funds_year=None,
+    projects_funds_opening=_PROJECT_FUNDS_OPENING_UNSET,
+):
+    """Internal upsert for project fund balances (rollover/backfill; no permission gate)."""
+    try:
+        house_id = get_current_household_id()
+        payload = {
+            "household_id": house_id,
+            "projects_funds_year": projects_funds_year,
+            "updated_at": datetime.now(ZoneInfo("America/Chicago")).isoformat(),
+        }
+        if projects_funds is not None:
+            payload["projects_funds"] = encrypt_data(projects_funds)
+        else:
+            payload["projects_funds"] = None
+        if projects_funds_opening is not _PROJECT_FUNDS_OPENING_UNSET:
+            if projects_funds_opening is not None:
+                payload["projects_funds_opening"] = encrypt_data(projects_funds_opening)
+            else:
+                payload["projects_funds_opening"] = None
+        (
+            supabase
+            .table(HOUSEHOLD_FINANCE_SETTINGS_TABLE)
+            .upsert(payload, on_conflict="household_id")
+            .execute()
+        )
+        return True
+    except Exception as e:
+        print(f"Error upserting projects funds row: {e}")
+        return False
+
+
+def reconstruct_projects_funds_opening(working_balance, ytd_pool_spend):
+    """
+    Infer a Jan 1 opening snapshot mid-year: working balance plus YTD pool spend.
+    Assumes no mid-year fund Add/Subtract adjustments since Jan 1.
+    """
+    return max(0.0, float(working_balance or 0.0) + float(ytd_pool_spend or 0.0))
+
+
+def _projects_funds_opening_needs_backfill(saved_opening, working_balance, ytd_pool_spend):
+    """True when opening was never captured (NULL/0) but the pool is in use."""
+    working = float(working_balance or 0.0)
+    spent = float(ytd_pool_spend or 0.0)
+    if saved_opening is None:
+        return working > 0 or spent > 0
+    if float(saved_opening) == 0.0:
+        return working > 0 or spent > 0
+    return False
+
+
+def apply_projects_funds_year_rollover(current_year: int) -> dict:
+    """
+    Carry forward unspent project funds into a new calendar year.
+    Sets both opening snapshot and working balance to max(0, prior_remaining).
+    Also backfills opening mid-year when the Jan 1 snapshot was never stored.
+    """
+    result = {
+        "applied": False,
+        "backfilled": False,
+        "opening": None,
+        "prior_year": None,
+        "prior_spend": 0.0,
+        "prior_remaining": None,
+    }
+    try:
+        house_id = get_current_household_id()
+        settings = get_household_finance_settings()
+        saved_year = settings.get("projects_funds_year")
+        saved_funds = settings.get("projects_funds")
+        saved_opening = settings.get("projects_funds_opening")
+        ytd_spend = sum_project_pool_expenses_for_year(house_id, current_year)
+
+        if saved_year is None:
+            if saved_funds is not None or ytd_spend > 0:
+                opening_val = (
+                    float(saved_opening)
+                    if saved_opening is not None and float(saved_opening) != 0.0
+                    else reconstruct_projects_funds_opening(saved_funds, ytd_spend)
+                )
+                if _upsert_household_projects_funds_row(
+                    projects_funds=saved_funds,
+                    projects_funds_opening=opening_val,
+                    projects_funds_year=current_year,
+                ):
+                    result["backfilled"] = True
+                    result["opening"] = opening_val
+            return result
+
+        if saved_year == current_year:
+            if _projects_funds_opening_needs_backfill(saved_opening, saved_funds, ytd_spend):
+                opening_val = reconstruct_projects_funds_opening(saved_funds, ytd_spend)
+                if _upsert_household_projects_funds_row(
+                    projects_funds=saved_funds,
+                    projects_funds_opening=opening_val,
+                    projects_funds_year=current_year,
+                ):
+                    result["backfilled"] = True
+                    result["opening"] = opening_val
+            return result
+
+        prior_year = int(saved_year)
+        prior_working = float(saved_funds or 0.0)
+        prior_spend = sum_project_pool_expenses_for_year(house_id, prior_year)
+        prior_remaining = prior_working - prior_spend
+        new_balance = max(0.0, prior_remaining)
+
+        if _upsert_household_projects_funds_row(
+            projects_funds=new_balance,
+            projects_funds_opening=new_balance,
+            projects_funds_year=current_year,
+        ):
+            result.update(
+                {
+                    "applied": True,
+                    "opening": new_balance,
+                    "prior_year": prior_year,
+                    "prior_spend": prior_spend,
+                    "prior_remaining": prior_remaining,
+                }
+            )
+        return result
+    except Exception as e:
+        print(f"Error applying projects funds year rollover: {e}")
+        return result
 
 
 def adjust_household_projects_funds(delta, projects_funds_year=None) -> bool:
@@ -4110,32 +4347,27 @@ def adjust_household_projects_funds(delta, projects_funds_year=None) -> bool:
         return False
 
 
-def update_household_projects_funds(projects_funds, projects_funds_year=None):
+def update_household_projects_funds(
+    projects_funds,
+    projects_funds_year=None,
+    *,
+    projects_funds_opening=None,
+    set_opening=False,
+):
     """Encrypts and upserts projects_funds for the active household."""
     try:
         if not _can_edit_projects_server_side():
             return False
-        house_id = get_current_household_id()
-        
-        payload = {
-            "household_id": house_id,
-            "projects_funds_year": projects_funds_year,
-            "updated_at": datetime.now(ZoneInfo("America/Chicago")).isoformat(),
-        }
-        
-        # 🟢 ENCRYPT DOLLAR VALUE IF IT EXISTS
-        if projects_funds is not None:
-            payload["projects_funds"] = encrypt_data(projects_funds)
-        else:
-            payload["projects_funds"] = None
-            
-        (
-            supabase
-            .table(HOUSEHOLD_FINANCE_SETTINGS_TABLE)
-            .upsert(payload, on_conflict="household_id")
-            .execute()
+        opening_arg = (
+            projects_funds_opening
+            if set_opening
+            else _PROJECT_FUNDS_OPENING_UNSET
         )
-        return True
+        return _upsert_household_projects_funds_row(
+            projects_funds=projects_funds,
+            projects_funds_year=projects_funds_year,
+            projects_funds_opening=opening_arg,
+        )
     except Exception as e:
         print(f"Error updating projects funds: {e}")
         return False
