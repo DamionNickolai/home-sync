@@ -40,6 +40,10 @@ from db_connection import connect, load_db_url
 TABLE_PAIRS: list[tuple[str, str]] = [
     ("budget_categories_dev", "budget_categories"),
     ("household_incomes_dev", "household_incomes"),
+    ("household_income_streams_dev", "household_income_streams"),
+    ("household_income_stream_versions_dev", "household_income_stream_versions"),
+    ("household_expense_streams_dev", "household_expense_streams"),
+    ("household_expense_stream_versions_dev", "household_expense_stream_versions"),
     ("expenses_dev", "expenses"),
     ("cash_flow_routing_dev", "cash_flow_routing"),
     ("user_finance_settings_dev", "user_finance_settings"),
@@ -53,6 +57,7 @@ TABLE_PAIRS: list[tuple[str, str]] = [
 # Flag as expected so we don't alarm on it.
 EXPECTED_TYPE_DIFFERENCES: set[tuple[str, str]] = {
     ("expenses", "id"),
+    ("household_expense_streams", "category_id"),
 }
 
 

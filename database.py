@@ -3,13 +3,25 @@ from supabase import create_client, Client
 import pandas as pd
 from security import encrypt_data, decrypt_text, decrypt_float
 import calendar
+import uuid
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
 from utils import calculate_next_version
+from income_schedule import (
+    income_is_sub_monthly_frequency,
+    paycheck_occurrences_in_month,
+    resolve_version_at_date,
+)
+from expense_schedule import (
+    expense_is_sub_monthly_frequency,
+    bill_occurrences_in_month,
+)
 from constants import (
     ALLOWANCE_CATEGORY_NAME,
+    ALLOWANCE_INCOME_SOURCE_NAME,
     DEFAULT_BUDGET_CATEGORIES,
     PROJECT_EXPENSE_CATEGORY,
+    allowance_recipient_username,
     is_allowance_category,
     is_allowance_subcategory,
     is_system_managed_allowance_category,
@@ -77,6 +89,21 @@ def income_is_recurring_frequency(pay_frequency) -> bool:
     return normalize_income_pay_frequency(pay_frequency) != "one_time"
 
 
+def _income_row_is_materialized_occurrence(row) -> bool:
+    """Stream-linked sub-monthly rows are one ledger row per paycheck."""
+    if not row.get("stream_id"):
+        return False
+    freq = _income_row_frequency(row)
+    return income_is_sub_monthly_frequency(freq)
+
+
+def income_amount_for_month_total(amount, pay_frequency, month_year=None, *, row=None) -> float:
+    """Convert a ledger row into its contribution to monthly actual totals."""
+    if row is not None and _income_row_is_materialized_occurrence(row):
+        return float(amount or 0)
+    return normalize_income_amount_for_month(amount, pay_frequency, month_year=month_year)
+
+
 def normalize_income_amount_for_month(amount, pay_frequency, month_year=None) -> float:
     """Convert a per-payment income amount into an estimated monthly total."""
     freq = normalize_income_pay_frequency(pay_frequency)
@@ -100,6 +127,39 @@ def normalize_income_amount_for_month(amount, pay_frequency, month_year=None) ->
     if freq == "annually":
         return safe_amount / 12
     return safe_amount
+
+
+def monthly_amount_to_per_payment(
+    monthly_amount,
+    pay_frequency,
+    *,
+    month_year: str | None = None,
+    versions: list[dict] | None = None,
+) -> float:
+    """Convert a monthly projected total into per-payment stream amount."""
+    freq = normalize_expense_pay_frequency(pay_frequency)
+    safe_monthly = float(monthly_amount or 0)
+    if (
+        month_year
+        and versions
+        and expense_is_sub_monthly_frequency(freq)
+    ):
+        occurrences = bill_occurrences_in_month(versions, month_year)
+        if occurrences:
+            return safe_monthly / len(occurrences)
+    if freq == "weekly":
+        return safe_monthly * 12 / 52
+    if freq == "bi_weekly":
+        return safe_monthly * 12 / 26
+    if freq == "semi_monthly":
+        return safe_monthly / 2
+    if freq == "monthly":
+        return safe_monthly
+    if freq == "quarterly":
+        return safe_monthly * 3
+    if freq == "annually":
+        return safe_monthly * 12
+    return safe_monthly
 
 
 def _row_month_year(row, default=None):
@@ -138,8 +198,11 @@ def sum_income_for_month(incomes_df, selected_month=None) -> float:
         if not freq:
             freq = "monthly" if row.get("is_recurring") else "one_time"
         month_year = _row_month_year(row, selected_month)
-        total += normalize_income_amount_for_month(
-            row.get("take_home_amount"), freq, month_year=month_year
+        total += income_amount_for_month_total(
+            row.get("take_home_amount"),
+            freq,
+            month_year=month_year,
+            row=row,
         )
     return total
 
@@ -157,8 +220,11 @@ def sum_gross_for_month(incomes_df, selected_month=None) -> float:
     total = 0.0
     for _, row in incomes_df.iterrows():
         month_year = _row_month_year(row, selected_month)
-        total += normalize_income_amount_for_month(
-            row.get("gross_amount"), _income_row_frequency(row), month_year=month_year
+        total += income_amount_for_month_total(
+            row.get("gross_amount"),
+            _income_row_frequency(row),
+            month_year=month_year,
+            row=row,
         )
     return total
 
@@ -171,8 +237,11 @@ def sum_taxable_gross_for_month(incomes_df, selected_month=None) -> float:
         if not bool(row.get("is_taxable", False)):
             continue
         month_year = _row_month_year(row, selected_month)
-        total += normalize_income_amount_for_month(
-            row.get("gross_amount"), _income_row_frequency(row), month_year=month_year
+        total += income_amount_for_month_total(
+            row.get("gross_amount"),
+            _income_row_frequency(row),
+            month_year=month_year,
+            row=row,
         )
     return total
 
@@ -185,8 +254,11 @@ def sum_nontaxable_gross_for_month(incomes_df, selected_month=None) -> float:
         if bool(row.get("is_taxable", False)):
             continue
         month_year = _row_month_year(row, selected_month)
-        total += normalize_income_amount_for_month(
-            row.get("gross_amount"), _income_row_frequency(row), month_year=month_year
+        total += income_amount_for_month_total(
+            row.get("gross_amount"),
+            _income_row_frequency(row),
+            month_year=month_year,
+            row=row,
         )
     return total
 
@@ -204,8 +276,17 @@ def compute_annual_income_totals(incomes_df) -> dict:
     annual_gross = 0.0
     annual_taxable = 0.0
     annual_nontaxable = 0.0
+    counted_stream_annual: set[str] = set()
     for _, row in incomes_df.iterrows():
         freq = _income_row_frequency(row)
+        stream_id = row.get("stream_id")
+        if stream_id and (
+            income_is_sub_monthly_frequency(freq) or freq == "monthly"
+        ):
+            stream_key = str(stream_id)
+            if stream_key in counted_stream_annual:
+                continue
+            counted_stream_annual.add(stream_key)
         annual_takehome += annualize_income_amount(row.get("take_home_amount"), freq)
         gross_annual = annualize_income_amount(row.get("gross_amount"), freq)
         annual_gross += gross_annual
@@ -773,6 +854,1468 @@ def get_budget_table(base_name):
     except Exception:
         return base_name
 
+
+def get_income_streams_table():
+    return get_budget_table("household_income_streams")
+
+
+def get_income_stream_versions_table():
+    return get_budget_table("household_income_stream_versions")
+
+
+def _parse_iso_date(value) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, date):
+        return value
+    return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+
+
+def _month_year_from_date(value: date) -> str:
+    return f"{value.year}-{value.month:02d}"
+
+
+def _payment_date_in_month(payment_anchor_day: int, effective_from: date, month_year: str) -> date:
+    year, month = map(int, month_year.split("-"))
+    _, last_day = calendar.monthrange(year, month)
+    day = min(max(int(payment_anchor_day or 1), 1), last_day)
+    if effective_from.year == year and effective_from.month == month:
+        day = min(max(effective_from.day, day), last_day)
+    return date(year, month, day)
+
+
+def _fetch_household_income_row(income_id):
+    target_table = get_budget_table("household_incomes")
+    response = (
+        supabase.table(target_table)
+        .select("*")
+        .eq("id", income_id)
+        .limit(1)
+        .execute()
+    )
+    return response.data[0] if response.data else None
+
+
+def _income_stream_signature(source_name, owner_username, is_personal_income) -> str:
+    return f"{source_name}_{owner_username}_{is_personal_income}"
+
+
+def ensure_income_stream_for_row(income_id) -> str | None:
+    """Link a legacy monthly income row to a stream + version (idempotent)."""
+    row = _fetch_household_income_row(income_id)
+    if not row:
+        return None
+    if row.get("stream_id"):
+        return str(row["stream_id"])
+
+    if row.get("source_expense_id"):
+        return None
+
+    freq = normalize_income_pay_frequency(
+        row.get("pay_frequency") or ("monthly" if row.get("is_recurring") else "one_time")
+    )
+    if freq == "one_time":
+        return None
+
+    payment_date = _parse_iso_date(row.get("payment_date")) or date.today()
+    stream_id = str(uuid.uuid4())
+    version_id = str(uuid.uuid4())
+    streams_table = get_income_streams_table()
+    versions_table = get_income_stream_versions_table()
+    incomes_table = get_budget_table("household_incomes")
+
+    supabase.table(streams_table).insert(
+        {
+            "id": stream_id,
+            "household_id": row["household_id"],
+            "owner_username": row.get("owner_username"),
+            "is_personal_income": bool(row.get("is_personal_income", False)),
+            "display_name": row.get("source_name"),
+            "is_active": True,
+        }
+    ).execute()
+
+    supabase.table(versions_table).insert(
+        {
+            "id": version_id,
+            "stream_id": stream_id,
+            "effective_from": payment_date.isoformat(),
+            "take_home_amount": row.get("take_home_amount"),
+            "gross_amount": row.get("gross_amount"),
+            "is_taxable": bool(row.get("is_taxable", True)),
+            "is_windfall": bool(row.get("is_windfall", False)),
+            "pay_frequency": freq,
+            "payment_anchor_day": payment_date.day,
+        }
+    ).execute()
+
+    supabase.table(incomes_table).update(
+        {"stream_id": stream_id, "version_id": version_id}
+    ).eq("id", income_id).execute()
+    return stream_id
+
+
+def resolve_income_version(stream_id, as_of_date: date) -> dict | None:
+    streams_table = get_income_streams_table()
+    versions_table = get_income_stream_versions_table()
+
+    stream_res = (
+        supabase.table(streams_table)
+        .select("id, is_active, ended_on")
+        .eq("id", stream_id)
+        .limit(1)
+        .execute()
+    )
+    if not stream_res.data:
+        return None
+    stream = stream_res.data[0]
+    if not stream.get("is_active", True):
+        return None
+    ended_on = _parse_iso_date(stream.get("ended_on"))
+    if ended_on and as_of_date > ended_on:
+        return None
+
+    version_res = (
+        supabase.table(versions_table)
+        .select("*")
+        .eq("stream_id", stream_id)
+        .lte("effective_from", as_of_date.isoformat())
+        .order("effective_from", desc=True)
+        .limit(1)
+        .execute()
+    )
+    return version_res.data[0] if version_res.data else None
+
+
+def get_income_stream_versions(stream_id) -> list[dict]:
+    versions_table = get_income_stream_versions_table()
+    response = (
+        supabase.table(versions_table)
+        .select("*")
+        .eq("stream_id", stream_id)
+        .order("effective_from", desc=False)
+        .execute()
+    )
+    rows = response.data or []
+    for row in rows:
+        row["take_home_amount"] = decrypt_float(row.get("take_home_amount"))
+        row["gross_amount"] = decrypt_float(row.get("gross_amount"))
+        if row.get("effective_from") and not isinstance(row.get("effective_from"), str):
+            row["effective_from"] = row["effective_from"].isoformat()
+    return rows
+
+
+def _create_income_stream_and_version(
+    *,
+    household_id,
+    owner_username,
+    is_personal_income,
+    display_name,
+    take_home,
+    gross,
+    is_taxable,
+    is_windfall,
+    pay_frequency,
+    effective_from: date,
+):
+    freq = normalize_income_pay_frequency(pay_frequency)
+    stream_id = str(uuid.uuid4())
+    version_id = str(uuid.uuid4())
+    safe_take_home = float(take_home) if take_home not in [None, ""] else 0.0
+    safe_gross = float(gross) if gross not in [None, ""] else 0.0
+
+    supabase.table(get_income_streams_table()).insert(
+        {
+            "id": stream_id,
+            "household_id": household_id,
+            "owner_username": owner_username,
+            "is_personal_income": is_personal_income,
+            "display_name": encrypt_data(display_name),
+            "is_active": True,
+        }
+    ).execute()
+
+    supabase.table(get_income_stream_versions_table()).insert(
+        {
+            "id": version_id,
+            "stream_id": stream_id,
+            "effective_from": effective_from.isoformat(),
+            "take_home_amount": encrypt_data(safe_take_home),
+            "gross_amount": encrypt_data(safe_gross),
+            "is_taxable": is_taxable,
+            "is_windfall": is_windfall,
+            "pay_frequency": freq,
+            "payment_anchor_day": effective_from.day,
+        }
+    ).execute()
+    return stream_id, version_id
+
+
+def _fetch_stream_versions_raw(stream_id) -> list[dict]:
+    versions_table = get_income_stream_versions_table()
+    response = (
+        supabase.table(versions_table)
+        .select("*")
+        .eq("stream_id", stream_id)
+        .order("effective_from", desc=False)
+        .execute()
+    )
+    return response.data or []
+
+
+def _uses_paycheck_occurrences(versions: list[dict]) -> bool:
+    return any(
+        income_is_sub_monthly_frequency(
+            normalize_income_pay_frequency(version.get("pay_frequency") or "monthly")
+        )
+        for version in versions
+    )
+
+
+def _materialize_income_occurrence(
+    *,
+    stream: dict,
+    version: dict,
+    month_year: str,
+    payment_date: date,
+    household_id: str,
+    existing: dict | None,
+) -> bool:
+    """Insert/update one paycheck ledger row using a pre-fetched existing row.
+
+    Skips the write entirely when the row is locked or already reflects the
+    current version (idempotent re-materialization).
+    """
+    today = datetime.now().date()
+    if payment_date > today:
+        return False
+    if existing and existing.get("is_locked"):
+        return False
+    if existing and str(existing.get("version_id") or "") == str(version.get("id") or ""):
+        return False
+
+    incomes_table = get_budget_table("household_incomes")
+    payment_date_str = payment_date.isoformat()
+    freq = normalize_income_pay_frequency(version.get("pay_frequency") or "monthly")
+    payload = {
+        "household_id": household_id,
+        "month_year": month_year,
+        "source_name": stream.get("display_name"),
+        "take_home_amount": version.get("take_home_amount"),
+        "gross_amount": version.get("gross_amount"),
+        "is_taxable": version.get("is_taxable", True),
+        "owner_username": stream.get("owner_username"),
+        "is_windfall": version.get("is_windfall", False),
+        "is_recurring": income_is_recurring_frequency(freq),
+        "pay_frequency": freq,
+        "is_personal_income": stream.get("is_personal_income", False),
+        "payment_date": payment_date_str,
+        "stream_id": stream["id"],
+        "version_id": version.get("id"),
+    }
+
+    if existing:
+        supabase.table(incomes_table).update(payload).eq("id", existing["id"]).execute()
+    else:
+        supabase.table(incomes_table).insert(payload).execute()
+    return True
+
+
+def _cleanup_stale_income_occurrences(
+    stream_id,
+    month_year: str,
+    household_id: str,
+    expected_payment_dates: set[str],
+) -> None:
+    incomes_table = get_budget_table("household_incomes")
+    response = (
+        supabase.table(incomes_table)
+        .select("id, payment_date, is_locked")
+        .eq("household_id", household_id)
+        .eq("stream_id", stream_id)
+        .eq("month_year", month_year)
+        .execute()
+    )
+    for row in response.data or []:
+        if row.get("is_locked"):
+            continue
+        payment_date = str(row.get("payment_date") or "")[:10]
+        if payment_date not in expected_payment_dates:
+            supabase.table(incomes_table).delete().eq("id", row["id"]).execute()
+
+
+def _expected_income_occurrences(stream_id, versions, month_year):
+    """Return list of (payment_date, version) expected in month_year for a stream.
+
+    Pure/in-memory: resolves the governing version from the provided ``versions``
+    list without additional database round-trips.
+    """
+    if _uses_paycheck_occurrences(versions):
+        return [
+            (occ["payment_date"], occ["version"])
+            for occ in paycheck_occurrences_in_month(versions, month_year)
+        ]
+
+    year, month = map(int, month_year.split("-"))
+    _, last_day = calendar.monthrange(year, month)
+    version = resolve_version_at_date(versions, date(year, month, last_day))
+    if not version:
+        version = resolve_version_at_date(versions, date(year, month, 1))
+    if not version:
+        return []
+    effective_from = _parse_iso_date(version.get("effective_from")) or date(year, month, 1)
+    if _month_year_from_date(effective_from) > month_year:
+        return []
+    payment_date = _payment_date_in_month(
+        version.get("payment_anchor_day") or 1,
+        effective_from,
+        month_year,
+    )
+    return [(payment_date, version)]
+
+
+def materialize_income_month(stream_id, month_year, household_id=None) -> bool:
+    """Create or update ledger rows for each paycheck in month_year.
+
+    Idempotent and batched: fetches existing ledger rows for the month in a
+    single query and only writes rows that are missing or out of date.
+    """
+    streams_table = get_income_streams_table()
+    incomes_table = get_budget_table("household_incomes")
+
+    stream_res = (
+        supabase.table(streams_table)
+        .select("*")
+        .eq("id", stream_id)
+        .limit(1)
+        .execute()
+    )
+    if not stream_res.data:
+        return False
+    stream = stream_res.data[0]
+    if not stream.get("is_active", True):
+        return False
+    house_id = household_id or stream.get("household_id")
+
+    versions = _fetch_stream_versions_raw(stream_id)
+    if not versions:
+        return False
+
+    expected = _expected_income_occurrences(stream_id, versions, month_year)
+
+    # Single query: all existing ledger rows for this stream + month.
+    existing_res = (
+        supabase.table(incomes_table)
+        .select("id, payment_date, version_id, is_locked")
+        .eq("household_id", house_id)
+        .eq("stream_id", stream_id)
+        .eq("month_year", month_year)
+        .execute()
+    )
+    existing_by_date = {
+        str(row.get("payment_date") or "")[:10]: row
+        for row in (existing_res.data or [])
+    }
+
+    injected_any = False
+    expected_dates: set[str] = set()
+    for payment_date, version in expected:
+        date_str = payment_date.isoformat()
+        expected_dates.add(date_str)
+        if _materialize_income_occurrence(
+            stream=stream,
+            version=version,
+            month_year=month_year,
+            payment_date=payment_date,
+            household_id=house_id,
+            existing=existing_by_date.get(date_str),
+        ):
+            injected_any = True
+
+    # Cleanup stale rows using the already-fetched data (no extra query).
+    for date_str, row in existing_by_date.items():
+        if row.get("is_locked"):
+            continue
+        if date_str not in expected_dates:
+            supabase.table(incomes_table).delete().eq("id", row["id"]).execute()
+
+    return injected_any
+
+
+def _upsert_income_stream_version(
+    stream_id,
+    effective_from: date,
+    *,
+    take_home,
+    gross,
+    is_taxable,
+    is_windfall,
+    pay_frequency,
+) -> str:
+    freq = normalize_income_pay_frequency(pay_frequency)
+    safe_take_home = float(take_home) if take_home not in [None, ""] else 0.0
+    safe_gross = float(gross) if gross not in [None, ""] else 0.0
+    versions_table = get_income_stream_versions_table()
+    effective_from_str = effective_from.isoformat()
+    version_payload = {
+        "take_home_amount": encrypt_data(safe_take_home),
+        "gross_amount": encrypt_data(safe_gross),
+        "is_taxable": is_taxable,
+        "is_windfall": is_windfall,
+        "pay_frequency": freq,
+        "payment_anchor_day": effective_from.day,
+    }
+    existing_version = (
+        supabase.table(versions_table)
+        .select("id")
+        .eq("stream_id", stream_id)
+        .eq("effective_from", effective_from_str)
+        .limit(1)
+        .execute()
+    )
+    if existing_version.data:
+        version_id = existing_version.data[0]["id"]
+        supabase.table(versions_table).update(version_payload).eq("id", version_id).execute()
+    else:
+        version_id = str(uuid.uuid4())
+        supabase.table(versions_table).insert(
+            {
+                "id": version_id,
+                "stream_id": stream_id,
+                "effective_from": effective_from_str,
+                **version_payload,
+            }
+        ).execute()
+    return version_id
+
+
+def _rematerialize_stream_from_month(stream_id, from_month_year: str, household_id: str) -> None:
+    """Re-apply versions to unlocked monthly rows at or after from_month_year."""
+    incomes_table = get_budget_table("household_incomes")
+    materialize_income_month(stream_id, from_month_year, household_id)
+    response = (
+        supabase.table(incomes_table)
+        .select("month_year")
+        .eq("household_id", household_id)
+        .eq("stream_id", stream_id)
+        .gt("month_year", from_month_year)
+        .execute()
+    )
+    months = sorted({row["month_year"] for row in (response.data or [])})
+    for month_year in months:
+        materialize_income_month(stream_id, month_year, household_id)
+
+
+def schedule_income_change(
+    income_id,
+    effective_from,
+    source_name,
+    take_home,
+    gross,
+    is_taxable,
+    owner_username,
+    is_windfall,
+    pay_frequency,
+):
+    """New version from effective_from; past monthly rows unchanged."""
+    if not _can_edit_household_income_server_side(income_id):
+        return False
+    stream_id = ensure_income_stream_for_row(income_id)
+    if not stream_id:
+        return False
+
+    if isinstance(effective_from, str):
+        effective_from = datetime.strptime(effective_from[:10], "%Y-%m-%d").date()
+
+    row = _fetch_household_income_row(income_id)
+    if not row:
+        return False
+    household_id = row["household_id"]
+    freq = normalize_income_pay_frequency(pay_frequency)
+    safe_take_home = float(take_home) if take_home not in [None, ""] else 0.0
+    safe_gross = float(gross) if gross not in [None, ""] else 0.0
+    _upsert_income_stream_version(
+        stream_id,
+        effective_from,
+        take_home=safe_take_home,
+        gross=safe_gross,
+        is_taxable=is_taxable,
+        is_windfall=is_windfall,
+        pay_frequency=freq,
+    )
+
+    supabase.table(get_income_streams_table()).update(
+        {"display_name": encrypt_data(source_name), "owner_username": owner_username}
+    ).eq("id", stream_id).execute()
+
+    from_month = _month_year_from_date(effective_from)
+    _rematerialize_stream_from_month(stream_id, from_month, household_id)
+    return True
+
+
+def end_income_stream(income_id, end_date=None) -> bool:
+    """Stop future rollover; preserve all monthly ledger rows."""
+    if not _can_edit_household_income_server_side(income_id):
+        return False
+    stream_id = ensure_income_stream_for_row(income_id)
+    if not stream_id:
+        return False
+    if end_date is None:
+        end_date = date.today()
+    elif isinstance(end_date, str):
+        end_date = datetime.strptime(end_date[:10], "%Y-%m-%d").date()
+
+    supabase.table(get_income_streams_table()).update(
+        {"is_active": False, "ended_on": end_date.isoformat()}
+    ).eq("id", stream_id).execute()
+    return True
+
+
+def delete_household_income_month_only(income_id) -> bool:
+    """Remove one monthly ledger row only (does not end the stream)."""
+    return delete_household_income(income_id)
+
+
+# ==========================================
+# 💳 EXPENSE STREAMS (effective-from + bi-weekly)
+# ==========================================
+
+normalize_expense_pay_frequency = normalize_income_pay_frequency
+expense_pay_frequency_label = income_pay_frequency_label
+EXPENSE_PAY_FREQUENCY_LABELS = INCOME_PAY_FREQUENCY_LABELS
+normalize_expense_amount_for_month = normalize_income_amount_for_month
+
+
+def expense_is_recurring_frequency(pay_frequency) -> bool:
+    return normalize_expense_pay_frequency(pay_frequency) != "one_time"
+
+
+def get_expense_streams_table():
+    return get_budget_table("household_expense_streams")
+
+
+def get_expense_stream_versions_table():
+    return get_budget_table("household_expense_stream_versions")
+
+
+def _fetch_expense_row(expense_id):
+    target_table = get_budget_table("expenses")
+    response = (
+        supabase.table(target_table)
+        .select("*")
+        .eq("id", expense_id)
+        .limit(1)
+        .execute()
+    )
+    return response.data[0] if response.data else None
+
+
+def _expense_stream_signature(details, category_id, username, is_personal_spend) -> str:
+    return f"{details}_{category_id}_{username}_{is_personal_spend}"
+
+
+def ensure_expense_stream_for_row(expense_id) -> str | None:
+    """Link a legacy expense row to a stream + version (idempotent)."""
+    row = _fetch_expense_row(expense_id)
+    if not row:
+        return None
+    if row.get("stream_id"):
+        return str(row["stream_id"])
+
+    freq = normalize_expense_pay_frequency(
+        row.get("pay_frequency") or ("monthly" if row.get("is_recurring") else "one_time")
+    )
+    if freq == "one_time":
+        return None
+
+    date_logged = _parse_iso_date(row.get("date_logged")) or date.today()
+    amount = decrypt_float(row.get("amount")) if row.get("amount") is not None else 0.0
+    details = decrypt_text(row.get("details")) if row.get("details") else ""
+    stream_id = str(uuid.uuid4())
+    version_id = str(uuid.uuid4())
+
+    supabase.table(get_expense_streams_table()).insert(
+        {
+            "id": stream_id,
+            "household_id": row["household_id"],
+            "category_id": row.get("category_id"),
+            "auth_user_id": row.get("auth_user_id"),
+            "username": row.get("username"),
+            "is_personal_spend": bool(row.get("is_personal_spend", False)),
+            "display_name": encrypt_data(details),
+            "is_active": True,
+        }
+    ).execute()
+
+    supabase.table(get_expense_stream_versions_table()).insert(
+        {
+            "id": version_id,
+            "stream_id": stream_id,
+            "effective_from": date_logged.isoformat(),
+            "amount": encrypt_data(amount),
+            "pay_frequency": freq,
+            "payment_anchor_day": date_logged.day,
+        }
+    ).execute()
+
+    expenses_table = get_budget_table("expenses")
+    supabase.table(expenses_table).update(
+        {"stream_id": stream_id, "version_id": version_id, "pay_frequency": freq}
+    ).eq("id", expense_id).execute()
+    return stream_id
+
+
+def resolve_expense_version(stream_id, as_of_date: date) -> dict | None:
+    streams_table = get_expense_streams_table()
+    versions_table = get_expense_stream_versions_table()
+
+    stream_res = (
+        supabase.table(streams_table)
+        .select("id, is_active, ended_on")
+        .eq("id", stream_id)
+        .limit(1)
+        .execute()
+    )
+    if not stream_res.data:
+        return None
+    stream = stream_res.data[0]
+    if not stream.get("is_active", True):
+        return None
+    ended_on = _parse_iso_date(stream.get("ended_on"))
+    if ended_on and as_of_date > ended_on:
+        return None
+
+    version_res = (
+        supabase.table(versions_table)
+        .select("*")
+        .eq("stream_id", stream_id)
+        .lte("effective_from", as_of_date.isoformat())
+        .order("effective_from", desc=True)
+        .limit(1)
+        .execute()
+    )
+    return version_res.data[0] if version_res.data else None
+
+
+def get_expense_stream_versions(stream_id) -> list[dict]:
+    versions_table = get_expense_stream_versions_table()
+    response = (
+        supabase.table(versions_table)
+        .select("*")
+        .eq("stream_id", stream_id)
+        .order("effective_from", desc=False)
+        .execute()
+    )
+    rows = response.data or []
+    for row in rows:
+        row["amount"] = decrypt_float(row.get("amount"))
+        if row.get("effective_from") and not isinstance(row.get("effective_from"), str):
+            row["effective_from"] = row["effective_from"].isoformat()
+    return rows
+
+
+def _expense_stream_active_in_month(stream: dict, month_year: str) -> bool:
+    year, month = map(int, month_year.split("-"))
+    month_start = date(year, month, 1)
+    if not stream.get("is_active", True):
+        return False
+    ended_on = _parse_iso_date(stream.get("ended_on"))
+    return not (ended_on and ended_on < month_start)
+
+
+def _expense_stream_schedule_day(
+    stream_id,
+    versions: list[dict],
+    month_year: str,
+) -> int | None:
+    if _uses_expense_bill_occurrences(versions):
+        occurrences = bill_occurrences_in_month(versions, month_year)
+        if occurrences:
+            return occurrences[0]["date_logged"].day
+
+    year, month = map(int, month_year.split("-"))
+    _, last_day = calendar.monthrange(year, month)
+    version = resolve_expense_version(stream_id, date(year, month, last_day))
+    if version:
+        return int(version.get("payment_anchor_day") or 1)
+    return None
+
+
+def project_expense_stream_for_month(
+    stream_id,
+    month_year: str,
+    versions: list[dict] | None = None,
+) -> float:
+    """Estimated monthly projected cost for one expense stream."""
+    streams_table = get_expense_streams_table()
+    stream_res = (
+        supabase.table(streams_table)
+        .select("id, is_active, ended_on")
+        .eq("id", stream_id)
+        .limit(1)
+        .execute()
+    )
+    if not stream_res.data:
+        return 0.0
+    stream = stream_res.data[0]
+    if not _expense_stream_active_in_month(stream, month_year):
+        return 0.0
+
+    if versions is None:
+        versions = get_expense_stream_versions(stream_id)
+    if not versions:
+        return 0.0
+
+    first_effective = _parse_iso_date(versions[0].get("effective_from")) or date.today()
+    if _month_year_from_date(first_effective) > month_year:
+        return 0.0
+
+    if _uses_expense_bill_occurrences(versions):
+        total = 0.0
+        for occurrence in bill_occurrences_in_month(versions, month_year):
+            total += float(occurrence.get("version", {}).get("amount") or 0)
+        return total
+
+    year, month = map(int, month_year.split("-"))
+    _, last_day = calendar.monthrange(year, month)
+    version = resolve_expense_version(stream_id, date(year, month, last_day))
+    if not version:
+        return 0.0
+    amount = decrypt_float(version.get("amount")) if version.get("amount") is not None else 0.0
+    freq = normalize_expense_pay_frequency(version.get("pay_frequency") or "monthly")
+    return normalize_expense_amount_for_month(amount, freq, month_year=month_year)
+
+
+def get_expense_stream_projections(
+    household_id,
+    month_year: str,
+    *,
+    is_personal_spend: bool = False,
+    username: str | None = None,
+) -> tuple[dict, dict]:
+    """Projected monthly cost and bill-day schedule per category from expense streams.
+
+    Categories present in the returned projections dict should use stream totals
+    instead of static category target_budget values.
+    """
+    streams_table = get_expense_streams_table()
+    query = (
+        supabase.table(streams_table)
+        .select("id, category_id, is_active, ended_on")
+        .eq("household_id", household_id)
+        .eq("is_personal_spend", is_personal_spend)
+        .eq("is_active", True)
+    )
+    if is_personal_spend and username:
+        query = query.eq("username", username)
+
+    response = query.execute()
+
+    projections: dict = {}
+    schedule: dict = {}
+
+    for stream in response.data or []:
+        if not _expense_stream_active_in_month(stream, month_year):
+            continue
+        cat_id = stream.get("category_id")
+        if cat_id is None:
+            continue
+
+        stream_id = stream["id"]
+        versions = get_expense_stream_versions(stream_id)
+        if not versions:
+            continue
+        first_effective = _parse_iso_date(versions[0].get("effective_from")) or date.today()
+        if _month_year_from_date(first_effective) > month_year:
+            continue
+
+        projected = project_expense_stream_for_month(stream_id, month_year, versions=versions)
+        projections[cat_id] = projections.get(cat_id, 0.0) + projected
+
+        bill_day = _expense_stream_schedule_day(stream_id, versions, month_year)
+        if bill_day is not None:
+            if cat_id not in schedule or bill_day < schedule[cat_id]:
+                schedule[cat_id] = bill_day
+
+    normalized_projections = {str(k): float(v) for k, v in projections.items()}
+    normalized_schedule = {str(k): int(v) for k, v in schedule.items()}
+    return normalized_projections, normalized_schedule
+
+
+def sum_expense_stream_projections_for_months(
+    household_id,
+    month_years: list[str],
+    *,
+    is_personal_spend: bool = False,
+    username: str | None = None,
+) -> dict:
+    """Sum stream-based projections across multiple months (annual / YTD reports)."""
+    totals: dict = {}
+    for month_year in month_years:
+        projections, _ = get_expense_stream_projections(
+            household_id,
+            month_year,
+            is_personal_spend=is_personal_spend,
+            username=username,
+        )
+        for cat_id, amount in projections.items():
+            totals[cat_id] = totals.get(cat_id, 0.0) + float(amount)
+    return totals
+
+
+def _fetch_category_scope(category_id) -> dict | None:
+    target_table = get_budget_table("budget_categories")
+    response = (
+        supabase.table(target_table)
+        .select("household_id, is_personal, username")
+        .eq("id", category_id)
+        .limit(1)
+        .execute()
+    )
+    return response.data[0] if response.data else None
+
+
+def _update_category_target_budget_only(category_id, monthly_target: float) -> bool:
+    if is_system_project_expense_category_id(category_id):
+        return False
+    if is_allowance_subcategory_id(category_id):
+        return False
+    if not _can_edit_category_server_side(category_id):
+        return False
+    target_table = get_budget_table("budget_categories")
+    try:
+        safe_target = float(monthly_target) if monthly_target not in [None, ""] else 0.0
+        supabase.table(target_table).update(
+            {"target_budget": encrypt_data(safe_target)}
+        ).eq("id", category_id).execute()
+        return True
+    except Exception as e:
+        print(f"Error updating category target budget: {e}")
+        return False
+
+
+def _billing_anchor_from_stream_history(
+    stream_id,
+    household_id: str,
+) -> tuple[int, date] | None:
+    """Infer billing anchor from expense rows already logged for this stream."""
+    from collections import Counter
+
+    expenses_table = get_budget_table("expenses")
+    response = (
+        supabase.table(expenses_table)
+        .select("date_logged")
+        .eq("household_id", household_id)
+        .eq("stream_id", stream_id)
+        .order("date_logged", desc=False)
+        .limit(24)
+        .execute()
+    )
+    dates = [
+        _parse_iso_date(row.get("date_logged"))
+        for row in (response.data or [])
+        if row.get("date_logged")
+    ]
+    dates = [d for d in dates if d]
+    if not dates:
+        return None
+
+    day_counts = Counter(d.day for d in dates)
+    non_one = {day: count for day, count in day_counts.items() if day != 1}
+    anchor_day = max(non_one or day_counts, key=(non_one or day_counts).get)
+
+    anchor_date = next((d for d in dates if d.day == anchor_day), dates[0])
+    return anchor_day, anchor_date
+
+
+def sync_category_target_to_expense_streams(
+    category_id,
+    household_id: str,
+    monthly_target: float,
+) -> int:
+    """Push a category monthly target into linked active expense streams."""
+    streams_table = get_expense_streams_table()
+    response = (
+        supabase.table(streams_table)
+        .select("id")
+        .eq("household_id", household_id)
+        .eq("category_id", category_id)
+        .eq("is_active", True)
+        .execute()
+    )
+    updated = 0
+    from_month = _month_year_from_date(date.today())
+    versions_table = get_expense_stream_versions_table()
+    for row in response.data or []:
+        stream_id = str(row["id"])
+        versions = get_expense_stream_versions(stream_id)
+        if not versions:
+            continue
+
+        expenses_table = get_budget_table("expenses")
+        ledger_res = (
+            supabase.table(expenses_table)
+            .select("date_logged")
+            .eq("household_id", household_id)
+            .eq("stream_id", stream_id)
+            .eq("month_year", from_month)
+            .order("date_logged", desc=False)
+            .execute()
+        )
+        ledger_dates = [
+            _parse_iso_date(row.get("date_logged"))
+            for row in (ledger_res.data or [])
+            if row.get("date_logged")
+        ]
+
+        history_anchor = _billing_anchor_from_stream_history(stream_id, household_id)
+        governing = None
+        if history_anchor:
+            anchor_day, _ = history_anchor
+            for ver in versions:
+                if int(ver.get("payment_anchor_day") or 0) == anchor_day:
+                    governing = ver
+                    break
+        if governing is None and ledger_dates:
+            anchor_day = ledger_dates[0].day
+            for ver in versions:
+                if int(ver.get("payment_anchor_day") or 0) == anchor_day:
+                    governing = ver
+                    break
+            if governing is None:
+                for ver in versions:
+                    eff = _parse_iso_date(ver.get("effective_from"))
+                    if eff and eff.day == anchor_day:
+                        governing = ver
+                        break
+        if governing is None:
+            non_month_start = [
+                ver
+                for ver in versions
+                if (_parse_iso_date(ver.get("effective_from")) or date.today()).day != 1
+            ]
+            governing = non_month_start[0] if non_month_start else versions[0]
+
+        freq = normalize_expense_pay_frequency(governing.get("pay_frequency") or "monthly")
+        governing_id = governing["id"]
+
+        if history_anchor:
+            anchor_day, anchor_date = history_anchor
+            current_anchor = int(governing.get("payment_anchor_day") or 0)
+            current_eff = _parse_iso_date(governing.get("effective_from"))
+            if current_anchor != anchor_day or (
+                current_eff and current_eff.day == 1 and anchor_day != 1
+            ):
+                supabase.table(versions_table).update(
+                    {
+                        "payment_anchor_day": anchor_day,
+                        "effective_from": anchor_date.isoformat(),
+                    }
+                ).eq("id", governing_id).execute()
+                governing["payment_anchor_day"] = anchor_day
+                governing["effective_from"] = anchor_date.isoformat()
+
+        schedule_versions = [governing]
+        occurrences = bill_occurrences_in_month(schedule_versions, from_month)
+        if not occurrences:
+            occurrences = bill_occurrences_in_month(versions, from_month)
+        if not occurrences:
+            continue
+
+        per_payment = float(monthly_target) / len(occurrences)
+
+        supabase.table(versions_table).update(
+            {
+                "amount": encrypt_data(per_payment),
+                "pay_frequency": freq,
+            }
+        ).eq("id", governing_id).execute()
+
+        for ver in versions:
+            if ver["id"] == governing_id:
+                continue
+            eff = _parse_iso_date(ver.get("effective_from"))
+            if eff and _month_year_from_date(eff) == from_month:
+                supabase.table(versions_table).delete().eq("id", ver["id"]).execute()
+
+        _rematerialize_expense_stream_from_month(stream_id, from_month, household_id)
+        updated += 1
+    if updated > 0:
+        target_table = get_budget_table("budget_categories")
+        supabase.table(target_table).update(
+            {"target_budget": encrypt_data(float(monthly_target))}
+        ).eq("id", category_id).execute()
+    return updated
+
+
+def sync_category_target_from_stream_monthly(
+    category_id,
+    household_id: str,
+    month_year: str,
+) -> bool:
+    """Pull stream monthly projection back into category target_budget."""
+    scope = _fetch_category_scope(category_id)
+    if not scope:
+        return False
+    projections, _ = get_expense_stream_projections(
+        household_id,
+        month_year,
+        is_personal_spend=bool(scope.get("is_personal", False)),
+        username=scope.get("username"),
+    )
+    monthly = projections.get(str(category_id))
+    if monthly is None:
+        return False
+    ok = _update_category_target_budget_only(category_id, monthly)
+    return ok
+
+
+def _upsert_expense_stream_version(
+    stream_id,
+    effective_from: date,
+    *,
+    amount,
+    pay_frequency,
+) -> str:
+    freq = normalize_expense_pay_frequency(pay_frequency)
+    safe_amount = float(amount) if amount not in [None, ""] else 0.0
+    versions_table = get_expense_stream_versions_table()
+    effective_from_str = effective_from.isoformat()
+    version_payload = {
+        "amount": encrypt_data(safe_amount),
+        "pay_frequency": freq,
+        "payment_anchor_day": effective_from.day,
+    }
+    existing_version = (
+        supabase.table(versions_table)
+        .select("id")
+        .eq("stream_id", stream_id)
+        .eq("effective_from", effective_from_str)
+        .limit(1)
+        .execute()
+    )
+    if existing_version.data:
+        version_id = existing_version.data[0]["id"]
+        supabase.table(versions_table).update(version_payload).eq("id", version_id).execute()
+    else:
+        version_id = str(uuid.uuid4())
+        supabase.table(versions_table).insert(
+            {
+                "id": version_id,
+                "stream_id": stream_id,
+                "effective_from": effective_from_str,
+                **version_payload,
+            }
+        ).execute()
+    return version_id
+
+
+def _create_expense_stream_and_version(
+    *,
+    household_id,
+    category_id,
+    auth_user_id,
+    username,
+    is_personal_spend,
+    display_name,
+    amount,
+    pay_frequency,
+    effective_from: date,
+):
+    freq = normalize_expense_pay_frequency(pay_frequency)
+    stream_id = str(uuid.uuid4())
+    version_id = str(uuid.uuid4())
+    safe_amount = float(amount) if amount not in [None, ""] else 0.0
+
+    supabase.table(get_expense_streams_table()).insert(
+        {
+            "id": stream_id,
+            "household_id": household_id,
+            "category_id": category_id,
+            "auth_user_id": auth_user_id,
+            "username": username,
+            "is_personal_spend": is_personal_spend,
+            "display_name": encrypt_data(display_name),
+            "is_active": True,
+        }
+    ).execute()
+
+    supabase.table(get_expense_stream_versions_table()).insert(
+        {
+            "id": version_id,
+            "stream_id": stream_id,
+            "effective_from": effective_from.isoformat(),
+            "amount": encrypt_data(safe_amount),
+            "pay_frequency": freq,
+            "payment_anchor_day": effective_from.day,
+        }
+    ).execute()
+    return stream_id, version_id
+
+
+def _fetch_expense_stream_versions_raw(stream_id) -> list[dict]:
+    versions_table = get_expense_stream_versions_table()
+    response = (
+        supabase.table(versions_table)
+        .select("*")
+        .eq("stream_id", stream_id)
+        .order("effective_from", desc=False)
+        .execute()
+    )
+    return response.data or []
+
+
+def _uses_expense_bill_occurrences(versions: list[dict]) -> bool:
+    return any(
+        expense_is_sub_monthly_frequency(
+            normalize_expense_pay_frequency(version.get("pay_frequency") or "monthly")
+        )
+        for version in versions
+    )
+
+
+def _materialize_expense_occurrence(
+    *,
+    stream: dict,
+    version: dict,
+    month_year: str,
+    date_logged: date,
+    household_id: str,
+    existing: dict | None,
+) -> str | None:
+    """Insert/update one expense ledger row using a pre-fetched existing row.
+
+    Skips the write when the row is locked or already reflects the current
+    version (idempotent re-materialization).
+    """
+    today = datetime.now().date()
+    if date_logged > today:
+        return None
+    if existing and existing.get("is_locked"):
+        return None
+    if existing and str(existing.get("version_id") or "") == str(version.get("id") or ""):
+        return None
+
+    expenses_table = get_budget_table("expenses")
+    date_str = date_logged.isoformat()
+    freq = normalize_expense_pay_frequency(version.get("pay_frequency") or "monthly")
+    payload = {
+        "household_id": household_id,
+        "auth_user_id": stream.get("auth_user_id"),
+        "username": stream.get("username"),
+        "month_year": month_year,
+        "date_logged": date_str,
+        "category_id": stream.get("category_id"),
+        "amount": version.get("amount"),
+        "details": stream.get("display_name"),
+        "is_personal_spend": stream.get("is_personal_spend", False),
+        "is_recurring": expense_is_recurring_frequency(freq),
+        "pay_frequency": freq,
+        "stream_id": stream["id"],
+        "version_id": version.get("id"),
+    }
+
+    if existing:
+        expense_id = existing["id"]
+        supabase.table(expenses_table).update(payload).eq("id", expense_id).execute()
+        return str(expense_id)
+
+    response = supabase.table(expenses_table).insert(payload).execute()
+    if response.data:
+        return str(response.data[0].get("id"))
+    return None
+
+
+def _cleanup_stale_expense_occurrences(
+    stream_id,
+    month_year: str,
+    household_id: str,
+    expected_dates: set[str],
+) -> None:
+    expenses_table = get_budget_table("expenses")
+    response = (
+        supabase.table(expenses_table)
+        .select("id, date_logged, is_locked")
+        .eq("household_id", household_id)
+        .eq("stream_id", stream_id)
+        .eq("month_year", month_year)
+        .execute()
+    )
+    for row in response.data or []:
+        if row.get("is_locked"):
+            continue
+        logged = str(row.get("date_logged") or "")[:10]
+        if logged not in expected_dates:
+            supabase.table(expenses_table).delete().eq("id", row["id"]).execute()
+
+
+def materialize_expense_month(stream_id, month_year, household_id=None) -> bool:
+    """Create or update expense ledger rows for each bill date in month_year."""
+    streams_table = get_expense_streams_table()
+
+    stream_res = (
+        supabase.table(streams_table)
+        .select("*")
+        .eq("id", stream_id)
+        .limit(1)
+        .execute()
+    )
+    if not stream_res.data:
+        return False
+    stream = stream_res.data[0]
+    if not stream.get("is_active", True):
+        return False
+    house_id = household_id or stream.get("household_id")
+
+    versions = _fetch_expense_stream_versions_raw(stream_id)
+    if not versions:
+        return False
+
+    expected = _expected_expense_occurrences(stream_id, versions, month_year)
+
+    # Single query: all existing ledger rows for this stream + month.
+    expenses_table = get_budget_table("expenses")
+    existing_res = (
+        supabase.table(expenses_table)
+        .select("id, date_logged, version_id, is_locked")
+        .eq("household_id", house_id)
+        .eq("stream_id", stream_id)
+        .eq("month_year", month_year)
+        .execute()
+    )
+    existing_by_date = {
+        str(row.get("date_logged") or "")[:10]: row
+        for row in (existing_res.data or [])
+    }
+
+    injected_any = False
+    expected_dates: set[str] = set()
+    for bill_date, version in expected:
+        date_str = bill_date.isoformat()
+        expected_dates.add(date_str)
+        if _materialize_expense_occurrence(
+            stream=stream,
+            version=version,
+            month_year=month_year,
+            date_logged=bill_date,
+            household_id=house_id,
+            existing=existing_by_date.get(date_str),
+        ):
+            injected_any = True
+
+    # Cleanup stale rows using the already-fetched data (no extra query).
+    for date_str, row in existing_by_date.items():
+        if row.get("is_locked"):
+            continue
+        if date_str not in expected_dates:
+            supabase.table(expenses_table).delete().eq("id", row["id"]).execute()
+
+    return injected_any
+
+
+def _expected_expense_occurrences(stream_id, versions, month_year):
+    """Return list of (bill_date, version) expected in month_year for a stream.
+
+    Pure/in-memory: resolves the governing version from the provided ``versions``
+    list without additional database round-trips.
+    """
+    if _uses_expense_bill_occurrences(versions):
+        return [
+            (occ["date_logged"], occ["version"])
+            for occ in bill_occurrences_in_month(versions, month_year)
+        ]
+
+    year, month = map(int, month_year.split("-"))
+    _, last_day = calendar.monthrange(year, month)
+    version = resolve_version_at_date(versions, date(year, month, last_day))
+    if not version:
+        version = resolve_version_at_date(versions, date(year, month, 1))
+    if not version:
+        return []
+    effective_from = _parse_iso_date(version.get("effective_from")) or date(year, month, 1)
+    if _month_year_from_date(effective_from) > month_year:
+        return []
+    bill_date = _payment_date_in_month(
+        version.get("payment_anchor_day") or 1,
+        effective_from,
+        month_year,
+    )
+    return [(bill_date, version)]
+
+
+def _rematerialize_expense_stream_from_month(stream_id, from_month_year: str, household_id: str) -> None:
+    expenses_table = get_budget_table("expenses")
+    materialize_expense_month(stream_id, from_month_year, household_id)
+    response = (
+        supabase.table(expenses_table)
+        .select("month_year")
+        .eq("household_id", household_id)
+        .eq("stream_id", stream_id)
+        .gt("month_year", from_month_year)
+        .execute()
+    )
+    months = sorted({row["month_year"] for row in (response.data or [])})
+    for month_year in months:
+        materialize_expense_month(stream_id, month_year, household_id)
+
+
+def schedule_expense_change(
+    expense_id,
+    effective_from,
+    amount,
+    details,
+    pay_frequency,
+    category_id=None,
+):
+    """New version from effective_from; past expense rows unchanged."""
+    if not _can_edit_expense_server_side(expense_id):
+        return False
+    stream_id = ensure_expense_stream_for_row(expense_id)
+    if not stream_id:
+        return False
+
+    if isinstance(effective_from, str):
+        effective_from = datetime.strptime(effective_from[:10], "%Y-%m-%d").date()
+
+    row = _fetch_expense_row(expense_id)
+    if not row:
+        return False
+    household_id = row["household_id"]
+    safe_amount = float(amount) if amount not in [None, ""] else 0.0
+
+    _upsert_expense_stream_version(
+        stream_id,
+        effective_from,
+        amount=safe_amount,
+        pay_frequency=pay_frequency,
+    )
+
+    stream_update = {"display_name": encrypt_data(details)}
+    if category_id is not None:
+        stream_update["category_id"] = category_id
+    supabase.table(get_expense_streams_table()).update(stream_update).eq("id", stream_id).execute()
+
+    from_month = _month_year_from_date(effective_from)
+    _rematerialize_expense_stream_from_month(stream_id, from_month, household_id)
+    _sync_allowance_for_stream_month(stream_id, from_month, household_id)
+    if row.get("category_id"):
+        sync_category_target_from_stream_monthly(row["category_id"], household_id, from_month)
+    return True
+
+
+def end_expense_stream(expense_id, end_date=None) -> bool:
+    """Stop future rollover; preserve ledger history."""
+    if not _can_edit_expense_server_side(expense_id):
+        return False
+    stream_id = ensure_expense_stream_for_row(expense_id)
+    if not stream_id:
+        return False
+    if end_date is None:
+        end_date = date.today()
+    elif isinstance(end_date, str):
+        end_date = datetime.strptime(end_date[:10], "%Y-%m-%d").date()
+
+    supabase.table(get_expense_streams_table()).update(
+        {"is_active": False, "ended_on": end_date.isoformat()}
+    ).eq("id", stream_id).execute()
+    return True
+
+
+def delete_expense_month_only(expense_id) -> bool:
+    """Remove one expense ledger row only (does not end the stream)."""
+    return delete_expense(expense_id)
+
+
+def _sync_allowance_for_stream_month(stream_id, month_year, household_id) -> None:
+    """Re-sync allowance personal income when a household allowance stream materializes."""
+    expenses_table = get_budget_table("expenses")
+    response = (
+        supabase.table(expenses_table)
+        .select(
+            "id, category_id, amount, date_logged, month_year, is_personal_spend, "
+            "is_recurring, pay_frequency"
+        )
+        .eq("household_id", household_id)
+        .eq("stream_id", stream_id)
+        .eq("month_year", month_year)
+        .eq("is_personal_spend", False)
+        .execute()
+    )
+    for row in response.data or []:
+        category_id = row.get("category_id")
+        if not category_id or not is_allowance_subcategory_id(
+            category_id, household_id=household_id
+        ):
+            continue
+        recipient = get_allowance_recipient_username(category_id)
+        if not recipient:
+            continue
+        amount = decrypt_float(row.get("amount")) if row.get("amount") is not None else 0.0
+        freq = _resolve_allowance_pay_frequency(
+            expense_flags=row,
+            is_recurring=bool(row.get("is_recurring")),
+        )
+        _sync_allowance_personal_income(
+            household_id=household_id,
+            expense_id=row.get("id"),
+            recipient_username=recipient,
+            amount=amount,
+            payment_date=row.get("date_logged"),
+            month_year=month_year,
+            is_recurring=freq != "one_time",
+            pay_frequency=freq,
+        )
+
+
+def _log_expense_via_stream(
+    *,
+    auth_user_id,
+    username,
+    household_id,
+    month_year,
+    date_logged,
+    category_id,
+    amount,
+    details,
+    is_personal_spend,
+    pay_frequency,
+) -> str | None:
+    """Create stream + materialize; returns first expense id for the month."""
+    freq = normalize_expense_pay_frequency(pay_frequency)
+    if isinstance(date_logged, str):
+        date_logged = datetime.strptime(date_logged[:10], "%Y-%m-%d").date()
+
+    stream_id, _ = _create_expense_stream_and_version(
+        household_id=household_id,
+        category_id=category_id,
+        auth_user_id=auth_user_id,
+        username=username,
+        is_personal_spend=is_personal_spend,
+        display_name=details,
+        amount=amount,
+        pay_frequency=freq,
+        effective_from=date_logged,
+    )
+    materialize_expense_month(stream_id, month_year, household_id)
+    expenses_table = get_budget_table("expenses")
+    response = (
+        supabase.table(expenses_table)
+        .select("id")
+        .eq("household_id", household_id)
+        .eq("stream_id", stream_id)
+        .eq("month_year", month_year)
+        .order("date_logged", desc=False)
+        .limit(1)
+        .execute()
+    )
+    if response.data:
+        expense_id = str(response.data[0]["id"])
+    else:
+        expense_id = None
+    sync_category_target_from_stream_monthly(category_id, household_id, month_year)
+    return expense_id
+
+
 def get_user_finance_settings(household_id, username):
     """Fetches the user's specific finance UI settings and privacy toggles."""
     target_table = get_budget_table("user_finance_settings")
@@ -883,6 +2426,10 @@ def get_monthly_expenses(household_id, month_year, include_private_members=True)
         for row in response.data:
             row["amount"] = decrypt_float(row.get("amount"))
             row["details"] = decrypt_text(row.get("details"))
+            row["pay_frequency"] = normalize_expense_pay_frequency(
+                row.get("pay_frequency")
+                or ("monthly" if row.get("is_recurring") else "one_time")
+            )
             
         return pd.DataFrame(response.data)
     except Exception as e:
@@ -911,6 +2458,10 @@ def get_expenses_for_period(household_id, start_month, end_month, include_privat
         for row in response.data:
             row["amount"] = decrypt_float(row.get("amount"))
             row["details"] = decrypt_text(row.get("details"))
+            row["pay_frequency"] = normalize_expense_pay_frequency(
+                row.get("pay_frequency")
+                or ("monthly" if row.get("is_recurring") else "one_time")
+            )
 
         return pd.DataFrame(response.data)
     except Exception as e:
@@ -991,8 +2542,20 @@ def get_distinct_budget_years(household_id) -> list:
     return sorted(years, reverse=True)
 
 
-def log_expense_and_check_project(auth_user_id, username, household_id, month_year, date_logged, category_id, amount, details, is_personal_spend=False, is_recurring=False):
-    """Logs an expense, now tracking if it is a recurring monthly bill."""
+def log_expense_and_check_project(
+    auth_user_id,
+    username,
+    household_id,
+    month_year,
+    date_logged,
+    category_id,
+    amount,
+    details,
+    is_personal_spend=False,
+    is_recurring=False,
+    pay_frequency=None,
+):
+    """Logs an expense; recurring bills use expense streams + materialized ledger rows."""
     if not is_personal_spend:
         if not _can_edit_monthly_budget_server_side():
             return False
@@ -1002,40 +2565,76 @@ def log_expense_and_check_project(auth_user_id, username, household_id, month_ye
     ):
         return False
 
-    target_table = get_budget_table("expenses")
-    try:
-        payload = {
-            "household_id": household_id,
-            "auth_user_id": auth_user_id,
-            "username": username,
-            "month_year": month_year,
-            "date_logged": date_logged.isoformat(),
-            "category_id": category_id,
-            "amount": encrypt_data(float(amount)),
-            "details": encrypt_data(details),
-            "is_personal_spend": is_personal_spend,
-            "is_recurring": is_recurring  # 🟢 NEW: Recurring flag added to payload
-        }
-        response = supabase.table(target_table).insert(payload).execute()
-        if not response.data:
-            return False
+    if pay_frequency:
+        freq = normalize_expense_pay_frequency(pay_frequency)
+    elif is_recurring:
+        freq = "monthly"
+    else:
+        freq = "one_time"
 
-        expense_id = response.data[0].get("id")
+    try:
+        expense_id = None
+        if freq == "one_time":
+            target_table = get_budget_table("expenses")
+            payload = {
+                "household_id": household_id,
+                "auth_user_id": auth_user_id,
+                "username": username,
+                "month_year": month_year,
+                "date_logged": date_logged.isoformat()
+                if hasattr(date_logged, "isoformat")
+                else str(date_logged)[:10],
+                "category_id": category_id,
+                "amount": encrypt_data(float(amount)),
+                "details": encrypt_data(details),
+                "is_personal_spend": is_personal_spend,
+                "is_recurring": False,
+                "pay_frequency": freq,
+            }
+            response = supabase.table(target_table).insert(payload).execute()
+            if not response.data:
+                return False
+            expense_id = response.data[0].get("id")
+        else:
+            if isinstance(date_logged, str):
+                date_logged = datetime.strptime(date_logged[:10], "%Y-%m-%d").date()
+            expense_id = _log_expense_via_stream(
+                auth_user_id=auth_user_id,
+                username=username,
+                household_id=household_id,
+                month_year=month_year,
+                date_logged=date_logged,
+                category_id=category_id,
+                amount=float(amount),
+                details=details,
+                is_personal_spend=is_personal_spend,
+                pay_frequency=freq,
+            )
+            if not expense_id:
+                return False
+
         if (
             expense_id
             and not is_personal_spend
-            and is_allowance_subcategory_id(category_id)
+            and is_allowance_subcategory_id(category_id, household_id=household_id)
         ):
             recipient = get_allowance_recipient_username(category_id)
             if recipient:
-                _insert_allowance_personal_income(
-                    household_id=household_id,
-                    expense_id=expense_id,
-                    recipient_username=recipient,
-                    amount=float(amount),
-                    payment_date=date_logged,
-                    month_year=month_year,
-                )
+                expense_flags = _fetch_expense_flags(expense_id)
+                stream_id = expense_flags.get("stream_id") if expense_flags else None
+                if stream_id and freq != "one_time":
+                    _sync_allowance_for_stream_month(stream_id, month_year, household_id)
+                else:
+                    _sync_allowance_personal_income(
+                        household_id=household_id,
+                        expense_id=expense_id,
+                        recipient_username=recipient,
+                        amount=float(amount),
+                        payment_date=date_logged,
+                        month_year=month_year,
+                        is_recurring=freq != "one_time",
+                        pay_frequency=freq,
+                    )
         return True
     except Exception as e:
         print(f"Error logging expense: {e}")
@@ -1210,30 +2809,44 @@ def insert_household_income(
 
     target_table = get_budget_table("household_incomes")
     try:
-        # 🟢 SAFETY NET: Convert None to 0.0 before trying to make it a float
         safe_take_home = float(take_home) if take_home not in [None, ""] else 0.0
         safe_gross = float(gross) if gross not in [None, ""] else 0.0
         if payment_date is None:
             payment_date = date.today()
         elif isinstance(payment_date, str):
             payment_date = datetime.strptime(payment_date, "%Y-%m-%d").date()
-        
-        payload = {
-            "household_id": household_id,
-            "month_year": month_year,
-            "source_name": encrypt_data(source_name),
-            "take_home_amount": encrypt_data(safe_take_home),
-            "gross_amount": encrypt_data(safe_gross),
-            "is_taxable": is_taxable,
-            "owner_username": owner_username,
-            "is_windfall": is_windfall,
-            "is_recurring": income_is_recurring_frequency(freq),
-            "pay_frequency": freq,
-            "is_personal_income": is_personal_income,
-            "payment_date": payment_date.isoformat(),
-        }
-        supabase.table(target_table).insert(payload).execute()
-        return True
+
+        if freq == "one_time":
+            payload = {
+                "household_id": household_id,
+                "month_year": month_year,
+                "source_name": encrypt_data(source_name),
+                "take_home_amount": encrypt_data(safe_take_home),
+                "gross_amount": encrypt_data(safe_gross),
+                "is_taxable": is_taxable,
+                "owner_username": owner_username,
+                "is_windfall": is_windfall,
+                "is_recurring": False,
+                "pay_frequency": freq,
+                "is_personal_income": is_personal_income,
+                "payment_date": payment_date.isoformat(),
+            }
+            supabase.table(target_table).insert(payload).execute()
+            return True
+
+        stream_id, version_id = _create_income_stream_and_version(
+            household_id=household_id,
+            owner_username=owner_username,
+            is_personal_income=is_personal_income,
+            display_name=source_name,
+            take_home=safe_take_home,
+            gross=safe_gross,
+            is_taxable=is_taxable,
+            is_windfall=is_windfall,
+            pay_frequency=freq,
+            effective_from=payment_date,
+        )
+        return materialize_income_month(stream_id, month_year, household_id)
     except Exception as e:
         print(f"Error inserting income: {e}")
         return False
@@ -1413,7 +3026,10 @@ def _fetch_expense_flags(expense_id):
     try:
         response = (
             supabase.table(target_table)
-            .select("is_personal_spend, auth_user_id, household_id, category_id, date_logged, month_year")
+            .select(
+                "is_personal_spend, auth_user_id, household_id, category_id, "
+                "date_logged, month_year, is_recurring, pay_frequency, stream_id"
+            )
             .eq("id", expense_id)
             .limit(1)
             .execute()
@@ -1462,26 +3078,36 @@ def is_system_project_expense_category_id(category_id) -> bool:
     return is_system_project_expense_category(category_name, sub_category_name)
 
 
-def is_allowance_subcategory_id(category_id) -> bool:
+def _try_session_household_id():
+    try:
+        return get_current_household_id()
+    except ValueError:
+        return None
+
+
+def _allowance_recipient_from_record(record) -> str | None:
+    if not record:
+        return None
+    return allowance_recipient_username(
+        decrypt_text(record.get("category_name")),
+        decrypt_text(record.get("sub_category_name")),
+        username_field=record.get("username"),
+    )
+
+
+def is_allowance_subcategory_id(category_id, *, household_id=None) -> bool:
     record = _fetch_category_flags(category_id)
     if not record:
         return False
-    if record.get("household_id") != get_current_household_id():
+    expected_household = household_id or _try_session_household_id()
+    if expected_household and record.get("household_id") != expected_household:
         return False
-    category_name = decrypt_text(record.get("category_name"))
-    sub_category_name = decrypt_text(record.get("sub_category_name"))
-    return is_allowance_subcategory(category_name, sub_category_name) and bool(record.get("username"))
+    return _allowance_recipient_from_record(record) is not None
 
 
 def get_allowance_recipient_username(category_id):
     record = _fetch_category_flags(category_id)
-    if not record:
-        return None
-    category_name = decrypt_text(record.get("category_name"))
-    sub_category_name = decrypt_text(record.get("sub_category_name"))
-    if not is_allowance_subcategory(category_name, sub_category_name):
-        return None
-    return record.get("username") or None
+    return _allowance_recipient_from_record(record)
 
 
 def _can_edit_category_server_side(category_id, *, is_personal=None, username=None) -> bool:
@@ -1550,14 +3176,197 @@ def _insert_allowance_personal_income(
     month_year,
 ):
     """Create personal income for an allowance household expense (internal sync)."""
-    target_table = get_budget_table("household_incomes")
+    return _sync_allowance_personal_income(
+        household_id=household_id,
+        expense_id=expense_id,
+        recipient_username=recipient_username,
+        amount=amount,
+        payment_date=payment_date,
+        month_year=month_year,
+    )
+
+
+def _find_allowance_income_stream_id(household_id, owner_username) -> str | None:
+    streams_table = get_income_streams_table()
+    response = (
+        supabase.table(streams_table)
+        .select("id, display_name")
+        .eq("household_id", household_id)
+        .eq("owner_username", owner_username)
+        .eq("is_personal_income", True)
+        .eq("is_active", True)
+        .execute()
+    )
+    for row in response.data or []:
+        label = decrypt_text(row.get("display_name")) if row.get("display_name") else ""
+        if label == ALLOWANCE_INCOME_SOURCE_NAME:
+            return str(row["id"])
+    return None
+
+
+def _resolve_allowance_pay_frequency(*, expense_flags=None, pay_frequency=None, is_recurring=None) -> str:
+    """Map a household allowance expense to the personal income pay frequency."""
+    if pay_frequency:
+        return normalize_income_pay_frequency(pay_frequency)
+    if expense_flags:
+        freq = expense_flags.get("pay_frequency")
+        if freq:
+            return normalize_income_pay_frequency(freq)
+        if expense_flags.get("is_recurring"):
+            return "monthly"
+    if is_recurring:
+        return "monthly"
+    return "one_time"
+
+
+def _ensure_allowance_income_stream(
+    household_id,
+    owner_username,
+    amount,
+    payment_date: date,
+    pay_frequency="monthly",
+) -> str:
+    """Personal Allowance income stream mirroring the household expense schedule."""
+    safe_amount = float(amount)
+    freq = normalize_income_pay_frequency(pay_frequency)
+    stream_id = _find_allowance_income_stream_id(household_id, owner_username)
+    if stream_id:
+        current_version = resolve_income_version(stream_id, payment_date)
+        current_amount = (
+            decrypt_float(current_version.get("take_home_amount"))
+            if current_version
+            else None
+        )
+        current_freq = (
+            normalize_income_pay_frequency(current_version.get("pay_frequency") or "monthly")
+            if current_version
+            else None
+        )
+        amount_changed = (
+            current_version is None
+            or current_amount is None
+            or abs(float(current_amount) - safe_amount) > 0.009
+        )
+        freq_changed = current_version is None or current_freq != freq
+        if amount_changed or freq_changed:
+            _upsert_income_stream_version(
+                stream_id,
+                payment_date,
+                take_home=safe_amount,
+                gross=safe_amount,
+                is_taxable=False,
+                is_windfall=False,
+                pay_frequency=freq,
+            )
+            from_month = _month_year_from_date(payment_date)
+            _rematerialize_stream_from_month(stream_id, from_month, household_id)
+        return stream_id
+
+    stream_id, _ = _create_income_stream_and_version(
+        household_id=household_id,
+        owner_username=owner_username,
+        is_personal_income=True,
+        display_name=ALLOWANCE_INCOME_SOURCE_NAME,
+        take_home=safe_amount,
+        gross=safe_amount,
+        is_taxable=False,
+        is_windfall=False,
+        pay_frequency=freq,
+        effective_from=payment_date,
+    )
+    return stream_id
+
+
+def _link_allowance_expense_to_income_row(
+    expense_id,
+    household_id,
+    stream_id,
+    month_year,
+    payment_date=None,
+) -> None:
+    """Attach household expense id to the matching materialized allowance income row."""
+    incomes_table = get_budget_table("household_incomes")
+    expense_key = str(expense_id) if expense_id is not None else None
+    if not expense_key:
+        return
+    query = (
+        supabase.table(incomes_table)
+        .select("id")
+        .eq("household_id", household_id)
+        .eq("stream_id", stream_id)
+        .eq("month_year", month_year)
+    )
+    if payment_date is not None:
+        if isinstance(payment_date, str):
+            payment_date_str = payment_date[:10]
+        else:
+            payment_date_str = payment_date.isoformat()
+        query = query.eq("payment_date", payment_date_str)
+    response = query.limit(1).execute()
+    if response.data:
+        supabase.table(incomes_table).update({"source_expense_id": expense_key}).eq(
+            "id", response.data[0]["id"]
+        ).execute()
+
+
+def _sync_allowance_personal_income(
+    *,
+    household_id,
+    expense_id,
+    recipient_username,
+    amount,
+    payment_date,
+    month_year,
+    is_recurring=None,
+    pay_frequency=None,
+) -> bool:
+    """Upsert personal income for a household allowance expense.
+
+    One-time allowance → direct ledger row (one_time).
+    Recurring allowance → income stream + materialized paycheck rows using the
+    household expense pay frequency (monthly, bi-weekly, etc.).
+    """
+    expense_flags = _fetch_expense_flags(expense_id) if expense_id is not None else None
+    if is_recurring is None:
+        is_recurring = bool(expense_flags and expense_flags.get("is_recurring"))
+    freq = _resolve_allowance_pay_frequency(
+        expense_flags=expense_flags,
+        pay_frequency=pay_frequency,
+        is_recurring=is_recurring,
+    )
+
     if isinstance(payment_date, str):
         payment_date = datetime.strptime(payment_date[:10], "%Y-%m-%d").date()
+
+    if freq != "one_time":
+        try:
+            stream_id = _ensure_allowance_income_stream(
+                household_id,
+                recipient_username,
+                amount,
+                payment_date,
+                pay_frequency=freq,
+            )
+            materialize_income_month(stream_id, month_year, household_id)
+            _link_allowance_expense_to_income_row(
+                expense_id,
+                household_id,
+                stream_id,
+                month_year,
+                payment_date=payment_date,
+            )
+            return True
+        except Exception as e:
+            print(f"Error syncing recurring allowance income for expense {expense_id}: {e}")
+            return False
+
+    target_table = get_budget_table("household_incomes")
     safe_amount = float(amount)
+    expense_key = str(expense_id) if expense_id is not None else None
     payload = {
         "household_id": household_id,
         "month_year": month_year,
-        "source_name": encrypt_data("Allowance"),
+        "source_name": encrypt_data(ALLOWANCE_INCOME_SOURCE_NAME),
         "take_home_amount": encrypt_data(safe_amount),
         "gross_amount": encrypt_data(safe_amount),
         "is_taxable": False,
@@ -1567,9 +3376,27 @@ def _insert_allowance_personal_income(
         "pay_frequency": "one_time",
         "is_personal_income": True,
         "payment_date": payment_date.isoformat(),
-        "source_expense_id": str(expense_id) if expense_id is not None else None,
+        "source_expense_id": expense_key,
+        "stream_id": None,
+        "version_id": None,
     }
-    supabase.table(target_table).insert(payload).execute()
+    try:
+        if expense_key:
+            existing = (
+                supabase.table(target_table)
+                .select("id")
+                .eq("source_expense_id", expense_key)
+                .limit(1)
+                .execute()
+            )
+            if existing.data:
+                supabase.table(target_table).update(payload).eq("id", existing.data[0]["id"]).execute()
+                return True
+        supabase.table(target_table).insert(payload).execute()
+        return True
+    except Exception as e:
+        print(f"Error syncing allowance personal income for expense {expense_id}: {e}")
+        return False
 
 
 def _delete_allowance_income_for_expense(expense_id):
@@ -1581,20 +3408,33 @@ def _delete_allowance_income_for_expense(expense_id):
 
 
 def _update_allowance_income_for_expense(expense_id, amount, payment_date, month_year):
-    target_table = get_budget_table("household_incomes")
+    record = _fetch_expense_flags(expense_id)
+    if not record:
+        return
+    recipient = get_allowance_recipient_username(record.get("category_id"))
+    if not recipient:
+        return
     if isinstance(payment_date, str):
         payment_date = datetime.strptime(payment_date[:10], "%Y-%m-%d").date()
-    safe_amount = float(amount)
-    payload = {
-        "take_home_amount": encrypt_data(safe_amount),
-        "gross_amount": encrypt_data(safe_amount),
-        "payment_date": payment_date.isoformat(),
-        "month_year": month_year,
-    }
-    try:
-        supabase.table(target_table).update(payload).eq("source_expense_id", str(expense_id)).execute()
-    except Exception as e:
-        print(f"Error updating allowance income for expense {expense_id}: {e}")
+    freq = _resolve_allowance_pay_frequency(
+        expense_flags=record,
+        is_recurring=bool(record.get("is_recurring")),
+    )
+    stream_id = record.get("stream_id")
+    household_id = record.get("household_id")
+    if stream_id and freq != "one_time" and household_id:
+        _sync_allowance_for_stream_month(stream_id, month_year, household_id)
+        return
+    _sync_allowance_personal_income(
+        household_id=household_id,
+        expense_id=expense_id,
+        recipient_username=recipient,
+        amount=float(amount),
+        payment_date=payment_date,
+        month_year=month_year,
+        is_recurring=freq != "one_time",
+        pay_frequency=freq,
+    )
 
 def get_project_budgets():
     """
@@ -1666,6 +3506,35 @@ def ensure_project_expense_category(household_id):
         return None
 
 
+def allowance_categories_in_sync(household_id) -> bool:
+    """True when every household member has an Allowance sub-category."""
+    if not household_id:
+        return True
+    users = _fetch_household_users_cached(household_id) or []
+    usernames = {u.get("username") for u in users if u.get("username")}
+    if not usernames:
+        return True
+
+    categories_df = get_budget_categories(household_id, is_personal=False)
+    if categories_df is None or categories_df.empty:
+        return False
+
+    existing: set[str] = set()
+    for _, row in categories_df.iterrows():
+        if not is_allowance_subcategory(
+            row.get("category_name"), row.get("sub_category_name")
+        ):
+            continue
+        linked = allowance_recipient_username(
+            row.get("category_name"),
+            row.get("sub_category_name"),
+            username_field=row.get("username"),
+        )
+        if linked:
+            existing.add(linked)
+    return usernames <= existing
+
+
 def ensure_allowance_categories(household_id):
     """
     Ensure each household member has an Allowance sub-category for payout logging.
@@ -1689,7 +3558,15 @@ def ensure_allowance_categories(household_id):
                     row.get("category_name"), row.get("sub_category_name")
                 ):
                     continue
-                linked = row.get("username")
+                linked = allowance_recipient_username(
+                    row.get("category_name"),
+                    row.get("sub_category_name"),
+                    username_field=row.get("username"),
+                )
+                if linked and not row.get("username"):
+                    supabase.table(target_table).update({"username": linked}).eq(
+                        "id", row.get("id")
+                    ).execute()
                 if linked:
                     existing_by_username[linked] = row.get("id")
 
@@ -1706,10 +3583,112 @@ def ensure_allowance_categories(household_id):
                 "target_budget": encrypt_data(0.0),
             }
             supabase.table(target_table).insert(payload).execute()
+
+        repair_allowance_income_links(household_id)
         return True
     except Exception as e:
         print(f"Error ensuring allowance categories: {e}")
         return False
+
+
+def repair_allowance_income_links(household_id) -> int:
+    """Create or refresh personal income rows for allowance household expenses."""
+    target_expenses = get_budget_table("expenses")
+    try:
+        response = (
+            supabase.table(target_expenses)
+            .select(
+                "id, category_id, amount, date_logged, month_year, is_personal_spend, "
+                "is_recurring, pay_frequency"
+            )
+            .eq("household_id", household_id)
+            .eq("is_personal_spend", False)
+            .execute()
+        )
+        expense_rows = response.data or []
+
+        # Build an in-memory allowance category -> recipient map with a single
+        # batched query, avoiding a per-expense-row category lookup (N+1).
+        allowance_recipient_by_cat = {}
+        cat_table = get_budget_table("budget_categories")
+        cat_resp = (
+            supabase.table(cat_table)
+            .select("id, is_personal, username, household_id, category_name, sub_category_name")
+            .eq("household_id", household_id)
+            .execute()
+        )
+        for crow in (cat_resp.data or []):
+            recipient = _allowance_recipient_from_record(crow)
+            if recipient:
+                allowance_recipient_by_cat[crow.get("id")] = recipient
+
+        # Batch-fetch already-linked allowance income rows so we can skip the
+        # expensive per-row sync (stream lookup + materialize) when an expense is
+        # already correctly linked with a matching amount/month.
+        incomes_table = get_budget_table("household_incomes")
+        existing_resp = (
+            supabase.table(incomes_table)
+            .select("id, source_expense_id, take_home_amount, month_year, pay_frequency")
+            .eq("household_id", household_id)
+            .not_.is_("source_expense_id", "null")
+            .execute()
+        )
+        existing_by_expense = {}
+        for er in (existing_resp.data or []):
+            sek = er.get("source_expense_id")
+            if sek is not None:
+                existing_by_expense[str(sek)] = er
+
+        repaired = 0
+        for row in expense_rows:
+            category_id = row.get("category_id")
+            recipient = allowance_recipient_by_cat.get(category_id) if category_id else None
+            if not recipient:
+                continue
+            payment_date = row.get("date_logged")
+            month_year = row.get("month_year")
+            if not payment_date or not month_year:
+                continue
+            amount = decrypt_float(row.get("amount")) if row.get("amount") is not None else 0.0
+
+            existing_income = existing_by_expense.get(str(row.get("id")))
+            if existing_income is not None and existing_income.get("month_year") == month_year:
+                existing_amount = (
+                    decrypt_float(existing_income.get("take_home_amount"))
+                    if existing_income.get("take_home_amount") is not None
+                    else None
+                )
+                expected_freq = _resolve_allowance_pay_frequency(
+                    expense_flags=row,
+                    is_recurring=bool(row.get("is_recurring")),
+                )
+                existing_freq = _resolve_allowance_pay_frequency(
+                    pay_frequency=existing_income.get("pay_frequency"),
+                    is_recurring=bool(row.get("is_recurring")),
+                )
+                if (
+                    existing_amount is not None
+                    and abs(existing_amount - amount) <= 0.009
+                    and existing_freq == expected_freq
+                ):
+                    # Already linked and matching — nothing to repair.
+                    continue
+
+            if _sync_allowance_personal_income(
+                household_id=household_id,
+                expense_id=row.get("id"),
+                recipient_username=recipient,
+                amount=amount,
+                payment_date=payment_date,
+                month_year=month_year,
+                is_recurring=bool(row.get("is_recurring")),
+                pay_frequency=row.get("pay_frequency"),
+            ):
+                repaired += 1
+        return repaired
+    except Exception as e:
+        print(f"Error repairing allowance income links: {e}")
+        return 0
 
 
 def add_project_purchase_expense(project_id, purchase_date, amount, product_or_service=None):
@@ -2371,7 +4350,13 @@ def delete_expense(expense_id):
     if not _can_edit_expense_server_side(expense_id):
         return False
     record = _fetch_expense_flags(expense_id)
-    if record and record.get("category_id") and is_allowance_subcategory_id(record["category_id"]):
+    if (
+        record
+        and record.get("category_id")
+        and is_allowance_subcategory_id(
+            record["category_id"], household_id=record.get("household_id")
+        )
+    ):
         _delete_allowance_income_for_expense(expense_id)
     target_table = get_budget_table("expenses")
     try:
@@ -2381,23 +4366,41 @@ def delete_expense(expense_id):
         print(f"Error deleting expense: {e}")
         return False
 
-def update_expense(expense_id, amount, details, is_recurring, date_logged=None):
-    """Updates an existing expense amount, details, recurring status, and optionally the date logged."""
+def update_expense(
+    expense_id,
+    amount,
+    details,
+    is_recurring,
+    date_logged=None,
+    pay_frequency=None,
+):
+    """Updates one expense ledger row (this month only)."""
     if not _can_edit_expense_server_side(expense_id):
         return False
     record = _fetch_expense_flags(expense_id)
     target_table = get_budget_table("expenses")
     try:
+        if pay_frequency:
+            freq = normalize_expense_pay_frequency(pay_frequency)
+        else:
+            freq = "monthly" if is_recurring else "one_time"
         payload = {
             "amount": encrypt_data(float(amount)),
             "details": encrypt_data(details),
-            "is_recurring": is_recurring,
+            "is_recurring": expense_is_recurring_frequency(freq),
+            "pay_frequency": freq,
         }
         if date_logged:
             payload["date_logged"] = date_logged.strftime("%Y-%m-%d")
             payload["month_year"] = date_logged.strftime("%Y-%m")
         supabase.table(target_table).update(payload).eq("id", expense_id).execute()
-        if record and record.get("category_id") and is_allowance_subcategory_id(record["category_id"]):
+        if (
+            record
+            and record.get("category_id")
+            and is_allowance_subcategory_id(
+                record["category_id"], household_id=record.get("household_id")
+            )
+        ):
             effective_date = date_logged
             if effective_date is None and record.get("date_logged"):
                 effective_date = datetime.strptime(str(record["date_logged"])[:10], "%Y-%m-%d").date()
@@ -2432,17 +4435,108 @@ def update_budget_category(category_id, category_name, sub_category_name, target
             "target_budget": encrypt_data(safe_target)
         }
         supabase.table(target_table).update(payload).eq("id", category_id).execute()
+        scope = _fetch_category_scope(category_id)
+        if scope:
+            sync_category_target_to_expense_streams(
+                category_id,
+                scope["household_id"],
+                safe_target,
+            )
         return True
     except Exception as e:
         print(f"Error updating category: {e}")
         return False
     
-def auto_rollover_recurring_expenses(household_id, selected_month):
-    """Silently rolls over recurring expenses, keeping their exact day of the month, ONLY if the day has arrived."""
+def _rollover_expense_streams(household_id, selected_month) -> bool:
+    """Materialize active expense streams into selected_month.
+
+    Batched: fetches all active streams, their versions, and the month's existing
+    ledger rows in three queries total, then materializes in memory. Avoids the
+    per-stream N+1 round-trips that made first-of-month views slow.
+    """
+    streams_table = get_expense_streams_table()
+    versions_table = get_expense_stream_versions_table()
+    expenses_table = get_budget_table("expenses")
+    try:
+        streams_res = (
+            supabase.table(streams_table)
+            .select("*")
+            .eq("household_id", household_id)
+            .eq("is_active", True)
+            .execute()
+        )
+        streams = streams_res.data or []
+        if not streams:
+            return False
+        stream_ids = [str(s["id"]) for s in streams]
+
+        versions_res = (
+            supabase.table(versions_table)
+            .select("*")
+            .in_("stream_id", stream_ids)
+            .order("effective_from", desc=False)
+            .execute()
+        )
+        versions_by_stream: dict = {}
+        for v in versions_res.data or []:
+            versions_by_stream.setdefault(str(v["stream_id"]), []).append(v)
+
+        existing_res = (
+            supabase.table(expenses_table)
+            .select("id, stream_id, date_logged, version_id, is_locked")
+            .eq("household_id", household_id)
+            .eq("month_year", selected_month)
+            .in_("stream_id", stream_ids)
+            .execute()
+        )
+        existing_by_stream: dict = {}
+        for row in existing_res.data or []:
+            existing_by_stream.setdefault(str(row["stream_id"]), {})[
+                str(row.get("date_logged") or "")[:10]
+            ] = row
+
+        injected_any = False
+        for stream in streams:
+            sid = str(stream["id"])
+            versions = versions_by_stream.get(sid)
+            if not versions:
+                continue
+            expected = _expected_expense_occurrences(sid, versions, selected_month)
+            existing_by_date = existing_by_stream.get(sid, {})
+            expected_dates: set[str] = set()
+            stream_changed = False
+            for bill_date, version in expected:
+                ds = bill_date.isoformat()
+                expected_dates.add(ds)
+                if _materialize_expense_occurrence(
+                    stream=stream,
+                    version=version,
+                    month_year=selected_month,
+                    date_logged=bill_date,
+                    household_id=household_id,
+                    existing=existing_by_date.get(ds),
+                ):
+                    stream_changed = True
+            for ds, row in existing_by_date.items():
+                if row.get("is_locked"):
+                    continue
+                if ds not in expected_dates:
+                    supabase.table(expenses_table).delete().eq("id", row["id"]).execute()
+                    stream_changed = True
+            if stream_changed:
+                injected_any = True
+                _sync_allowance_for_stream_month(sid, selected_month, household_id)
+        return injected_any
+    except Exception as e:
+        print(f"Error rolling over expense streams: {e}")
+        return False
+
+
+def _rollover_recurring_expenses_legacy(household_id, selected_month) -> bool:
+    """Legacy rollover for recurring rows not yet linked to a stream."""
     target_table = get_budget_table("expenses")
-    
-    # 1. Calculate the exact previous month
-    year, month = map(int, selected_month.split('-'))
+
+    year, month = map(int, selected_month.split("-"))
     if month == 1:
         prev_year = year - 1
         prev_month = 12
@@ -2450,53 +4544,66 @@ def auto_rollover_recurring_expenses(household_id, selected_month):
         prev_year = year
         prev_month = month - 1
     prev_month_str = f"{prev_year}-{prev_month:02d}"
-    
+
     try:
-        # 2. Fetch last month's recurring expenses
-        prev_res = supabase.table(target_table).select("*").eq("household_id", household_id).eq("month_year", prev_month_str).eq("is_recurring", True).execute()
-        
+        prev_res = (
+            supabase.table(target_table)
+            .select("*")
+            .eq("household_id", household_id)
+            .eq("month_year", prev_month_str)
+            .eq("is_recurring", True)
+            .is_("stream_id", "null")
+            .execute()
+        )
+
         if not prev_res.data:
-            return False 
-            
-        # 3. Fetch this month's to check for duplicates
-        curr_res = supabase.table(target_table).select("id, details, username, category_id").eq("household_id", household_id).eq("month_year", selected_month).eq("is_recurring", True).execute()
-        
+            return False
+
+        curr_res = (
+            supabase.table(target_table)
+            .select("id, details, username, category_id, stream_id")
+            .eq("household_id", household_id)
+            .eq("month_year", selected_month)
+            .eq("is_recurring", True)
+            .execute()
+        )
+
         existing_signatures = []
         if curr_res.data:
             for row in curr_res.data:
+                if row.get("stream_id"):
+                    continue
                 decrypted_details = decrypt_text(row.get("details")) if row.get("details") else ""
-                existing_signatures.append(f"{decrypted_details}_{row.get('username')}_{row.get('category_id')}")
-                
+                existing_signatures.append(
+                    f"{decrypted_details}_{row.get('username')}_{row.get('category_id')}"
+                )
+
         injected_any = False
-        
-        # 🟢 TIME GATE 1: Grab today's exact date
         today = datetime.now().date()
-        
+
         for row in prev_res.data:
             details = decrypt_text(row.get("details")) if row.get("details") else ""
             username = row.get("username")
             category_id = row.get("category_id")
-            
             signature = f"{details}_{username}_{category_id}"
-            
-            # If it hasn't been rolled over yet, evaluate it
+
             if signature not in existing_signatures:
                 amount = decrypt_float(row.get("amount")) if row.get("amount") is not None else 0.0
-                
                 prev_date_str = row.get("date_logged")
                 if prev_date_str:
-                    prev_date = datetime.strptime(prev_date_str, "%Y-%m-%d").date()
+                    prev_date = datetime.strptime(str(prev_date_str)[:10], "%Y-%m-%d").date()
                     target_day = prev_date.day
                 else:
-                    target_day = 1 
-                    
+                    target_day = 1
+
                 _, last_day_of_new_month = calendar.monthrange(year, month)
                 new_day = min(target_day, last_day_of_new_month)
-                
                 new_date_logged = date(year, month, new_day)
-                
-                # 🟢 TIME GATE 2: Only inject if the target date is TODAY or in the PAST
+
                 if new_date_logged <= today:
+                    freq = normalize_expense_pay_frequency(
+                        row.get("pay_frequency") or "monthly"
+                    )
                     log_expense_and_check_project(
                         auth_user_id=row.get("auth_user_id"),
                         username=username,
@@ -2507,18 +4614,106 @@ def auto_rollover_recurring_expenses(household_id, selected_month):
                         amount=amount,
                         details=details,
                         is_personal_spend=row.get("is_personal_spend", False),
-                        is_recurring=True
+                        is_recurring=True,
+                        pay_frequency=freq,
                     )
                     injected_any = True
-                
+
         return injected_any
     except Exception as e:
-        print(f"Error rolling over expenses: {e}")
+        print(f"Error rolling over legacy expenses: {e}")
         return False
 
 
-def auto_rollover_recurring_incomes(household_id, selected_month):
-    """Rolls recurring income streams into a new month once their payment day arrives."""
+def auto_rollover_recurring_expenses(household_id, selected_month):
+    """Rolls recurring expenses via streams (preferred) or legacy copy."""
+    stream_rolled = _rollover_expense_streams(household_id, selected_month)
+    legacy_rolled = _rollover_recurring_expenses_legacy(household_id, selected_month)
+    return stream_rolled or legacy_rolled
+
+
+def _rollover_income_streams(household_id, selected_month) -> bool:
+    """Materialize active income streams into selected_month from version history.
+
+    Batched: fetches all active streams, their versions, and the month's existing
+    ledger rows in three queries total, then materializes in memory. Avoids the
+    per-stream N+1 round-trips that made first-of-month views slow.
+    """
+    streams_table = get_income_streams_table()
+    versions_table = get_income_stream_versions_table()
+    incomes_table = get_budget_table("household_incomes")
+    try:
+        streams_res = (
+            supabase.table(streams_table)
+            .select("*")
+            .eq("household_id", household_id)
+            .eq("is_active", True)
+            .execute()
+        )
+        streams = streams_res.data or []
+        if not streams:
+            return False
+        stream_ids = [str(s["id"]) for s in streams]
+
+        versions_res = (
+            supabase.table(versions_table)
+            .select("*")
+            .in_("stream_id", stream_ids)
+            .order("effective_from", desc=False)
+            .execute()
+        )
+        versions_by_stream: dict = {}
+        for v in versions_res.data or []:
+            versions_by_stream.setdefault(str(v["stream_id"]), []).append(v)
+
+        existing_res = (
+            supabase.table(incomes_table)
+            .select("id, stream_id, payment_date, version_id, is_locked")
+            .eq("household_id", household_id)
+            .eq("month_year", selected_month)
+            .in_("stream_id", stream_ids)
+            .execute()
+        )
+        existing_by_stream: dict = {}
+        for row in existing_res.data or []:
+            existing_by_stream.setdefault(str(row["stream_id"]), {})[
+                str(row.get("payment_date") or "")[:10]
+            ] = row
+
+        injected_any = False
+        for stream in streams:
+            sid = str(stream["id"])
+            versions = versions_by_stream.get(sid)
+            if not versions:
+                continue
+            expected = _expected_income_occurrences(sid, versions, selected_month)
+            existing_by_date = existing_by_stream.get(sid, {})
+            expected_dates: set[str] = set()
+            for payment_date, version in expected:
+                ds = payment_date.isoformat()
+                expected_dates.add(ds)
+                if _materialize_income_occurrence(
+                    stream=stream,
+                    version=version,
+                    month_year=selected_month,
+                    payment_date=payment_date,
+                    household_id=household_id,
+                    existing=existing_by_date.get(ds),
+                ):
+                    injected_any = True
+            for ds, row in existing_by_date.items():
+                if row.get("is_locked"):
+                    continue
+                if ds not in expected_dates:
+                    supabase.table(incomes_table).delete().eq("id", row["id"]).execute()
+        return injected_any
+    except Exception as e:
+        print(f"Error rolling over income streams: {e}")
+        return False
+
+
+def _rollover_recurring_incomes_legacy(household_id, selected_month) -> bool:
+    """Legacy rollover for monthly rows not yet linked to a stream."""
     target_table = get_budget_table("household_incomes")
 
     year, month = map(int, selected_month.split("-"))
@@ -2539,6 +4734,7 @@ def auto_rollover_recurring_incomes(household_id, selected_month):
             .eq("household_id", household_id)
             .eq("month_year", prev_month_str)
             .eq("is_recurring", True)
+            .is_("stream_id", "null")
             .execute()
         )
         if prev_res.data:
@@ -2553,6 +4749,7 @@ def auto_rollover_recurring_incomes(household_id, selected_month):
                     .eq("household_id", household_id)
                     .eq("month_year", source_month_str)
                     .eq("is_recurring", True)
+                    .is_("stream_id", "null")
                     .execute()
                 )
                 if school_res.data:
@@ -2566,7 +4763,7 @@ def auto_rollover_recurring_incomes(household_id, selected_month):
 
         curr_res = (
             supabase.table(target_table)
-            .select("id, source_name, owner_username, is_personal_income")
+            .select("id, source_name, owner_username, is_personal_income, stream_id")
             .eq("household_id", household_id)
             .eq("month_year", selected_month)
             .eq("is_recurring", True)
@@ -2574,8 +4771,12 @@ def auto_rollover_recurring_incomes(household_id, selected_month):
         )
 
         existing_signatures = []
+        existing_stream_ids = set()
         if curr_res.data:
             for row in curr_res.data:
+                if row.get("stream_id"):
+                    existing_stream_ids.add(str(row["stream_id"]))
+                    continue
                 source = decrypt_text(row.get("source_name")) if row.get("source_name") else ""
                 existing_signatures.append(
                     f"{source}_{row.get('owner_username')}_{row.get('is_personal_income')}"
@@ -2631,11 +4832,31 @@ def auto_rollover_recurring_incomes(household_id, selected_month):
 
         return injected_any
     except Exception as e:
-        print(f"Error rolling over incomes: {e}")
+        print(f"Error rolling over legacy incomes: {e}")
         return False
 
-def get_recurring_schedule(household_id, month_year, is_personal=False):
-    """Fetches recurring expenses to determine upcoming dates, filtered by scope."""
+
+def auto_rollover_recurring_incomes(household_id, selected_month):
+    """Rolls recurring income into a new month via streams (preferred) or legacy copy."""
+    stream_rolled = _rollover_income_streams(household_id, selected_month)
+    legacy_rolled = _rollover_recurring_incomes_legacy(household_id, selected_month)
+    return stream_rolled or legacy_rolled
+
+
+def get_recurring_schedule(household_id, month_year, is_personal=False, username=None):
+    """Bill-day schedule per category from expense streams, with legacy fallback."""
+    try:
+        _, schedule = get_expense_stream_projections(
+            household_id,
+            month_year,
+            is_personal_spend=is_personal,
+            username=username,
+        )
+        if schedule:
+            return schedule
+    except Exception as e:
+        print(f"Error fetching stream recurring schedule: {e}")
+
     target_table = get_budget_table("expenses")
     try:
         res = supabase.table(target_table).select("category_id, date_logged") \

@@ -1,6 +1,11 @@
 """Apply the prod/dev schema parity migration to production.
 
-Runs migrations/022_prod_dev_schema_parity.sql (idempotent) and, if prod
+Runs migrations/022_prod_dev_schema_parity.sql,
+migrations/023_household_income_streams.sql,
+migrations/024_income_paycheck_occurrences.sql,
+migrations/025_household_expense_streams.sql, and
+migrations/026_expense_paycheck_occurrences.sql,
+migrations/027_expense_stream_category_id_dev.sql (all idempotent), and if prod
 budget tables are entirely absent, migrations/017_create_budget_prod_tables.sql
 first.
 
@@ -34,6 +39,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from db_connection import connect
 MIGRATION_017 = ROOT / "migrations" / "017_create_budget_prod_tables.sql"
 MIGRATION_022 = ROOT / "migrations" / "022_prod_dev_schema_parity.sql"
+MIGRATION_023 = ROOT / "migrations" / "023_household_income_streams.sql"
+MIGRATION_024 = ROOT / "migrations" / "024_income_paycheck_occurrences.sql"
+MIGRATION_025 = ROOT / "migrations" / "025_household_expense_streams.sql"
+MIGRATION_026 = ROOT / "migrations" / "026_expense_paycheck_occurrences.sql"
+MIGRATION_027 = ROOT / "migrations" / "027_expense_stream_category_id_dev.sql"
 
 BUDGET_PROD_TABLES = [
     "budget_categories",
@@ -68,15 +78,34 @@ def _print_migration_plan(need_017: bool) -> None:
     print()
     print("=== Apply Plan (dry-run) ===")
     print()
+    step = 1
     if need_017:
-        print(f"  Step 1: {MIGRATION_017.name}")
+        print(f"  Step {step}: {MIGRATION_017.name}")
         print("          Creates the five core prod budget tables.")
+        step += 1
         print()
-        print(f"  Step 2: {MIGRATION_022.name}")
-        print("          Adds all missing columns (idempotent catch-all).")
-    else:
-        print(f"  Step 1: {MIGRATION_022.name}")
-        print("          Adds all missing columns (idempotent catch-all).")
+    print(f"  Step {step}: {MIGRATION_022.name}")
+    print("          Adds all missing columns (idempotent catch-all).")
+    step += 1
+    print()
+    print(f"  Step {step}: {MIGRATION_023.name}")
+    print("          Income streams, versions, and ledger link columns.")
+    step += 1
+    print()
+    print(f"  Step {step}: {MIGRATION_024.name}")
+    print("          Per-paycheck unique index for bi-weekly / weekly rows.")
+    step += 1
+    print()
+    print(f"  Step {step}: {MIGRATION_025.name}")
+    print("          Expense streams, versions, and ledger link columns.")
+    step += 1
+    print()
+    print(f"  Step {step}: {MIGRATION_026.name}")
+    print("          Per-bill unique index for bi-weekly / weekly expense rows.")
+    step += 1
+    print()
+    print(f"  Step {step}: {MIGRATION_027.name}")
+    print("          Dev expense-stream category_id UUID (matches budget_categories_dev).")
     print()
     print("To apply, re-run with --apply:")
     print("  python maintenance/apply_schema_parity.py --apply")
@@ -160,6 +189,36 @@ def main() -> int:
                 cur2.execute(sql_022)
             print(f"  ✓  {MIGRATION_022.name} applied.")
 
+            sql_023 = MIGRATION_023.read_text(encoding="utf-8")
+            print(f"Applying {MIGRATION_023.name} ...")
+            with conn.cursor() as cur2:
+                cur2.execute(sql_023)
+            print(f"  ✓  {MIGRATION_023.name} applied.")
+
+            sql_024 = MIGRATION_024.read_text(encoding="utf-8")
+            print(f"Applying {MIGRATION_024.name} ...")
+            with conn.cursor() as cur2:
+                cur2.execute(sql_024)
+            print(f"  ✓  {MIGRATION_024.name} applied.")
+
+            sql_025 = MIGRATION_025.read_text(encoding="utf-8")
+            print(f"Applying {MIGRATION_025.name} ...")
+            with conn.cursor() as cur2:
+                cur2.execute(sql_025)
+            print(f"  ✓  {MIGRATION_025.name} applied.")
+
+            sql_026 = MIGRATION_026.read_text(encoding="utf-8")
+            print(f"Applying {MIGRATION_026.name} ...")
+            with conn.cursor() as cur2:
+                cur2.execute(sql_026)
+            print(f"  ✓  {MIGRATION_026.name} applied.")
+
+            sql_027 = MIGRATION_027.read_text(encoding="utf-8")
+            print(f"Applying {MIGRATION_027.name} ...")
+            with conn.cursor() as cur2:
+                cur2.execute(sql_027)
+            print(f"  ✓  {MIGRATION_027.name} applied.")
+
             # 4. Re-audit to confirm
             print()
             print("Re-running audit to verify...")
@@ -172,6 +231,10 @@ def main() -> int:
                 print("Next steps:")
                 print("  1. Reload the Streamlit app (restart or rerun).")
                 print("  2. Smoke-test Financial Hub, Projects, Wish List, and To-Do in production mode.")
+                print("  3. Backfill legacy recurring incomes:")
+                print("     python maintenance/backfill_income_streams.py --apply")
+                print("  4. Backfill legacy recurring expenses:")
+                print("     python maintenance/backfill_expense_streams.py --apply")
                 return 0
             else:
                 remaining = len(report2["issues"])

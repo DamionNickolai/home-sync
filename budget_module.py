@@ -15,6 +15,7 @@ from database import (
     add_project_purchase_expense,
     ensure_project_expense_category,
     ensure_allowance_categories,
+    allowance_categories_in_sync,
     get_household_finance_settings,
     update_household_projects_funds,
     get_household_users_for_admin,
@@ -44,17 +45,30 @@ from database import (
     INCOME_PAY_FREQUENCY_LABELS,
     normalize_income_pay_frequency,
     normalize_income_amount_for_month,
+    income_amount_for_month_total,
     school_year_active_month,
     get_individual_expenses,
     update_user_privacy_toggle,
     delete_budget_category,
     delete_household_income,
+    delete_household_income_month_only,
+    schedule_income_change,
+    end_income_stream,
+    get_income_stream_versions,
+    ensure_income_stream_for_row,
     delete_expense,
     update_expense,
     update_budget_category,
     auto_rollover_recurring_expenses,
     auto_rollover_recurring_incomes,
-    get_recurring_schedule
+    get_expense_stream_projections,
+    sum_expense_stream_projections_for_months,
+    expense_pay_frequency_label,
+    normalize_expense_pay_frequency,
+    schedule_expense_change,
+    end_expense_stream,
+    get_expense_stream_versions,
+    delete_expense_month_only,
 )
 from ui_helpers import (
     rerun_app_with_reason,
@@ -65,7 +79,12 @@ from ui_helpers import (
     is_delete_confirm_armed,
     render_delete_confirmation,
 )
-from constants import is_system_project_expense_category, is_system_managed_allowance_category, is_allowance_subcategory
+from constants import (
+    allowance_recipient_username,
+    is_system_project_expense_category,
+    is_system_managed_allowance_category,
+    is_allowance_subcategory,
+)
 
 
 def _maybe_auto_rollover(household_id, selected_month):
@@ -273,6 +292,7 @@ def _enrich_expenses_with_categories(expenses_df, categories_df):
 
 
 INCOME_FREQUENCY_OPTIONS = list(INCOME_PAY_FREQUENCY_LABELS.keys())
+EXPENSE_FREQUENCY_OPTIONS = [f for f in INCOME_FREQUENCY_OPTIONS if f != "school_year_monthly"]
 
 
 def _render_html_scroll_table(headers, rows, *, right_align_from: int = 1, variant: str = "") -> None:
@@ -344,6 +364,18 @@ def _purchase_counts_by_category(expenses_df, selected_month) -> dict:
     return filtered.groupby("category_id").size().to_dict()
 
 
+def _category_projected_amount(row, stream_projections, *, month_count=1) -> float:
+    """Use expense-stream totals when present; otherwise category target_budget."""
+    if row.get("category_name") == "Annual Subscriptions":
+        return float(row["target_budget"]) * month_count
+    cat_id = row["id"]
+    cat_key_str = str(cat_id)
+    target_budget = float(row["target_budget"]) * month_count
+    if cat_key_str in stream_projections:
+        return float(stream_projections[cat_key_str])
+    return target_budget
+
+
 def _render_household_budget_breakdown(
     merged_df,
     hh_expenses_df,
@@ -351,7 +383,10 @@ def _render_household_budget_breakdown(
     selected_month,
     *,
     filter_key: str,
-) -> None:
+    stream_projections=None,
+):
+    if stream_projections is None:
+        stream_projections = {}
     if merged_df.empty:
         st.info("No categories setup yet. Add some to build your ledger!")
         return
@@ -362,7 +397,9 @@ def _render_household_budget_breakdown(
     parent_groups = []
     for parent in merged_df["category_name"].unique():
         parent_mask = merged_df["category_name"] == parent
-        parent_target = float(merged_df.loc[parent_mask, "target_budget"].sum())
+        parent_target = float(
+            sum(_category_projected_amount(row, stream_projections) for _, row in merged_df[parent_mask].iterrows())
+        )
         parent_actual = float(merged_df.loc[parent_mask, "actual_amount"].sum())
         if parent_target == 0 and parent_actual == 0:
             continue
@@ -370,7 +407,7 @@ def _render_household_budget_breakdown(
         sub_rows = []
         parent_purchase_count = 0
         for _, row in merged_df[parent_mask].iterrows():
-            target = float(row["target_budget"])
+            target = _category_projected_amount(row, stream_projections)
             actual = float(row["actual_amount"])
             if target == 0 and actual == 0:
                 continue
@@ -385,9 +422,16 @@ def _render_household_budget_breakdown(
             else:
                 sub_name = str(sub_name)
 
-            recurring_items = hh_expenses_df[
-                (hh_expenses_df["category_id"] == cat_id) & (hh_expenses_df["is_recurring"] == True)
-            ]
+            if (
+                not hh_expenses_df.empty
+                and "category_id" in hh_expenses_df.columns
+                and "is_recurring" in hh_expenses_df.columns
+            ):
+                recurring_items = hh_expenses_df[
+                    (hh_expenses_df["category_id"] == cat_id) & (hh_expenses_df["is_recurring"] == True)
+                ]
+            else:
+                recurring_items = hh_expenses_df
             recurring_due = _filter_expenses_for_actual_totals(recurring_items, selected_month)
             if recurring_due.empty and cat_id in recurring_schedule:
                 target_day = recurring_schedule[cat_id]
@@ -597,7 +641,13 @@ def _render_expense_manage_rows(
 
     table_rows = []
     for _, row in sorted_df.iterrows():
-        recurring_tag = " 🔄" if row.get("is_recurring", False) else ""
+        freq = normalize_expense_pay_frequency(
+            row.get("pay_frequency")
+            or ("monthly" if row.get("is_recurring") else "one_time")
+        )
+        recurring_tag = (
+            f" 🔄 {expense_pay_frequency_label(freq)}" if freq != "one_time" else ""
+        )
         details_text = f"{row.get('details', '') or ''}{recurring_tag}".strip() or "—"
         table_rows.append(
             {
@@ -638,6 +688,39 @@ def _render_expense_manage_rows(
         selected_idx = edit_options.index(selected_label)
         target_row = sorted_df.iloc[selected_idx]
         exp_id = target_row["id"]
+        stream_id = target_row.get("stream_id")
+        if stream_id and pd.notna(stream_id):
+            stream_id = str(stream_id)
+        else:
+            stream_id = None
+
+        current_freq = normalize_expense_pay_frequency(
+            target_row.get("pay_frequency")
+            or ("monthly" if target_row.get("is_recurring") else "one_time")
+        )
+
+        if stream_id:
+            versions = get_expense_stream_versions(stream_id)
+            if versions:
+                with st.expander("Version history", expanded=False):
+                    for ver in versions:
+                        eff = ver.get("effective_from", "")[:10]
+                        amt = _to_number(ver.get("amount"))
+                        freq = expense_pay_frequency_label(ver.get("pay_frequency"))
+                        st.caption(f"From {eff}: ${amt:,.2f} · {freq}")
+
+        edit_scope = "This occurrence only"
+        if current_freq != "one_time":
+            edit_scope = st.radio(
+                "Apply changes",
+                (
+                    "From effective date forward",
+                    "This occurrence only",
+                    "End stream",
+                ),
+                key=f"expense_edit_scope_{key_prefix}_{exp_id}",
+            )
+
         form_key = f"edit_form_{key_prefix}_{exp_id}"
 
         with st.form(form_key):
@@ -647,16 +730,67 @@ def _render_expense_manage_rows(
             )
             new_amt = st.text_input("Amount ($)", value=str(target_row["amount"]))
             new_det = st.text_input("Details", value=target_row.get("details") or "")
-            new_recur = st.checkbox("🔄 Is Recurring?", value=bool(target_row.get("is_recurring", False)))
+            if edit_scope != "End stream":
+                new_freq = st.selectbox(
+                    "Bill frequency",
+                    EXPENSE_FREQUENCY_OPTIONS,
+                    format_func=expense_pay_frequency_label,
+                    index=EXPENSE_FREQUENCY_OPTIONS.index(current_freq)
+                    if current_freq in EXPENSE_FREQUENCY_OPTIONS
+                    else EXPENSE_FREQUENCY_OPTIONS.index("monthly"),
+                    key=f"exp_edit_freq_{key_prefix}_{exp_id}",
+                )
+            else:
+                new_freq = current_freq
+            effective_from = new_date
+            if edit_scope == "From effective date forward":
+                effective_from = st.date_input(
+                    "New terms start on",
+                    value=max(new_date, date.today()),
+                    key=f"exp_edit_effective_{key_prefix}_{exp_id}",
+                )
             save_clicked = st.form_submit_button("💾 Save Changes", type="primary", width="stretch")
 
         if save_clicked:
             parsed_amt = _parse_currency_input(new_amt)
-            if parsed_amt != "invalid":
-                if update_expense(exp_id, parsed_amt, new_det.strip(), new_recur, date_logged=new_date):
-                    rerun_fragment_with_reason("budget_nav")
-            else:
+            if parsed_amt == "invalid":
                 st.error("Invalid amount.")
+            elif edit_scope == "End stream":
+                if end_expense_stream(exp_id):
+                    rerun_fragment_with_reason("budget_nav")
+                else:
+                    st.error("Could not end expense stream.")
+            elif edit_scope == "From effective date forward" and current_freq != "one_time":
+                eff_key = f"exp_edit_effective_{key_prefix}_{exp_id}"
+                effective_from_val = st.session_state.get(eff_key, new_date)
+                if schedule_expense_change(
+                    exp_id,
+                    effective_from_val,
+                    parsed_amt,
+                    new_det.strip(),
+                    new_freq,
+                ):
+                    rerun_fragment_with_reason("budget_nav")
+                else:
+                    st.error("Could not schedule expense change.")
+            elif update_expense(
+                exp_id,
+                parsed_amt,
+                new_det.strip(),
+                new_freq != "one_time",
+                date_logged=new_date,
+                pay_frequency=new_freq,
+            ):
+                rerun_fragment_with_reason("budget_nav")
+
+        delete_scope = "This occurrence only"
+        if stream_id or current_freq != "one_time":
+            delete_scope = st.radio(
+                "Delete scope",
+                ("This occurrence only", "End stream"),
+                key=f"expense_delete_scope_{key_prefix}_{exp_id}",
+                horizontal=True,
+            )
 
         expense_delete_key = f"expense_{key_prefix}_{exp_id}"
         if st.button("❌ Delete Expense", key=f"del_{key_prefix}_{exp_id}", type="secondary", width="stretch"):
@@ -664,7 +798,11 @@ def _render_expense_manage_rows(
             rerun_fragment_with_reason("delete_arm")
 
         if render_delete_confirmation(expense_delete_key, item_label=selected_label, rerun_scope="fragment"):
-            if delete_expense(exp_id):
+            if delete_scope == "End stream" and current_freq != "one_time":
+                ok = end_expense_stream(exp_id)
+            else:
+                ok = delete_expense_month_only(exp_id)
+            if ok:
                 rerun_fragment_with_reason("delete_expense")
 
 
@@ -766,9 +904,11 @@ def _render_income_management(
                 owner = row.get("owner_username", "unassigned")
                 amount = _to_number(row.get("take_home_amount"))
                 freq = income_pay_frequency_label(row.get("pay_frequency"))
+                pay_date = _format_payment_date(row.get("payment_date"))
+                pay_suffix = f" · paid {pay_date}" if pay_date != "—" else ""
                 if is_personal:
-                    return f"{row.get('source_name')} · {freq} · ${_format_money(amount)}"
-                return f"{row.get('source_name')} ({owner}) · {freq} · ${_format_money(amount)}"
+                    return f"{row.get('source_name')} · {freq} · ${_format_money(amount)}{pay_suffix}"
+                return f"{row.get('source_name')} ({owner}) · {freq} · ${_format_money(amount)}{pay_suffix}"
 
             edit_options = editable_df.apply(_income_label, axis=1).tolist()
             selected_edit_str = st.selectbox(
@@ -779,6 +919,32 @@ def _render_income_management(
             selected_edit_idx = edit_options.index(selected_edit_str)
             target_row = editable_df.iloc[selected_edit_idx]
             target_income_id = target_row["id"]
+            stream_id = target_row.get("stream_id")
+            if stream_id and pd.notna(stream_id):
+                stream_id = str(stream_id)
+            else:
+                stream_id = None
+
+            if stream_id:
+                versions = get_income_stream_versions(stream_id)
+                if versions:
+                    with st.expander("Version history", expanded=False):
+                        for ver in versions:
+                            eff = ver.get("effective_from", "")[:10]
+                            amt = _to_number(ver.get("take_home_amount"))
+                            freq = income_pay_frequency_label(ver.get("pay_frequency"))
+                            st.caption(f"From {eff}: ${amt:,.2f} · {freq}")
+
+            edit_scope = st.radio(
+                "Apply changes",
+                (
+                    "From effective date forward",
+                    "This month only",
+                    "End stream",
+                ),
+                key=f"income_edit_scope_{form_key_prefix}_{target_income_id}",
+                help="Forward changes preserve past months. End stream stops future rollover.",
+            )
 
             with st.form(f"edit_{form_key_prefix}_income_form", clear_on_submit=True):
                 edit_source = st.text_input("Source Name", value=target_row.get("source_name", ""))
@@ -815,6 +981,17 @@ def _render_income_management(
                     value=payment_default,
                     key=f"edit_pay_date_{form_key_prefix}_{target_income_id}",
                 )
+                effective_from_default = edit_payment_date
+                if edit_scope == "From effective date forward":
+                    effective_from_default = max(payment_default, date.today())
+                    effective_from = st.date_input(
+                        "New terms start on",
+                        value=effective_from_default,
+                        key=f"edit_effective_from_{form_key_prefix}_{target_income_id}",
+                        help="Past months are not changed.",
+                    )
+                else:
+                    effective_from = edit_payment_date
 
                 u1, u2 = st.columns(2)
                 update_clicked = u1.form_submit_button("💾 Update Income", type="primary", width="stretch")
@@ -825,6 +1002,30 @@ def _render_income_management(
                 parsed_gross = _parse_currency_input(edit_gross)
                 if not edit_source.strip() or parsed_take_home == "invalid" or parsed_gross == "invalid":
                     st.error("Please provide a valid source name and dollar amounts.")
+                elif edit_scope == "End stream":
+                    if end_income_stream(target_income_id, end_date=date.today()):
+                        st.success("Income stream ended. Past months are unchanged.")
+                        rerun_fragment_with_reason("budget_nav")
+                    else:
+                        st.error("Could not end income stream.")
+                elif edit_scope == "From effective date forward":
+                    eff_key = f"edit_effective_from_{form_key_prefix}_{target_income_id}"
+                    effective_from_val = st.session_state.get(eff_key, edit_payment_date)
+                    ensure_income_stream_for_row(target_income_id)
+                    if schedule_income_change(
+                        target_income_id,
+                        effective_from_val,
+                        edit_source,
+                        parsed_take_home,
+                        parsed_gross,
+                        edit_taxable,
+                        edit_owner,
+                        False,
+                        edit_pay_frequency,
+                    ):
+                        rerun_fragment_with_reason("budget_nav")
+                    else:
+                        st.error("Could not schedule income change.")
                 elif update_household_income(
                     target_income_id,
                     edit_source,
@@ -839,12 +1040,22 @@ def _render_income_management(
                     rerun_fragment_with_reason("budget_nav")
 
             income_delete_key = f"income_{form_key_prefix}_{target_income_id}"
+            delete_scope = st.radio(
+                "Delete scope",
+                ("This month only", "End stream"),
+                key=f"income_delete_scope_{form_key_prefix}_{target_income_id}",
+                horizontal=True,
+            )
             if delete_clicked:
                 arm_delete_confirm(income_delete_key)
                 rerun_fragment_with_reason("delete_arm")
 
             if render_delete_confirmation(income_delete_key, item_label=edit_source, rerun_scope="fragment"):
-                if delete_household_income(target_income_id):
+                if delete_scope == "End stream":
+                    ok = end_income_stream(target_income_id)
+                else:
+                    ok = delete_household_income_month_only(target_income_id)
+                if ok:
                     rerun_fragment_with_reason("delete_income")
 
 
@@ -906,10 +1117,12 @@ def _render_family_member_budgets(household_id, selected_month, household_users)
         merged_df["actual_amount"] = merged_df["amount"].fillna(0.0)
 
         year, month = map(int, selected_month.split("-"))
-        prev_month = month - 1 if month > 1 else 12
-        prev_year = year if month > 1 else year - 1
-        prev_month_str = f"{prev_year}-{prev_month:02d}"
-        recurring_schedule = get_recurring_schedule(household_id, prev_month_str, is_personal=True)
+        stream_projections, recurring_schedule = get_expense_stream_projections(
+            household_id,
+            selected_month,
+            is_personal_spend=True,
+            username=selected_member,
+        )
 
         _render_household_budget_breakdown(
             merged_df,
@@ -917,6 +1130,7 @@ def _render_family_member_budgets(household_id, selected_month, household_users)
             recurring_schedule,
             selected_month,
             filter_key=f"family_breakdown_{selected_member}",
+            stream_projections=stream_projections,
         )
 
         annual_df = merged_df[merged_df["category_name"] == "Annual Subscriptions"]
@@ -1297,8 +1511,11 @@ def _build_period_summary(household_id, year, mode, scope, username=None, auth_u
             for _, row in incomes_actual.iterrows():
                 source = row.get("source_name") or "—"
                 freq = row.get("pay_frequency") or "monthly"
-                amt = normalize_income_amount_for_month(
-                    row.get("take_home_amount"), freq, month_year=month_year
+                amt = income_amount_for_month_total(
+                    row.get("take_home_amount"),
+                    freq,
+                    month_year=month_year,
+                    row=row.to_dict(),
                 )
                 income_by_source[source] = income_by_source.get(source, 0.0) + amt
 
@@ -1325,10 +1542,22 @@ def _build_period_summary(household_id, year, mode, scope, username=None, auth_u
     merged_df["actual_amount"] = merged_df["amount"].fillna(0.0)
     merged_df = _exclude_system_categories(merged_df)
 
+    stream_projections = sum_expense_stream_projections_for_months(
+        household_id,
+        months,
+        is_personal_spend=is_personal,
+        username=username if is_personal else None,
+    )
+
     category_groups = []
     for parent in merged_df["category_name"].unique():
         parent_mask = merged_df["category_name"] == parent
-        parent_target = float(merged_df.loc[parent_mask, "target_budget"].sum()) * month_count
+        parent_target = float(
+            sum(
+                _category_projected_amount(row, stream_projections, month_count=month_count)
+                for _, row in merged_df[parent_mask].iterrows()
+            )
+        )
         parent_actual = float(merged_df.loc[parent_mask, "actual_amount"].sum())
         if parent_target == 0 and parent_actual == 0:
             continue
@@ -1336,7 +1565,7 @@ def _build_period_summary(household_id, year, mode, scope, username=None, auth_u
         sub_rows = []
         parent_purchase_count = 0
         for _, row in merged_df[parent_mask].iterrows():
-            target = float(row["target_budget"]) * month_count
+            target = _category_projected_amount(row, stream_projections, month_count=month_count)
             actual = float(row["actual_amount"])
             if target == 0 and actual == 0:
                 continue
@@ -1676,9 +1905,11 @@ def _render_budget_fragment(show_back_to_hub=False):
             ensure_project_expense_category(household_id)
             st.session_state[guard_key] = True
         allowance_guard = f"allowance_categories_ready_{household_id}"
-        if not st.session_state.get(allowance_guard):
-            ensure_allowance_categories(household_id)
-            st.session_state[allowance_guard] = True
+        if not st.session_state.get(allowance_guard) or not allowance_categories_in_sync(household_id):
+            if ensure_allowance_categories(household_id):
+                st.session_state[allowance_guard] = True
+            else:
+                st.session_state.pop(allowance_guard, None)
 
     if "budget_view" not in st.session_state:
         st.session_state["budget_view"] = "menu"
@@ -2115,7 +2346,7 @@ def _render_budget_fragment(show_back_to_hub=False):
         current_month = datetime.now().strftime("%Y-%m")
         selected_month = st.selectbox("Select Month", [current_month, "2026-05", "2026-04"], index=0)
         _maybe_auto_rollover(household_id, selected_month)
-            
+
         incomes_df = get_household_incomes(household_id, selected_month)
         incomes_actual_df = _filter_incomes_for_actual_totals(incomes_df, selected_month)
         expenses_df = get_monthly_expenses(household_id, selected_month, include_private_members=True)
@@ -2170,11 +2401,11 @@ def _render_budget_fragment(show_back_to_hub=False):
                 merged_df["actual_amount"] = merged_df["amount"].fillna(0.0)
                 merged_df = _exclude_system_categories(merged_df)
 
-                year, month = map(int, selected_month.split("-"))
-                prev_month = month - 1 if month > 1 else 12
-                prev_year = year if month > 1 else year - 1
-                prev_month_str = f"{prev_year}-{prev_month:02d}"
-                recurring_schedule = get_recurring_schedule(household_id, prev_month_str)
+                stream_projections, recurring_schedule = get_expense_stream_projections(
+                    household_id,
+                    selected_month,
+                    is_personal_spend=False,
+                )
 
                 _render_household_budget_breakdown(
                     merged_df,
@@ -2182,8 +2413,8 @@ def _render_budget_fragment(show_back_to_hub=False):
                     recurring_schedule,
                     selected_month,
                     filter_key="hh_breakdown_category",
+                    stream_projections=stream_projections,
                 )
-            
             st.divider()
             
             # 🟢 SINKING FUNDS TRACKER
@@ -2233,11 +2464,15 @@ def _render_budget_fragment(show_back_to_hub=False):
                 is_allowance_payment = is_allowance_subcategory(
                     cat_row.get("category_name"), cat_row.get("sub_category_name")
                 )
-                allowance_recipient = cat_row.get("username") if is_allowance_payment else None
+                allowance_recipient = allowance_recipient_username(
+                    cat_row.get("category_name"),
+                    cat_row.get("sub_category_name"),
+                    username_field=cat_row.get("username"),
+                )
                 if is_allowance_payment and allowance_recipient:
                     st.caption(
-                        f"This payment will appear as income in **{allowance_recipient}**'s Personal Budget. "
-                        "Check recurring to pay the same amount each month on this day."
+                        f"This payment will appear as income in **{allowance_recipient}**'s Personal Budget "
+                        "using the same bill frequency you select here."
                     )
 
                 with st.form("hh_expense_entry", clear_on_submit=True):
@@ -2246,9 +2481,12 @@ def _render_budget_fragment(show_back_to_hub=False):
                     amount_raw = a2.text_input("Amount ($) *")
 
                     details = st.text_input("Details")
-                    is_recurring = st.checkbox(
-                        "🔄 Make this a recurring monthly bill",
-                        value=False,
+                    pay_frequency = st.selectbox(
+                        "Bill frequency",
+                        EXPENSE_FREQUENCY_OPTIONS,
+                        format_func=expense_pay_frequency_label,
+                        index=EXPENSE_FREQUENCY_OPTIONS.index("monthly"),
+                        key="hh_expense_pay_freq",
                     )
 
                     if st.form_submit_button("💾 Save Shared Expense", type="primary", width="stretch"):
@@ -2260,7 +2498,9 @@ def _render_budget_fragment(show_back_to_hub=False):
                                 auth_user_id=auth_user_id, username=username, household_id=household_id,
                                 month_year=date_logged.strftime("%Y-%m"), date_logged=date_logged,
                                 category_id=cat_row["id"], amount=parsed_amount, details=details.strip(),
-                                is_personal_spend=False, is_recurring=is_recurring,
+                                is_personal_spend=False,
+                                is_recurring=pay_frequency != "one_time",
+                                pay_frequency=pay_frequency,
                             )
                             if success:
                                 st.success(f"Logged ${_format_money(parsed_amount)} to Household Ledger.")
@@ -2483,6 +2723,14 @@ def _render_budget_fragment(show_back_to_hub=False):
             net_personal_cash = total_personal_income - total_personal_spend
             _render_signed_currency_metric(p_col3, "Net Personal Cash Flow", net_personal_cash)
             st.divider()
+
+            st.markdown("**Income this month**")
+            _render_income_streams_list(
+                personal_incomes_df,
+                is_personal=True,
+                annual_totals=None,
+            )
+            st.divider()
             
             st.markdown(f"#### {username.title()}'s Budget Breakdown")
             
@@ -2499,19 +2747,20 @@ def _render_budget_fragment(show_back_to_hub=False):
                 merged_df = pd.merge(categories_df, exp_summary, left_on="id", right_on="category_id", how="left")
                 merged_df["actual_amount"] = merged_df["amount"].fillna(0.0)
                 
-                # Grab personal recurring schedule
-                year, month = map(int, selected_month.split('-'))
-                prev_month = month - 1 if month > 1 else 12
-                prev_year = year if month > 1 else year - 1
-                prev_month_str = f"{prev_year}-{prev_month:02d}"
-                recurring_schedule = get_recurring_schedule(household_id, prev_month_str, is_personal=True)
-                
+                stream_projections, recurring_schedule = get_expense_stream_projections(
+                    household_id,
+                    selected_month,
+                    is_personal_spend=True,
+                    username=username,
+                )
+
                 _render_household_budget_breakdown(
                     merged_df,
                     my_personal_df,
                     recurring_schedule,
                     selected_month,
                     filter_key="pers_breakdown_category",
+                    stream_projections=stream_projections,
                 )
 
                 annual_df = merged_df[merged_df["category_name"] == "Annual Subscriptions"]
@@ -2544,7 +2793,13 @@ def _render_budget_fragment(show_back_to_hub=False):
                     selected_display_name = st.selectbox("Category", display_list, key="pers_cat_form")
                     
                     details = st.text_input("Details")
-                    is_recurring = st.checkbox("🔄 Make this a recurring monthly expense", value=False)
+                    pay_frequency = st.selectbox(
+                        "Bill frequency",
+                        EXPENSE_FREQUENCY_OPTIONS,
+                        format_func=expense_pay_frequency_label,
+                        index=EXPENSE_FREQUENCY_OPTIONS.index("monthly"),
+                        key="pers_expense_pay_freq",
+                    )
                     
                     if st.form_submit_button("💾 Save Personal Expense", type="primary", width="stretch"):
                         parsed_amount = _parse_currency_input(amount_raw)
@@ -2557,7 +2812,9 @@ def _render_budget_fragment(show_back_to_hub=False):
                                 auth_user_id=auth_user_id, username=username, household_id=household_id,
                                 month_year=date_logged.strftime("%Y-%m"), date_logged=date_logged,
                                 category_id=cat_row["id"], amount=parsed_amount, details=details.strip(), 
-                                is_personal_spend=True, is_recurring=is_recurring
+                                is_personal_spend=True,
+                                is_recurring=pay_frequency != "one_time",
+                                pay_frequency=pay_frequency,
                             )
                             if success:
                                 st.success(f"Logged ${_format_money(parsed_amount)} to Personal Ledger.")

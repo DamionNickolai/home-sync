@@ -44,6 +44,7 @@ def is_system_project_expense_category(category_name, sub_category_name=None) ->
 
 
 ALLOWANCE_CATEGORY_NAME = "Allowance"
+ALLOWANCE_INCOME_SOURCE_NAME = "Allowance"
 
 
 def is_allowance_category(category_name, sub_category_name=None) -> bool:
@@ -64,3 +65,16 @@ def is_system_managed_allowance_category(category_name, sub_category_name=None) 
     if sub_category_name is None:
         return True
     return is_allowance_subcategory(category_name, sub_category_name)
+
+
+def allowance_recipient_username(
+    category_name,
+    sub_category_name,
+    *,
+    username_field=None,
+) -> str | None:
+    """Resolve who receives allowance income for an Allowance sub-category."""
+    if not is_allowance_subcategory(category_name, sub_category_name):
+        return None
+    recipient = (username_field or sub_category_name or "").strip()
+    return recipient or None

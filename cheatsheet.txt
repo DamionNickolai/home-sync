@@ -65,14 +65,34 @@ APPLY SCHEMA PARITY TO PROD (dry-run first, then --apply):
 python maintenance/apply_schema_parity.py
 python maintenance/apply_schema_parity.py --apply
 
-MIGRATION RUN ORDER FOR FRESH PROD DEPLOYMENT:
-  Supabase SQL Editor → run in this order:
-  1. migrations/017_create_budget_prod_tables.sql  (core budget tables)
-  2. migrations/016_add_income_pay_frequency.sql   (pay_frequency column)
-  3. migrations/018_add_income_payment_date.sql    (payment_date, safe no-op if 017 ran)
-  4. migrations/020_add_income_source_expense_id.sql
-  5. migrations/021_fix_source_expense_id_type.sql
-  Or: run migrations/022_prod_dev_schema_parity.sql (idempotent catch-all)
+RUN INCOME STREAM BACKFILL (after migration 023):
+python maintenance/backfill_income_streams.py              # prod, dry-run
+python maintenance/backfill_income_streams.py --local      # dev tables
+python maintenance/backfill_income_streams.py --apply      # prod, write
+python maintenance/backfill_income_streams.py --local --apply
+
+INCOME STREAMS (migrations 023 + 024 + backfill):
+  apply_schema_parity.py --apply runs 022, 023, 024, 025, and 026 automatically.
+  Or paste 023 then 024 in Supabase SQL Editor.
+  Test schedule logic locally (no DB):
+  python -m unittest tests.test_income_pay_occurrences -v
+  Then backfill legacy recurring rows:
+  python maintenance/backfill_income_streams.py --apply
+
+EXPENSE STREAMS (migrations 025 + 026 + 027 + backfill):
+  apply_schema_parity.py --apply includes 025, 026, and 027 (027 fixes dev category_id UUID).
+  Test bill schedule logic locally (no DB):
+  python -m unittest tests.test_expense_bill_occurrences -v
+  Backfill legacy recurring expense rows:
+  python maintenance/backfill_expense_streams.py              # prod, dry-run
+  python maintenance/backfill_expense_streams.py --local      # dev tables
+  python maintenance/backfill_expense_streams.py --apply
+  python maintenance/backfill_expense_streams.py --local --apply
+
+RESET DEV HOUSEHOLD DATA (E2E testing — *_dev tables only):
+  python maintenance/reset_dev_household_data.py --list-households
+  python maintenance/reset_dev_household_data.py --household-id test_home
+  python maintenance/reset_dev_household_data.py --household-id test_home --apply
 
 BACKFILL ENCRYPTED SESSION TOKENS:
 .\venv\Scripts\python.exe maintenance/migrate_user_sessions_refresh_tokens.py
