@@ -1982,18 +1982,25 @@ def _materialize_expense_occurrence(
     date_logged: date,
     household_id: str,
     existing: dict | None,
+    force: bool = False,
 ) -> str | None:
     """Insert/update one expense ledger row using a pre-fetched existing row.
 
     Skips the write when the row is locked or already reflects the current
-    version (idempotent re-materialization).
+    version (idempotent re-materialization). ``force=True`` rewrites the row even
+    when the version id is unchanged, which is required after an in-place version
+    edit (same effective_from, new amount/details).
     """
     today = datetime.now().date()
     if date_logged > today:
         return None
     if existing and existing.get("is_locked"):
         return None
-    if existing and str(existing.get("version_id") or "") == str(version.get("id") or ""):
+    if (
+        not force
+        and existing
+        and str(existing.get("version_id") or "") == str(version.get("id") or "")
+    ):
         return None
 
     expenses_table = get_budget_table("expenses")
@@ -2049,7 +2056,7 @@ def _cleanup_stale_expense_occurrences(
             supabase.table(expenses_table).delete().eq("id", row["id"]).execute()
 
 
-def materialize_expense_month(stream_id, month_year, household_id=None) -> bool:
+def materialize_expense_month(stream_id, month_year, household_id=None, force=False) -> bool:
     """Create or update expense ledger rows for each bill date in month_year."""
     streams_table = get_expense_streams_table()
 
@@ -2100,6 +2107,7 @@ def materialize_expense_month(stream_id, month_year, household_id=None) -> bool:
             date_logged=bill_date,
             household_id=house_id,
             existing=existing_by_date.get(date_str),
+            force=force,
         ):
             injected_any = True
 
@@ -2143,9 +2151,9 @@ def _expected_expense_occurrences(stream_id, versions, month_year):
     return [(bill_date, version)]
 
 
-def _rematerialize_expense_stream_from_month(stream_id, from_month_year: str, household_id: str) -> None:
+def _rematerialize_expense_stream_from_month(stream_id, from_month_year: str, household_id: str, force: bool = False) -> None:
     expenses_table = get_budget_table("expenses")
-    materialize_expense_month(stream_id, from_month_year, household_id)
+    materialize_expense_month(stream_id, from_month_year, household_id, force=force)
     response = (
         supabase.table(expenses_table)
         .select("month_year")
@@ -2156,7 +2164,7 @@ def _rematerialize_expense_stream_from_month(stream_id, from_month_year: str, ho
     )
     months = sorted({row["month_year"] for row in (response.data or [])})
     for month_year in months:
-        materialize_expense_month(stream_id, month_year, household_id)
+        materialize_expense_month(stream_id, month_year, household_id, force=force)
 
 
 def schedule_expense_change(
@@ -2190,13 +2198,26 @@ def schedule_expense_change(
         pay_frequency=pay_frequency,
     )
 
-    stream_update = {"display_name": encrypt_data(details)}
+    # "From effective date forward" means these terms govern everything on or
+    # after effective_from. Remove stale later-dated versions left by previous
+    # edits, otherwise they shadow this change for occurrences after their date.
+    supabase.table(get_expense_stream_versions_table()).delete().eq(
+        "stream_id", stream_id
+    ).gt("effective_from", effective_from.isoformat()).execute()
+
+    # Editing a stream "forward" implies it should be live again: clear any
+    # prior end-stream state so re-materialization is not refused as inactive.
+    stream_update = {
+        "display_name": encrypt_data(details),
+        "is_active": True,
+        "ended_on": None,
+    }
     if category_id is not None:
         stream_update["category_id"] = category_id
     supabase.table(get_expense_streams_table()).update(stream_update).eq("id", stream_id).execute()
 
     from_month = _month_year_from_date(effective_from)
-    _rematerialize_expense_stream_from_month(stream_id, from_month, household_id)
+    _rematerialize_expense_stream_from_month(stream_id, from_month, household_id, force=True)
     _sync_allowance_for_stream_month(stream_id, from_month, household_id)
     if row.get("category_id"):
         sync_category_target_from_stream_monthly(row["category_id"], household_id, from_month)
@@ -2204,7 +2225,12 @@ def schedule_expense_change(
 
 
 def end_expense_stream(expense_id, end_date=None) -> bool:
-    """Stop future rollover; preserve ledger history."""
+    """Stop future rollover and remove the current/future unlocked occurrences.
+
+    Past months (and any locked rows) are preserved as history; the selected
+    expense's month and everything after it are cleared so the recurring charge
+    visibly stops in the ledger.
+    """
     if not _can_edit_expense_server_side(expense_id):
         return False
     stream_id = ensure_expense_stream_for_row(expense_id)
@@ -2215,9 +2241,24 @@ def end_expense_stream(expense_id, end_date=None) -> bool:
     elif isinstance(end_date, str):
         end_date = datetime.strptime(end_date[:10], "%Y-%m-%d").date()
 
+    row = _fetch_expense_flags(expense_id)
+    from_month = (row or {}).get("month_year") or end_date.strftime("%Y-%m")
+
     supabase.table(get_expense_streams_table()).update(
         {"is_active": False, "ended_on": end_date.isoformat()}
     ).eq("id", stream_id).execute()
+
+    expenses_table = get_budget_table("expenses")
+    occ = (
+        supabase.table(expenses_table)
+        .select("id, is_locked")
+        .eq("stream_id", stream_id)
+        .gte("month_year", from_month)
+        .execute()
+    )
+    for occ_row in occ.data or []:
+        if not occ_row.get("is_locked"):
+            delete_expense(occ_row["id"])
     return True
 
 
