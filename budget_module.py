@@ -298,6 +298,14 @@ def _enrich_expenses_with_categories(expenses_df, categories_df):
     return enriched
 
 
+def _format_expense_category_label(row) -> str:
+    cat = row.get("category_name") or "—"
+    sub = row.get("sub_category_name")
+    if sub is None or (isinstance(sub, float) and pd.isna(sub)) or str(sub).strip() in ("", "—"):
+        return str(cat)
+    return f"{cat} > {sub}"
+
+
 INCOME_FREQUENCY_OPTIONS = list(INCOME_PAY_FREQUENCY_LABELS.keys())
 EXPENSE_FREQUENCY_OPTIONS = [f for f in INCOME_FREQUENCY_OPTIONS if f != "school_year_monthly"]
 
@@ -719,11 +727,11 @@ def _render_expense_manage_rows(
         return
 
     def _expense_label(row):
-        cat = row.get("category_name", "—")
+        cat_label = _format_expense_category_label(row)
         amt = _format_ledger_amount(row.get("amount", 0))
-        det = (row.get("details") or "").strip()
-        base = f"{row.get('date_logged', '—')} · {cat} · {amt}"
-        return f"{base} · {det}" if det else base
+        det = (row.get("details") or "").strip() or "—"
+        dt = row.get("date_logged", "—")
+        return f"{cat_label} · {amt} · {det} · {dt}"
 
     edit_options = sorted_df.apply(_expense_label, axis=1).tolist()
     with st.expander("🛠️ Edit or Delete Expense", expanded=False):
@@ -777,6 +785,9 @@ def _render_expense_manage_rows(
             row_date = date.today()
 
         with st.form(form_key):
+            st.markdown(f"**Category:** {_format_expense_category_label(target_row)}")
+            new_amt = st.text_input("Amount ($)", value=str(target_row["amount"]))
+            new_det = st.text_input("Details", value=target_row.get("details") or "")
             if edit_scope == "From effective date forward":
                 st.caption(
                     "New terms apply to this date and every future bill for this "
@@ -791,8 +802,6 @@ def _render_expense_manage_rows(
             else:
                 new_date = st.date_input("Date", value=row_date)
                 effective_from = new_date
-            new_amt = st.text_input("Amount ($)", value=str(target_row["amount"]))
-            new_det = (target_row.get("details") or "")
             if edit_scope != "End stream":
                 new_freq = st.selectbox(
                     "Bill frequency",
@@ -2529,6 +2538,8 @@ def _render_budget_fragment(show_back_to_hub=False):
                     date_logged = a1.date_input("Date", value=date.today())
                     amount_raw = a2.text_input("Amount ($) *")
 
+                    details = st.text_input("Details")
+
                     pay_frequency = st.selectbox(
                         "Bill frequency",
                         EXPENSE_FREQUENCY_OPTIONS,
@@ -2545,7 +2556,7 @@ def _render_budget_fragment(show_back_to_hub=False):
                             success = log_expense_and_check_project(
                                 auth_user_id=auth_user_id, username=username, household_id=household_id,
                                 month_year=date_logged.strftime("%Y-%m"), date_logged=date_logged,
-                                category_id=cat_row["id"], amount=parsed_amount, details="",
+                                category_id=cat_row["id"], amount=parsed_amount, details=details.strip(),
                                 is_personal_spend=False,
                                 is_recurring=pay_frequency != "one_time",
                                 pay_frequency=pay_frequency,
@@ -2841,6 +2852,8 @@ def _render_budget_fragment(show_back_to_hub=False):
                     
                     selected_display_name = st.selectbox("Category", display_list, key="pers_cat_form")
                     
+                    details = st.text_input("Details")
+
                     pay_frequency = st.selectbox(
                         "Bill frequency",
                         EXPENSE_FREQUENCY_OPTIONS,
@@ -2859,7 +2872,7 @@ def _render_budget_fragment(show_back_to_hub=False):
                             success = log_expense_and_check_project(
                                 auth_user_id=auth_user_id, username=username, household_id=household_id,
                                 month_year=date_logged.strftime("%Y-%m"), date_logged=date_logged,
-                                category_id=cat_row["id"], amount=parsed_amount, details="", 
+                                category_id=cat_row["id"], amount=parsed_amount, details=details.strip(), 
                                 is_personal_spend=True,
                                 is_recurring=pay_frequency != "one_time",
                                 pay_frequency=pay_frequency,
