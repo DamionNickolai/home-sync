@@ -306,6 +306,11 @@ def _format_expense_category_label(row) -> str:
     return f"{cat} > {sub}"
 
 
+def _sort_subcategory_rows(sub_rows: list[dict]) -> list[dict]:
+    """Alphabetical sub-category order within a parent category on ledgers."""
+    return sorted(sub_rows, key=lambda row: str(row.get("name", "")).lower())
+
+
 INCOME_FREQUENCY_OPTIONS = list(INCOME_PAY_FREQUENCY_LABELS.keys())
 EXPENSE_FREQUENCY_OPTIONS = [f for f in INCOME_FREQUENCY_OPTIONS if f != "school_year_monthly"]
 
@@ -507,6 +512,8 @@ def _render_household_budget_breakdown(
                     "purchase_count": sub_purchase_count,
                 }
             )
+
+        sub_rows = _sort_subcategory_rows(sub_rows)
 
         parent_groups.append(
             {
@@ -1630,6 +1637,8 @@ def _build_period_summary(household_id, year, mode, scope, username=None, auth_u
                     "purchase_count": sub_purchase_count,
                 }
             )
+
+        sub_rows = _sort_subcategory_rows(sub_rows)
 
         category_groups.append(
             {
