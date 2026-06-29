@@ -13,7 +13,15 @@ from database import (
     insert_project_budget_item,
     delete_project_budget_item,
     add_project_purchase_expense,
+    update_project_purchase_expense,
+    delete_project_purchase_expense,
+    get_project_purchase_expenses,
+    get_project_purchase_expense_entries,
+    sum_project_purchase_expenses_for_year,
+    format_project_purchase_expense_line,
+    _project_expense_product_from_details,
     ensure_project_expense_category,
+    strip_expense_audit_lines_from_notes,
     ensure_allowance_categories,
     allowance_categories_in_sync,
     get_household_finance_settings,
@@ -65,17 +73,48 @@ from database import (
     auto_rollover_recurring_expenses,
     auto_rollover_recurring_incomes,
     get_expense_stream_projections,
-    sum_expense_stream_projections_for_months,
     expense_pay_frequency_label,
     normalize_expense_pay_frequency,
     schedule_expense_change,
     end_expense_stream,
     get_expense_stream_versions,
     delete_expense_month_only,
+    compute_household_obligations,
+    upsert_parent_assignment,
+    clear_parent_assignment,
+    upsert_subcategory_override,
+    clear_subcategory_override,
+    compute_household_disbursement_plan,
+    get_disbursement_allowance_surplus_flags,
+    get_household_income_stream_options,
+    get_member_transfers,
+    upsert_planned_transfers_from_schedule,
+    reset_disbursement_plan_transfers,
+    cleanup_orphan_disbursement_artifacts,
+    auto_complete_due_member_transfers,
+    complete_due_member_transfers,
+    get_due_planned_member_transfers,
+    ensure_completed_transfer_allowance_expenses,
+    auto_materialize_disbursement_plan,
+    complete_member_transfer,
+    update_personal_household_integration,
+    get_personal_household_integration,
+    get_personal_ledger_incomes,
+    get_personal_ledger_expenses,
+    get_member_obligation_parent_names,
+    get_member_obligation_expense_categories,
+    get_member_obligation_inactive_subcategories,
+    insert_obligation_subcategory,
+    deactivate_obligation_subcategory,
+    reactivate_obligation_subcategory,
+    log_household_expense_from_personal,
+    get_member_funding_streams,
+    set_member_funding_streams,
 )
 from ui_helpers import (
     rerun_app_with_reason,
     rerun_fragment_with_reason,
+    rerun_with_reason,
     manage_popover_key,
     finish_manage_popover,
     arm_delete_confirm,
@@ -91,21 +130,83 @@ from constants import (
     is_system_project_expense_category,
     is_system_managed_allowance_category,
     is_allowance_subcategory,
+    TRANSFER_ALLOWANCE_EXPENSE_DETAILS,
 )
 
 
-def _maybe_auto_rollover(household_id, selected_month):
-    """Run recurring rollover once per session/month to avoid repeat DB scans on every rerun."""
+def _clear_disbursement_session_guards(household_id, month_year) -> None:
+    """Allow materialization/backfill editors to refresh after a disbursement reset.
+
+    Does not clear the per-day auto-complete guard — reset arms that separately so
+    past-due planned rows stay planned until the next session/day.
+    """
+    prefixes = (
+        f"disburse_materialized_{household_id}_",
+        f"transfer_allowance_expenses_{household_id}_",
+        f"disbursement_orphan_cleanup_{household_id}_",
+        f"rollover_checked_{household_id}_",
+    )
+    for key in list(st.session_state.keys()):
+        if any(key.startswith(prefix) for prefix in prefixes):
+            st.session_state.pop(key, None)
+        if key == f"disbursement_editor_rev_{household_id}_{month_year}":
+            st.session_state.pop(key, None)
+
+
+def _arm_disbursement_reset_autocomplete_hold(household_id) -> None:
+    """Block auto-complete for the rest of this session after a manual plan reset."""
+    tz = ZoneInfo("America/Chicago")
+    today = datetime.now(tz).date().isoformat()
+    st.session_state[f"transfers_auto_completed_{household_id}_{today}"] = True
+
+
+def maybe_run_household_automation(household_id, selected_month=None, *, rerun_scope: str = "fragment") -> None:
+    """Run rollover, disbursement materialization, and due transfer completion once per session."""
     if not household_id:
         return
-    guard_key = f"rollover_checked_{household_id}_{selected_month}"
-    if st.session_state.get(guard_key):
-        return
-    expense_rolled = auto_rollover_recurring_expenses(household_id, selected_month)
-    income_rolled = auto_rollover_recurring_incomes(household_id, selected_month)
-    st.session_state[guard_key] = True
-    if expense_rolled or income_rolled:
-        rerun_fragment_with_reason("recurring_rollover")
+    tz = ZoneInfo("America/Chicago")
+    month_year = selected_month or datetime.now(tz).strftime("%Y-%m")
+    today = datetime.now(tz).date().isoformat()
+    changed = False
+
+    guard_key = f"rollover_checked_{household_id}_{month_year}"
+    if not st.session_state.get(guard_key):
+        expense_rolled = auto_rollover_recurring_expenses(household_id, month_year)
+        income_rolled = auto_rollover_recurring_incomes(household_id, month_year)
+        st.session_state[guard_key] = True
+        changed = changed or bool(expense_rolled or income_rolled)
+
+    disburse_guard = f"disburse_materialized_{household_id}_{month_year}"
+    if not st.session_state.get(disburse_guard):
+        disburse_inserted = auto_materialize_disbursement_plan(household_id, month_year)
+        st.session_state[disburse_guard] = True
+        changed = changed or bool(disburse_inserted)
+
+    transfer_guard = f"transfers_auto_completed_{household_id}_{today}"
+    if not st.session_state.get(transfer_guard):
+        transfers_completed = auto_complete_due_member_transfers(household_id)
+        st.session_state[transfer_guard] = True
+        changed = changed or transfers_completed > 0
+
+    backfill_guard = f"transfer_allowance_expenses_{household_id}_{month_year}"
+    if not st.session_state.get(backfill_guard):
+        backfilled = ensure_completed_transfer_allowance_expenses(household_id, month_year)
+        st.session_state[backfill_guard] = True
+        changed = changed or backfilled > 0
+
+    orphan_guard = f"disbursement_orphan_cleanup_{household_id}_{month_year}"
+    if not st.session_state.get(orphan_guard):
+        orphan_stats = cleanup_orphan_disbursement_artifacts(household_id, month_year)
+        st.session_state[orphan_guard] = True
+        changed = changed or bool(orphan_stats.get("expenses") or orphan_stats.get("incomes"))
+
+    if changed:
+        rerun_with_reason("household_automation", scope=rerun_scope)
+
+
+def _maybe_auto_rollover(household_id, selected_month):
+    """Backward-compatible alias for household session automation."""
+    maybe_run_household_automation(household_id, selected_month)
 
 
 def _recurring_due_date_in_month(expense_row, selected_month):
@@ -232,6 +333,24 @@ def _exclude_system_category_expenses(expenses_df, categories_df):
     return expenses_df[~expenses_df["category_id"].isin(system_ids)].copy()
 
 
+def _exclude_allowance_categories(categories_df):
+    """Hide system-managed Allowance sub-categories from manual HH expense pickers."""
+    if categories_df is None or categories_df.empty:
+        return categories_df
+    mask = ~categories_df.apply(
+        lambda row: is_allowance_subcategory(
+            row.get("category_name"),
+            row.get("sub_category_name"),
+        ),
+        axis=1,
+    )
+    return categories_df[mask].copy()
+
+
+def _is_transfer_allowance_expense_row(row) -> bool:
+    return (str(row.get("details") or "").strip() == TRANSFER_ALLOWANCE_EXPENSE_DETAILS)
+
+
 def _is_budget_admin():
     return st.session_state.get("user_role", "member") in ["admin", "developer"]
 
@@ -298,17 +417,364 @@ def _enrich_expenses_with_categories(expenses_df, categories_df):
     return enriched
 
 
+def _render_project_expense_entries(entries: list[dict], container=None) -> None:
+    target = container or st
+    if not entries:
+        target.markdown("**Expenses:** —")
+        return
+    target.markdown("**Expenses:**")
+    for entry in entries:
+        label = entry.get("display") or ""
+        if entry.get("is_legacy"):
+            target.caption(f"{label} (legacy)")
+        else:
+            target.caption(label)
+
+
+def _project_purchase_expense_label(row, project_name: str) -> str:
+    date_str = str(row.get("date_logged") or "")[:10]
+    product = _project_expense_product_from_details(row.get("details"), project_name)
+    return format_project_purchase_expense_line(date_str, row.get("amount"), product)
+
+
+def _render_project_expense_manage_popover(
+    *,
+    project_id,
+    project_name: str,
+    projects_household_id,
+    project_popover_key: str,
+    mode: str,
+):
+    project_expenses_df = get_project_purchase_expenses(projects_household_id, project_id)
+
+    if mode == "add":
+        st.caption("Adds to this project's Actual Spent and records a Projects line in the household budget.")
+        with st.form(f"add_project_expense_form_{project_id}"):
+            exp_date = st.date_input(
+                "Purchase date",
+                value=date.today(),
+                key=f"proj_exp_date_{project_id}",
+            )
+            exp_product = st.text_input(
+                "Product or Service",
+                placeholder="e.g., Lumber, paint, contractor labor",
+                key=f"proj_exp_product_{project_id}",
+            )
+            exp_amount_raw = st.text_input(
+                "Amount ($) *",
+                placeholder="e.g., 125.00",
+                key=f"proj_exp_amt_{project_id}",
+            )
+            expense_submit = st.form_submit_button(
+                "💾 Add Expense",
+                type="primary",
+                width="stretch",
+            )
+        if expense_submit:
+            parsed_exp_amount = _parse_currency_input(exp_amount_raw)
+            if parsed_exp_amount == "invalid" or parsed_exp_amount is None:
+                st.error("Please enter a valid dollar amount.")
+            elif add_project_purchase_expense(
+                project_id,
+                exp_date,
+                parsed_exp_amount,
+                product_or_service=exp_product,
+            ):
+                finish_manage_popover("project_expense_write", project_popover_key, scope="fragment")
+            else:
+                st.error("Could not log project expense.")
+        return
+
+    if project_expenses_df is None or project_expenses_df.empty:
+        st.caption("No logged expenses for this project yet.")
+        st.caption("Legacy purchases shown on the card are read-only and cannot be edited here.")
+        return
+
+    picker_df = project_expenses_df.sort_values("date_logged", ascending=False).copy()
+    expense_labels = picker_df.apply(
+        lambda row: _project_purchase_expense_label(row, project_name),
+        axis=1,
+    ).tolist()
+    selected_label = st.selectbox(
+        "Select expense",
+        expense_labels,
+        key=f"proj_exp_edit_select_{project_id}",
+    )
+    target_row = picker_df.iloc[expense_labels.index(selected_label)]
+    exp_id = target_row["id"]
+    try:
+        row_date = datetime.strptime(
+            str(target_row["date_logged"])[:10], "%Y-%m-%d"
+        ).date()
+    except (ValueError, TypeError):
+        row_date = date.today()
+    product_value = _project_expense_product_from_details(
+        target_row.get("details"), project_name
+    )
+
+    with st.form(f"edit_project_expense_form_{project_id}_{exp_id}"):
+        edit_date = st.date_input(
+            "Purchase date",
+            value=row_date,
+            key=f"proj_exp_edit_date_{project_id}_{exp_id}",
+        )
+        edit_product = st.text_input(
+            "Product or Service",
+            value=product_value,
+            key=f"proj_exp_edit_product_{project_id}_{exp_id}",
+        )
+        edit_amount_raw = st.text_input(
+            "Amount ($) *",
+            value=_format_currency_for_input(target_row.get("amount")),
+            key=f"proj_exp_edit_amt_{project_id}_{exp_id}",
+        )
+        save_exp = st.form_submit_button("💾 Save Expense", type="primary", width="stretch")
+        delete_exp = st.form_submit_button("🗑️ Delete Expense", width="stretch")
+
+    if save_exp:
+        parsed_edit_amount = _parse_currency_input(edit_amount_raw)
+        if parsed_edit_amount == "invalid" or parsed_edit_amount is None:
+            st.error("Please enter a valid dollar amount.")
+        elif update_project_purchase_expense(
+            exp_id,
+            edit_date,
+            parsed_edit_amount,
+            product_or_service=edit_product,
+        ):
+            finish_manage_popover("project_expense_edit", project_popover_key, scope="fragment")
+        else:
+            st.error("Could not update expense.")
+
+    if delete_exp:
+        if delete_project_purchase_expense(exp_id):
+            finish_manage_popover("project_expense_delete", project_popover_key, scope="fragment")
+        else:
+            st.error("Could not delete expense.")
+
+
 def _format_expense_category_label(row) -> str:
     cat = row.get("category_name") or "—"
     sub = row.get("sub_category_name")
     if sub is None or (isinstance(sub, float) and pd.isna(sub)) or str(sub).strip() in ("", "—"):
-        return str(cat)
-    return f"{cat} > {sub}"
+        base = str(cat)
+    else:
+        base = f"{cat} > {sub}"
+    if row.get("ledger_source") == "household_obligation":
+        return f"{base} [Household obligation]"
+    return base
 
 
 def _sort_subcategory_rows(sub_rows: list[dict]) -> list[dict]:
     """Alphabetical sub-category order within a parent category on ledgers."""
     return sorted(sub_rows, key=lambda row: str(row.get("name", "")).lower())
+
+
+def _normalize_sub_category_label(value) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)) or str(value).strip() == "":
+        return "(General)"
+    return str(value)
+
+
+def _sorted_parent_category_names(values) -> list[str]:
+    names = {
+        str(name)
+        for name in values
+        if name is not None
+        and not (isinstance(name, float) and pd.isna(name))
+        and str(name).strip()
+    }
+    return sorted(names, key=str.lower)
+
+
+def _sort_categories_dataframe(categories_df: pd.DataFrame) -> pd.DataFrame:
+    """Sort budget categories by parent name, then sub-category."""
+    if categories_df is None or categories_df.empty:
+        return categories_df
+    df = categories_df.copy()
+    df["_sort_cat"] = df["category_name"].map(lambda value: str(value or "").lower())
+    df["_sort_sub"] = df["sub_category_name"].map(
+        lambda value: _normalize_sub_category_label(value).lower()
+    )
+    return (
+        df.sort_values(["_sort_cat", "_sort_sub"], kind="stable")
+        .drop(columns=["_sort_cat", "_sort_sub"])
+        .reset_index(drop=True)
+    )
+
+
+def _format_income_source_with_badge(row) -> str:
+    source = row.get("source_name", "—")
+    ledger_source = row.get("ledger_source", "personal")
+    if ledger_source == "household_mirror":
+        return f"{source} [Household]"
+    if ledger_source == "transfer":
+        return f"{source} [Transfer]"
+    return str(source)
+
+
+def _build_obligation_category_display_name(row) -> str:
+    sub = row.get("sub_category_name")
+    parent = row.get("category_name") or ""
+    if sub is None or (isinstance(sub, float) and pd.isna(sub)) or str(sub).strip() == "":
+        return f"{parent} [Household obligation]"
+    return f"{parent} → {sub} [Household obligation]"
+
+
+# ---------------------------------------------------------------------------
+# Shared expense-picker builders (used by Budget module + Quick Expense page)
+# ---------------------------------------------------------------------------
+
+def build_household_expense_picker_df(household_id):
+    """Return a sorted, display-ready DataFrame of HH categories for admins.
+
+    Returns an empty DataFrame when no eligible categories exist.
+    Columns guaranteed: id, category_name, sub_category_name, display_name.
+    """
+    cats = get_budget_categories(household_id, is_personal=False)
+    if cats is None or cats.empty:
+        return pd.DataFrame()
+    user_cats = _exclude_allowance_categories(_exclude_system_categories(cats))
+    if user_cats is None or user_cats.empty:
+        return pd.DataFrame()
+    return _prepare_sorted_category_picker(user_cats)
+
+
+def build_personal_expense_picker_df(
+    household_id,
+    username,
+    *,
+    integrated: bool,
+    include_member_obligations: bool | None = None,
+):
+    """Return a combined picker DataFrame for personal expense entry.
+
+    Always includes personal categories. When `integrated` is True (or
+    `include_member_obligations` is True), appends obligation HH categories
+    tagged with `is_household_obligation=True`.
+    Returns an empty DataFrame when nothing is available.
+    """
+    frames = []
+
+    personal_cats = get_budget_categories(household_id, is_personal=True, username=username)
+    if personal_cats is not None and not personal_cats.empty:
+        picker = _prepare_sorted_category_picker(personal_cats).copy()
+        picker["is_household_obligation"] = False
+        frames.append(picker)
+
+    show_obligations = integrated if include_member_obligations is None else include_member_obligations
+    if show_obligations:
+        obl_cats = get_member_obligation_expense_categories(household_id, username)
+        if obl_cats is not None and not obl_cats.empty:
+            obl = _sort_categories_dataframe(obl_cats).copy()
+            obl["display_name"] = obl.apply(_build_obligation_category_display_name, axis=1)
+            obl["is_household_obligation"] = True
+            frames.append(obl)
+
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def submit_expense_from_picker(
+    *,
+    cat_row,
+    date_logged,
+    amount: float,
+    details: str,
+    pay_frequency: str,
+    household_id: str,
+    auth_user_id: str,
+    username: str,
+    is_household_admin: bool,
+) -> tuple[bool, str]:
+    """Log an expense from a picker row; return (success, human-readable message).
+
+    Routes to the correct log function based on category type and role:
+    - HH admin + non-obligation category → shared HH ledger
+    - integrated member + obligation category → shared HH ledger via personal path
+    - personal category → personal ledger
+    """
+    month_year = date_logged.strftime("%Y-%m")
+    is_obl = bool(cat_row.get("is_household_obligation"))
+    is_hh = bool(cat_row.get("is_personal_spend") is False) if "is_personal_spend" in cat_row else False
+
+    if is_household_admin and not is_obl:
+        ok = log_expense_and_check_project(
+            auth_user_id=auth_user_id,
+            username=username,
+            household_id=household_id,
+            month_year=month_year,
+            date_logged=date_logged,
+            category_id=cat_row["id"],
+            amount=amount,
+            details=details,
+            is_personal_spend=False,
+            is_recurring=pay_frequency != "one_time",
+            pay_frequency=pay_frequency,
+        )
+        return ok, f"Logged ${_format_money(amount)} to Household Ledger."
+
+    if is_obl:
+        ok = log_household_expense_from_personal(
+            auth_user_id=auth_user_id,
+            username=username,
+            household_id=household_id,
+            month_year=month_year,
+            date_logged=date_logged,
+            category_id=cat_row["id"],
+            amount=amount,
+            details=details,
+            is_recurring=pay_frequency != "one_time",
+            pay_frequency=pay_frequency,
+        )
+        return ok, f"Logged ${_format_money(amount)} to Household Ledger."
+
+    ok = log_expense_and_check_project(
+        auth_user_id=auth_user_id,
+        username=username,
+        household_id=household_id,
+        month_year=month_year,
+        date_logged=date_logged,
+        category_id=cat_row["id"],
+        amount=amount,
+        details=details,
+        is_personal_spend=True,
+        is_recurring=pay_frequency != "one_time",
+        pay_frequency=pay_frequency,
+    )
+    return ok, f"Logged ${_format_money(amount)} to Personal Ledger."
+
+
+def _build_category_display_name(row) -> str:
+    sub = row.get("sub_category_name")
+    parent = row.get("category_name") or ""
+    if sub is None or (isinstance(sub, float) and pd.isna(sub)) or str(sub).strip() == "":
+        return str(parent)
+    return f"{parent} - {sub}"
+
+
+def _build_category_edit_label(row) -> str:
+    budget = float(row.get("target_budget") or 0.0)
+    return f"{_build_category_display_name(row)} (${budget:,.2f}/mo)"
+
+
+def _prepare_sorted_category_picker(categories_df: pd.DataFrame) -> pd.DataFrame:
+    sorted_df = _sort_categories_dataframe(categories_df)
+    if sorted_df is None or sorted_df.empty:
+        return sorted_df
+    out = sorted_df.copy()
+    out["display_name"] = out.apply(_build_category_display_name, axis=1)
+    return out
+
+
+def _sort_dataframe_column_case_insensitive(df: pd.DataFrame, column: str) -> pd.DataFrame:
+    if df is None or df.empty or column not in df.columns:
+        return df
+    return df.sort_values(
+        column,
+        key=lambda series: series.map(lambda value: str(value or "").lower()),
+        kind="stable",
+    )
 
 
 INCOME_FREQUENCY_OPTIONS = list(INCOME_PAY_FREQUENCY_LABELS.keys())
@@ -384,60 +850,9 @@ def _purchase_counts_by_category(expenses_df, selected_month) -> dict:
     return filtered.groupby("category_id").size().to_dict()
 
 
-def _category_projected_amount(row, stream_projections, *, month_count=1) -> float:
-    """Use expense-stream totals when present; otherwise category target_budget."""
-    if row.get("category_name") == "Annual Subscriptions":
-        return float(row["target_budget"]) * month_count
-    cat_id = row["id"]
-    cat_key_str = str(cat_id)
-    target_budget = float(row["target_budget"]) * month_count
-    if cat_key_str in stream_projections:
-        return float(stream_projections[cat_key_str])
-    return target_budget
-
-
-def _sum_household_projected_expenses(merged_df, stream_projections, *, month_count=1) -> float:
-    """Sum projected household category targets for the selected month."""
-    if merged_df is None or merged_df.empty:
-        return 0.0
-    total = 0.0
-    for _, row in merged_df.iterrows():
-        total += _category_projected_amount(row, stream_projections, month_count=month_count)
-    return float(total)
-
-
-def _compute_household_projected_savings(monthly_income, merged_df, stream_projections) -> float:
-    """Unallocated projected income after all household category targets."""
-    projected_expenses = _sum_household_projected_expenses(merged_df, stream_projections)
-    return float(monthly_income or 0.0) - projected_expenses
-
-
-def _render_projected_savings_metric(amount: float) -> None:
-    """Red / green / white display for projected savings ($0.00 = on target)."""
-    safe_amount = float(amount or 0.0)
-    if abs(safe_amount) < 0.009:
-        st.markdown("**Projected Savings**")
-        st.markdown(
-            "<div style='display:inline-block;padding:0.35rem 0.75rem;border-radius:0.5rem;"
-            "background:#FFFFFF;border:1px solid #D1D5DB;'>"
-            f"<span style='color:#111827;font-size:1.75rem;font-weight:600;line-height:1.2;'>"
-            f"${safe_amount:,.2f}</span></div>",
-            unsafe_allow_html=True,
-        )
-        st.caption("On target — income fully assigned.")
-        return
-
-    color = "#21c354" if safe_amount > 0 else "#ff4b4b"
-    st.markdown("**Projected Savings**")
-    st.markdown(
-        f"<p style='color:{color};font-size:1.75rem;font-weight:600;margin:0;line-height:1.2;'>"
-        f"${safe_amount:,.2f}</p>",
-        unsafe_allow_html=True,
-    )
-    if safe_amount > 0:
-        st.caption("Unassigned projected income this month.")
-    else:
-        st.caption("Projected expenses exceed projected income.")
+def _category_projected_amount(row, *, month_count=1) -> float:
+    """Projected monthly cost from category target_budget (category management only)."""
+    return float(row.get("target_budget") or 0) * month_count
 
 
 def _render_household_budget_breakdown(
@@ -447,10 +862,7 @@ def _render_household_budget_breakdown(
     selected_month,
     *,
     filter_key: str,
-    stream_projections=None,
 ):
-    if stream_projections is None:
-        stream_projections = {}
     if merged_df.empty:
         st.info("No categories setup yet. Add some to build your ledger!")
         return
@@ -459,10 +871,10 @@ def _render_household_budget_breakdown(
     purchase_counts = _purchase_counts_by_category(hh_expenses_df, selected_month)
 
     parent_groups = []
-    for parent in merged_df["category_name"].unique():
+    for parent in _sorted_parent_category_names(merged_df["category_name"].unique()):
         parent_mask = merged_df["category_name"] == parent
         parent_target = float(
-            sum(_category_projected_amount(row, stream_projections) for _, row in merged_df[parent_mask].iterrows())
+            sum(_category_projected_amount(row) for _, row in merged_df[parent_mask].iterrows())
         )
         parent_actual = float(merged_df.loc[parent_mask, "actual_amount"].sum())
         if parent_target == 0 and parent_actual == 0:
@@ -471,7 +883,7 @@ def _render_household_budget_breakdown(
         sub_rows = []
         parent_purchase_count = 0
         for _, row in merged_df[parent_mask].iterrows():
-            target = _category_projected_amount(row, stream_projections)
+            target = _category_projected_amount(row)
             actual = float(row["actual_amount"])
             if target == 0 and actual == 0:
                 continue
@@ -629,7 +1041,8 @@ def _render_income_streams_list(incomes_df, *, is_personal=False, annual_totals=
 
     table_rows = []
     for _, row in incomes_df.iterrows():
-        cells = [row.get("source_name", "—")]
+        source_label = _format_income_source_with_badge(row) if "ledger_source" in incomes_df.columns else row.get("source_name", "—")
+        cells = [source_label]
         if not is_personal:
             cells.append(row.get("owner_username", "—"))
         cells.extend([
@@ -661,7 +1074,7 @@ def _render_sinking_funds_list(annual_df) -> None:
     )
 
     table_rows = []
-    for _, row in annual_df.iterrows():
+    for _, row in _sort_categories_dataframe(annual_df).iterrows():
         sub = row["sub_category_name"]
         if sub is None or (isinstance(sub, float) and pd.isna(sub)) or str(sub).strip() == "":
             sub = "(General)"
@@ -700,6 +1113,22 @@ def _render_expense_manage_rows(
 
     enriched = _enrich_expenses_with_categories(expenses_df, categories_df)
     sorted_df = enriched.sort_values("date_logged", ascending=False)
+    edit_picker_df = enriched.copy()
+    if can_edit:
+        edit_picker_df = edit_picker_df[
+            ~edit_picker_df.apply(_is_transfer_allowance_expense_row, axis=1)
+        ]
+    edit_picker_df["_sort_cat"] = edit_picker_df["category_name"].map(
+        lambda value: str(value or "").lower()
+    )
+    edit_picker_df["_sort_sub"] = edit_picker_df["sub_category_name"].map(
+        lambda value: _normalize_sub_category_label(value).lower()
+    )
+    edit_picker_df = edit_picker_df.sort_values(
+        ["_sort_cat", "_sort_sub", "date_logged"],
+        ascending=[True, True, False],
+        kind="stable",
+    ).drop(columns=["_sort_cat", "_sort_sub"])
 
     table_rows = []
     for _, row in sorted_df.iterrows():
@@ -733,6 +1162,10 @@ def _render_expense_manage_rows(
     if not can_edit:
         return
 
+    if edit_picker_df.empty:
+        st.caption("System-managed transfer expenses cannot be edited here.")
+        return
+
     def _expense_label(row):
         cat_label = _format_expense_category_label(row)
         amt = _format_ledger_amount(row.get("amount", 0))
@@ -740,7 +1173,7 @@ def _render_expense_manage_rows(
         dt = row.get("date_logged", "—")
         return f"{cat_label} · {amt} · {det} · {dt}"
 
-    edit_options = sorted_df.apply(_expense_label, axis=1).tolist()
+    edit_options = edit_picker_df.apply(_expense_label, axis=1).tolist()
     with st.expander("🛠️ Edit or Delete Expense", expanded=False):
         selected_label = st.selectbox(
             "Select expense",
@@ -748,7 +1181,7 @@ def _render_expense_manage_rows(
             key=f"{key_prefix}_edit_select",
         )
         selected_idx = edit_options.index(selected_label)
-        target_row = sorted_df.iloc[selected_idx]
+        target_row = edit_picker_df.iloc[selected_idx]
         exp_id = target_row["id"]
         stream_id = target_row.get("stream_id")
         if stream_id and pd.notna(stream_id):
@@ -811,7 +1244,7 @@ def _render_expense_manage_rows(
                 effective_from = new_date
             if edit_scope != "End stream":
                 new_freq = st.selectbox(
-                    "Bill frequency",
+                    "Frequency",
                     EXPENSE_FREQUENCY_OPTIONS,
                     format_func=expense_pay_frequency_label,
                     index=EXPENSE_FREQUENCY_OPTIONS.index(current_freq)
@@ -894,22 +1327,29 @@ def _render_income_management(
 
         with tab_add:
             with st.form(f"add_{form_key_prefix}_income_form", clear_on_submit=True):
-                source_name = st.text_input(
-                    "Source Name",
-                    placeholder="e.g., Paycheck, Side Gig, Bonus" if not is_personal else "e.g., Side Hustle, Dividends",
-                )
-
                 owner_username = fixed_owner
                 if not is_personal:
-                    owner_username = st.selectbox("Assign to Earner", earner_options or ["unassigned"])
+                    owner_username = st.selectbox(
+                        "Assign to Earner", earner_options or ["unassigned"]
+                    )
 
-                inc1, inc2 = st.columns(2)
-                take_home = inc1.text_input("Take-Home (Net) $ per payment")
-                gross = inc2.text_input("Gross $ per payment")
+                a1, a2 = st.columns([1, 1])
+                payment_date = a1.date_input("Date", value=date.today())
+                take_home_raw = a2.text_input("Take-Home (Net) $ *")
+
+                gross_raw = st.text_input("Gross $")
+
+                source_name = st.text_input(
+                    "Details",
+                    placeholder="e.g., Paycheck, Side Gig, Bonus"
+                    if not is_personal
+                    else "e.g., Side Hustle, Dividends",
+                )
 
                 is_taxable = st.checkbox("Is Taxable?", value=True)
+
                 pay_frequency = st.selectbox(
-                    "Pay frequency",
+                    "Frequency",
                     INCOME_FREQUENCY_OPTIONS,
                     format_func=income_pay_frequency_label,
                     index=INCOME_FREQUENCY_OPTIONS.index("monthly"),
@@ -919,25 +1359,16 @@ def _render_income_management(
                         "Regular paychecks run Sep–Jun on this day each month. "
                         "Add two **One-time** incomes in July and August for summer checks."
                     )
-                payment_date = st.date_input(
-                    "Payment / recurrence start date",
-                    value=date.today(),
-                    help=(
-                        "Recurring income counts toward the ledger once this day of the month arrives."
-                        if pay_frequency != "school_year_monthly"
-                        else "Day of month for each Sep–Jun paycheck."
-                    ),
-                )
 
                 if st.form_submit_button("💾 Save Income", type="primary", width="stretch"):
-                    th_val = _parse_currency_input(take_home)
-                    g_val = _parse_currency_input(gross)
+                    th_val = _parse_currency_input(take_home_raw)
+                    g_val = _parse_currency_input(gross_raw) if gross_raw.strip() else th_val
                     if not source_name.strip() or th_val == "invalid" or g_val == "invalid":
-                        st.error("Please provide a valid source name and dollar amounts.")
+                        st.error("Please provide details and valid take-home and gross amounts.")
                     elif insert_household_income(
                         household_id,
                         selected_month,
-                        source_name,
+                        source_name.strip(),
                         th_val,
                         g_val,
                         is_taxable,
@@ -976,15 +1407,16 @@ def _render_income_management(
                 owner = row.get("owner_username", "unassigned")
                 amount = _to_number(row.get("take_home_amount"))
                 freq = income_pay_frequency_label(row.get("pay_frequency"))
+                det = (row.get("source_name") or "").strip() or "—"
                 pay_date = _format_payment_date(row.get("payment_date"))
-                pay_suffix = f" · paid {pay_date}" if pay_date != "—" else ""
+                pay_suffix = f" · {pay_date}" if pay_date != "—" else ""
                 if is_personal:
-                    return f"{row.get('source_name')} · {freq} · ${_format_money(amount)}{pay_suffix}"
-                return f"{row.get('source_name')} ({owner}) · {freq} · ${_format_money(amount)}{pay_suffix}"
+                    return f"{det} · {freq} · ${_format_money(amount)}{pay_suffix}"
+                return f"{det} ({owner}) · {freq} · ${_format_money(amount)}{pay_suffix}"
 
             edit_options = editable_df.apply(_income_label, axis=1).tolist()
             selected_edit_str = st.selectbox(
-                "Select Income Stream to Edit",
+                "Select income",
                 edit_options,
                 key=f"edit_{form_key_prefix}_income_select",
             )
@@ -997,6 +1429,9 @@ def _render_income_management(
             else:
                 stream_id = None
 
+            current_freq = normalize_income_pay_frequency(target_row.get("pay_frequency"))
+            edit_owner = fixed_owner or target_row.get("owner_username")
+
             if stream_id:
                 versions = get_income_stream_versions(stream_id)
                 if versions:
@@ -1007,128 +1442,651 @@ def _render_income_management(
                             freq = income_pay_frequency_label(ver.get("pay_frequency"))
                             st.caption(f"From {eff}: ${amt:,.2f} · {freq}")
 
-            edit_scope = st.radio(
-                "Apply changes",
-                (
-                    "From effective date forward",
-                    "This month only",
-                    "End stream",
-                ),
-                key=f"income_edit_scope_{form_key_prefix}_{target_income_id}",
-                help="Forward changes preserve past months. End stream stops future rollover.",
-            )
+            edit_scope = "This occurrence only"
+            if current_freq != "one_time":
+                edit_scope = st.radio(
+                    "Apply changes",
+                    (
+                        "From effective date forward",
+                        "This occurrence only",
+                    ),
+                    key=f"income_edit_scope_{form_key_prefix}_{target_income_id}",
+                    help="Forward changes preserve past months.",
+                )
 
-            with st.form(f"edit_{form_key_prefix}_income_form", clear_on_submit=True):
-                edit_source = st.text_input("Source Name", value=target_row.get("source_name", ""))
+            try:
+                row_date = datetime.strptime(
+                    str(target_row.get("payment_date") or target_row.get("date_logged") or "")[:10],
+                    "%Y-%m-%d",
+                ).date()
+            except (ValueError, TypeError):
+                row_date = date.today()
 
-                edit_owner = fixed_owner
+            form_key = f"edit_{form_key_prefix}_income_form_{target_income_id}"
+            with st.form(form_key, clear_on_submit=False):
                 if not is_personal:
-                    current_owner = target_row.get("owner_username") or (earner_options or ["unassigned"])[0]
-                    owner_index = (earner_options or ["unassigned"]).index(current_owner) if current_owner in (earner_options or []) else 0
-                    edit_owner = st.selectbox("Assign to Earner", earner_options or ["unassigned"], index=owner_index)
+                    st.markdown(f"**Earner:** {target_row.get('owner_username', '—')}")
 
                 e1, e2 = st.columns(2)
-                edit_take_home = e1.text_input("Take-Home (Net) $ per payment", value=f"{_to_number(target_row.get('take_home_amount')):.2f}")
-                edit_gross = e2.text_input("Gross $ per payment", value=f"{_to_number(target_row.get('gross_amount')):.2f}")
+                new_take_home = e1.text_input(
+                    "Take-Home (Net) $",
+                    value=f"{_to_number(target_row.get('take_home_amount')):.2f}",
+                )
+                new_gross = e2.text_input(
+                    "Gross $",
+                    value=f"{_to_number(target_row.get('gross_amount')):.2f}",
+                )
+                new_source = st.text_input(
+                    "Details", value=target_row.get("source_name") or ""
+                )
+                new_taxable = st.checkbox(
+                    "Is Taxable?", value=bool(target_row.get("is_taxable", True))
+                )
 
-                edit_taxable = st.checkbox("Is Taxable?", value=bool(target_row.get("is_taxable", True)))
-                current_freq = normalize_income_pay_frequency(target_row.get("pay_frequency"))
-                edit_pay_frequency = st.selectbox(
-                    "Pay frequency",
+                if edit_scope == "From effective date forward":
+                    st.caption(
+                        "New terms apply to this date and every future payment for this "
+                        "recurring income."
+                    )
+                    effective_from = st.date_input(
+                        "New terms start on",
+                        value=row_date,
+                        key=f"edit_effective_from_{form_key_prefix}_{target_income_id}",
+                    )
+                    new_date = effective_from
+                else:
+                    new_date = st.date_input("Date", value=row_date)
+                    effective_from = new_date
+
+                new_freq = st.selectbox(
+                    "Frequency",
                     INCOME_FREQUENCY_OPTIONS,
                     format_func=income_pay_frequency_label,
-                    index=INCOME_FREQUENCY_OPTIONS.index(current_freq),
+                    index=INCOME_FREQUENCY_OPTIONS.index(current_freq)
+                    if current_freq in INCOME_FREQUENCY_OPTIONS
+                    else INCOME_FREQUENCY_OPTIONS.index("monthly"),
                     key=f"edit_pay_freq_{form_key_prefix}_{target_income_id}",
                 )
-                if edit_pay_frequency == "school_year_monthly":
+                if new_freq == "school_year_monthly":
                     st.caption(
                         "Regular paychecks run Sep–Jun on this day each month. "
                         "Add two **One-time** incomes in July and August for summer checks."
                     )
-                payment_default = date.today()
-                if target_row.get("payment_date"):
-                    payment_default = datetime.strptime(str(target_row["payment_date"])[:10], "%Y-%m-%d").date()
-                edit_payment_date = st.date_input(
-                    "Payment / recurrence start date",
-                    value=payment_default,
-                    key=f"edit_pay_date_{form_key_prefix}_{target_income_id}",
+
+                save_clicked = st.form_submit_button(
+                    "💾 Save Changes", type="primary", width="stretch"
                 )
-                effective_from_default = edit_payment_date
-                if edit_scope == "From effective date forward":
-                    effective_from_default = payment_default
-                    effective_from = st.date_input(
-                        "New terms start on",
-                        value=effective_from_default,
-                        key=f"edit_effective_from_{form_key_prefix}_{target_income_id}",
-                        help="Past months are not changed.",
-                    )
-                else:
-                    effective_from = edit_payment_date
 
-                u1, u2 = st.columns(2)
-                update_clicked = u1.form_submit_button("💾 Update Income", type="primary", width="stretch")
-                delete_clicked = u2.form_submit_button("🗑️ Delete Income", type="secondary", width="stretch")
-
-            if update_clicked:
-                parsed_take_home = _parse_currency_input(edit_take_home)
-                parsed_gross = _parse_currency_input(edit_gross)
-                if not edit_source.strip() or parsed_take_home == "invalid" or parsed_gross == "invalid":
-                    st.error("Please provide a valid source name and dollar amounts.")
-                elif edit_scope == "End stream":
-                    if end_income_stream(target_income_id, end_date=date.today()):
-                        st.success("Income stream ended. Past months are unchanged.")
-                        rerun_fragment_with_reason("budget_nav")
-                    else:
-                        st.error("Could not end income stream.")
-                elif edit_scope == "From effective date forward":
+            if save_clicked:
+                parsed_take_home = _parse_currency_input(new_take_home)
+                parsed_gross = _parse_currency_input(new_gross)
+                if (
+                    not new_source.strip()
+                    or parsed_take_home == "invalid"
+                    or parsed_gross == "invalid"
+                ):
+                    st.error("Please provide details and valid take-home and gross amounts.")
+                elif (
+                    edit_scope == "From effective date forward"
+                    and current_freq != "one_time"
+                ):
                     eff_key = f"edit_effective_from_{form_key_prefix}_{target_income_id}"
-                    effective_from_val = st.session_state.get(eff_key, edit_payment_date)
+                    effective_from_val = st.session_state.get(eff_key, new_date)
                     ensure_income_stream_for_row(target_income_id)
                     if schedule_income_change(
                         target_income_id,
                         effective_from_val,
-                        edit_source,
+                        new_source.strip(),
                         parsed_take_home,
                         parsed_gross,
-                        edit_taxable,
+                        new_taxable,
                         edit_owner,
                         False,
-                        edit_pay_frequency,
+                        new_freq,
                     ):
                         rerun_fragment_with_reason("budget_nav")
                     else:
                         st.error("Could not schedule income change.")
                 elif update_household_income(
                     target_income_id,
-                    edit_source,
+                    new_source.strip(),
                     parsed_take_home,
                     parsed_gross,
-                    edit_taxable,
+                    new_taxable,
                     edit_owner,
                     False,
-                    edit_pay_frequency,
-                    payment_date=edit_payment_date,
+                    new_freq,
+                    payment_date=new_date,
                 ):
                     rerun_fragment_with_reason("budget_nav")
+                else:
+                    st.error("Could not update income.")
+
+            delete_scope = "This occurrence only"
+            if stream_id or current_freq != "one_time":
+                delete_scope = st.radio(
+                    "Delete scope",
+                    ("This occurrence only", "End stream"),
+                    key=f"income_delete_scope_{form_key_prefix}_{target_income_id}",
+                    horizontal=True,
+                )
 
             income_delete_key = f"income_{form_key_prefix}_{target_income_id}"
-            delete_scope = st.radio(
-                "Delete scope",
-                ("This month only", "End stream"),
-                key=f"income_delete_scope_{form_key_prefix}_{target_income_id}",
-                horizontal=True,
-            )
-            if delete_clicked:
+            if st.button(
+                "❌ Delete Income",
+                key=f"del_{form_key_prefix}_{target_income_id}",
+                type="secondary",
+                width="stretch",
+            ):
                 arm_delete_confirm(income_delete_key)
                 rerun_fragment_with_reason("delete_arm")
 
-            if render_delete_confirmation(income_delete_key, item_label=edit_source, rerun_scope="fragment"):
-                if delete_scope == "End stream":
+            if render_delete_confirmation(
+                income_delete_key, item_label=selected_edit_str, rerun_scope="fragment"
+            ):
+                if delete_scope == "End stream" and current_freq != "one_time":
                     ok = end_income_stream(target_income_id)
                 else:
                     ok = delete_household_income_month_only(target_income_id)
                 if ok:
                     rerun_fragment_with_reason("delete_income")
+
+
+def _render_obligation_assignments_tab(household_id, selected_month, member_options):
+    """Assign household budget categories to members."""
+    st.caption(
+        "Assign each household budget parent (and optional sub-category overrides) to the "
+        "member responsible for that spend. The Disbursement plan tab uses these assignments "
+        "to calculate transfer amounts."
+    )
+    data = compute_household_obligations(household_id, selected_month)
+    parent_summaries = data.get("parent_summaries") or []
+    assign_options = ["— Unassigned —"] + list(member_options)
+
+    if parent_summaries:
+        st.markdown("**Parent category assignments**")
+        for summary in parent_summaries:
+            parent_name = summary.get("parent_category_name") or ""
+            cols = st.columns([2, 1, 2])
+            cols[0].markdown(f"**{parent_name}**")
+            cols[1].markdown(f"${summary.get('projected', 0):,.2f}")
+            current = summary.get("assigned_member") or "— Unassigned —"
+            idx = assign_options.index(current) if current in assign_options else 0
+            cols[2].selectbox(
+                "Assigned member",
+                assign_options,
+                index=idx,
+                key=f"parent_assign_{parent_name}",
+                label_visibility="collapsed",
+            )
+            unassigned_subs = summary.get("unassigned_subs") or []
+            if unassigned_subs:
+                st.caption(f"Unassigned sub-categories: {', '.join(unassigned_subs)}")
+
+        if st.button("Save parent assignments", key="save_parent_assignments", type="primary"):
+            for summary in parent_summaries:
+                parent_name = summary.get("parent_category_name") or ""
+                chosen = st.session_state.get(f"parent_assign_{parent_name}", "— Unassigned —")
+                if chosen == "— Unassigned —":
+                    clear_parent_assignment(household_id, parent_name)
+                else:
+                    upsert_parent_assignment(household_id, parent_name, chosen)
+            rerun_fragment_with_reason("obligation_assign")
+    else:
+        st.info("No household budget categories to assign yet.")
+
+    lines = data.get("lines") or []
+    override_candidates = [
+        line for line in lines if line.get("source") in ("parent", "override", "unassigned")
+    ]
+    if override_candidates:
+        with st.expander("Sub-category overrides", expanded=False):
+            st.caption("Override a single sub-category when it should not follow the parent assignee.")
+            for line in override_candidates:
+                label = f"{line.get('parent_category_name')} → {line.get('sub_category_name')}"
+                ocols = st.columns([2, 1, 2])
+                ocols[0].markdown(label)
+                ocols[1].markdown(f"${line.get('projected_amount', 0):,.2f}")
+                current = line.get("member_username") or "— Unassigned —"
+                idx = assign_options.index(current) if current in assign_options else 0
+                ocols[2].selectbox(
+                    "Member",
+                    assign_options,
+                    index=idx,
+                    key=f"sub_override_{line.get('category_id')}",
+                    label_visibility="collapsed",
+                )
+            if st.button("Save sub-category overrides", key="save_sub_overrides"):
+                for line in override_candidates:
+                    cat_id = line.get("category_id")
+                    chosen = st.session_state.get(f"sub_override_{cat_id}", "— Unassigned —")
+                    if chosen == "— Unassigned —":
+                        clear_subcategory_override(household_id, cat_id)
+                    else:
+                        upsert_subcategory_override(household_id, cat_id, chosen)
+                rerun_fragment_with_reason("obligation_override")
+
+
+def _render_disbursement_plan_tab(household_id, selected_month):
+    """Bundled transfer schedule with per-member paycheck stream selectors."""
+    st.caption(
+        "Plan real banking transfers: obligation shortfalls for members, plus an even "
+        "split of remaining household income among admins/developers. Each member sets "
+        "their own paycheck streams — transfers are split across those paychecks."
+    )
+    plan = compute_household_disbursement_plan(household_id, selected_month)
+    summary = plan.get("monthly_summary") or {}
+    review_flags = plan.get("review_flags") or []
+    allowance_surplus_flags = plan.get("allowance_surplus_flags") or []
+
+    for flag in allowance_surplus_flags:
+        if flag.get("kind") == "allowance_exceeds_surplus":
+            st.error(flag["message"])
+        else:
+            st.warning(flag["message"])
+
+    if review_flags:
+        st.warning(
+            "**Extra paycheck month — review recommended**\n\n"
+            + "\n".join(f"• {flag['message']}" for flag in review_flags)
+            + "\n\nPer-transfer amounts are lower when split across more checks. "
+            "Adjust in the table below if needed, then click **Update transfer plan** or **Reset plan**."
+        )
+    else:
+        st.caption(
+            "Transfer rows auto-generate each month from your funding streams and obligations. "
+            "On sign-in, any planned transfer whose pay date has arrived is completed automatically (once per day). "
+            "After a **Reset plan** or mid-month schedule change, use **Complete due transfers** when you are ready. "
+            "Use **Mark transferred** on individual rows to complete early."
+        )
+
+    render_metrics_grid(
+        [
+            {
+                "label": "Household income",
+                "value": f"${plan.get('total_regular_income', 0):,.2f}",
+            },
+            {
+                "label": "Assigned obligations",
+                "value": f"${plan.get('total_assigned_obligations', 0):,.2f}",
+            },
+            {
+                "label": "Surplus to split",
+                "value": f"${plan.get('surplus_pool', 0):,.2f}",
+                "help": "Income left after all assigned obligation targets.",
+            },
+            {
+                "label": "Monthly transfers",
+                "value": f"${summary.get('monthly_disbursement_total', 0):,.2f}",
+            },
+        ],
+        desktop_columns=4,
+    )
+
+    # ── Per-member funding stream selectors ───────────────────────────
+    bundled = plan.get("member_bundled_amounts") or {}
+    stream_options = get_household_income_stream_options(household_id)
+
+    if bundled:
+        st.markdown("**Monthly amounts & funding stream per member**")
+        if not stream_options:
+            st.info("Add household income streams in Cash Flow to link paycheck funding.")
+        else:
+            labels = [opt["label"] for opt in stream_options]
+            stream_ids = [opt["stream_id"] for opt in stream_options]
+            bundle_rows = []
+            for member in sorted(bundled):
+                parts = bundled[member]
+                bundle_rows.append({
+                    "cells": [
+                        member,
+                        _format_ledger_amount(parts.get("obligation_amount", 0)),
+                        _format_ledger_amount(parts.get("allowance_amount", 0)),
+                        _format_ledger_amount(parts.get("total_amount", 0)),
+                    ]
+                })
+            _render_html_scroll_table(
+                ["Member", "Obligation", "Allowance", "Total"],
+                bundle_rows,
+                right_align_from=1,
+                variant="ledger",
+            )
+
+            st.markdown("**Set each member's funding paycheck streams:**")
+            for member in sorted(bundled):
+                current_streams = get_member_funding_streams(household_id, member)
+                default_labels = [
+                    lbl for lbl, sid in zip(labels, stream_ids)
+                    if sid in current_streams
+                ]
+                col_sel, col_btn = st.columns([4, 1])
+                with col_sel:
+                    chosen_labels = st.multiselect(
+                        f"{member}'s paycheck streams",
+                        labels,
+                        default=default_labels,
+                        key=f"member_streams_{member}",
+                        help="Pick one or more income streams. Transfers are split evenly across all their combined pay dates in the month.",
+                    )
+                with col_btn:
+                    st.write("")
+                    if st.button("Save", key=f"save_member_streams_{member}", type="primary"):
+                        chosen_ids = [stream_ids[labels.index(lbl)] for lbl in chosen_labels]
+                        if set_member_funding_streams(household_id, member, chosen_ids):
+                            rerun_fragment_with_reason("member_streams_saved")
+                        else:
+                            st.error(f"Could not save streams for {member}.")
+
+    # ── Paycheck schedule with transfer tracking ──────────────────────
+    per_member_stream_info = plan.get("per_member_stream_info") or {}
+    paycheck_schedule = plan.get("paycheck_schedule") or []
+
+    members_without_stream = [
+        m for m in sorted(bundled or {})
+        if not (per_member_stream_info.get(m) or {}).get("stream_ids")
+    ]
+    if members_without_stream:
+        st.caption(
+            f"No funding streams set for: {', '.join(members_without_stream)}. "
+            "Select streams above to generate a paycheck schedule."
+        )
+
+    if not paycheck_schedule:
+        if any((per_member_stream_info.get(m) or {}).get("stream_ids") for m in (bundled or {})):
+            st.caption("No paychecks land in this month for the configured funding streams.")
+    else:
+        # Summary: one line per member — streams + real paycheck count
+        summary_parts = []
+        for member in sorted(per_member_stream_info):
+            info = per_member_stream_info[member]
+            if info.get("stream_ids"):
+                streams_display = info.get("display") or ", ".join(info["stream_ids"])
+                count = info.get("paycheck_count", 0)
+                summary_parts.append(
+                    f"**{member}**: {streams_display} · {count} paycheck(s) this month"
+                )
+        if summary_parts:
+            st.markdown("  \n".join(summary_parts))
+
+        # ── Editable schedule table ───────────────────────────────────
+        saved_transfers = get_member_transfers(household_id, selected_month)
+        saved_by_key = {
+            (r["payment_date"][:10], r["recipient_username"], str(r.get("funding_income_stream_id") or "")): r
+            for r in saved_transfers
+            if r.get("payment_date") and r.get("recipient_username")
+        }
+        stream_label_by_id = {
+            str(opt.get("stream_id") or ""): opt.get("label") or ""
+            for opt in (stream_options or [])
+        }
+
+        st.markdown("**Planned transfer amounts** — saved plan shown when locked in:")
+        editor_rows = []
+        seen_keys: set[tuple] = set()
+        for entry in paycheck_schedule:
+            pay_date_str = str(entry.get("payment_date", ""))[:10]
+            stream_id = str(entry.get("stream_id") or "")
+            stream_label = entry.get("stream_label") or stream_label_by_id.get(stream_id, stream_id)
+            for member in sorted(entry.get("payouts") or {}):
+                parts = entry["payouts"][member]
+                plan_obl = round(float(parts.get("obligation") or 0), 2)
+                plan_allow = round(float(parts.get("allowance") or 0), 2)
+                key = (pay_date_str, member, stream_id)
+                saved = saved_by_key.get(key)
+                if saved:
+                    obl = round(float(saved.get("obligation_amount") or 0), 2)
+                    allow = round(float(saved.get("allowance_amount") or 0), 2)
+                    status = (saved.get("status") or "planned").title()
+                else:
+                    obl, allow = plan_obl, plan_allow
+                    status = "—"
+                editor_rows.append({
+                    "Pay Date": pay_date_str,
+                    "Stream": stream_label,
+                    "Member": member,
+                    "Obligation ($)": obl,
+                    "Allowance ($)": allow,
+                    "Status": status,
+                    "_stream_id": stream_id,
+                    "_plan_obligation": plan_obl,
+                    "_plan_allowance": plan_allow,
+                })
+                seen_keys.add(key)
+
+        # Include saved transfers that no longer appear in the current computed schedule
+        for key, saved in saved_by_key.items():
+            if key in seen_keys:
+                continue
+            pay_date_str, member, stream_id = key
+            editor_rows.append({
+                "Pay Date": pay_date_str,
+                "Stream": stream_label_by_id.get(stream_id, stream_id or "—"),
+                "Member": member,
+                "Obligation ($)": round(float(saved.get("obligation_amount") or 0), 2),
+                "Allowance ($)": round(float(saved.get("allowance_amount") or 0), 2),
+                "Status": (saved.get("status") or "planned").title(),
+                "_stream_id": stream_id,
+                "_plan_obligation": round(float(saved.get("obligation_amount") or 0), 2),
+                "_plan_allowance": round(float(saved.get("allowance_amount") or 0), 2),
+            })
+
+        editor_rows.sort(key=lambda r: (r["Pay Date"], r["Stream"], r["Member"]))
+        default_df = pd.DataFrame(editor_rows) if editor_rows else pd.DataFrame()
+        editor_rev_key = f"disbursement_editor_rev_{household_id}_{selected_month}"
+        editor_rev = st.session_state.get(editor_rev_key, 0)
+
+        if not default_df.empty:
+            edited_df = st.data_editor(
+                default_df,
+                column_order=["Pay Date", "Stream", "Member", "Obligation ($)", "Allowance ($)", "Status"],
+                column_config={
+                    "Pay Date": st.column_config.TextColumn("Pay Date", disabled=True),
+                    "Stream": st.column_config.TextColumn("Stream", disabled=True),
+                    "Member": st.column_config.TextColumn("Member", disabled=True),
+                    "Status": st.column_config.TextColumn("Status", disabled=True),
+                    "Obligation ($)": st.column_config.NumberColumn(
+                        "Obligation ($)", format="$%.2f", min_value=0.0, step=0.01,
+                        help="Amount to cover this member's obligation gap this paycheck.",
+                    ),
+                    "Allowance ($)": st.column_config.NumberColumn(
+                        "Allowance ($)", format="$%.2f", min_value=0.0, step=0.01,
+                        help="Surplus share (allowance) for this paycheck.",
+                    ),
+                },
+                disabled=["Pay Date", "Stream", "Member", "Status"],
+                hide_index=True,
+                width='stretch',
+                key=f"transfer_schedule_editor_{household_id}_{selected_month}_{editor_rev}",
+            )
+
+            # Warn when the live computed plan differs from saved planned rows
+            _stale_rows = []
+            for _, er in edited_df.iterrows():
+                if str(er.get("Status") or "").lower() == "completed":
+                    continue
+                _plan_obl = round(float(er.get("_plan_obligation") or 0), 2)
+                _plan_all = round(float(er.get("_plan_allowance") or 0), 2)
+                _ed_obl = round(float(er.get("Obligation ($)") or 0), 2)
+                _ed_all = round(float(er.get("Allowance ($)") or 0), 2)
+                if _plan_obl != _ed_obl or _plan_all != _ed_all:
+                    _stale_rows.append(
+                        f"{er['Member']} on {er['Pay Date']}: saved ${_ed_obl + _ed_all:,.2f}, "
+                        f"current plan ${_plan_obl + _plan_all:,.2f}"
+                    )
+
+            if _stale_rows:
+                st.warning(
+                    "Saved amounts differ from the current computed plan:\n" +
+                    "\n".join(f"• {s}" for s in _stale_rows) +
+                    "\n\nClick **Update transfer plan** to save your edits, or **Reset plan** to reload from the current schedule."
+                )
+
+            btn_update, btn_reset = st.columns(2)
+            with btn_update:
+                update_clicked = st.button(
+                    "Update transfer plan",
+                    key="plan_transfers_btn",
+                    type="secondary",
+                    use_container_width=True,
+                )
+            with btn_reset:
+                reset_clicked = st.button(
+                    "Reset plan",
+                    key="reset_disbursement_plan_btn",
+                    type="secondary",
+                    use_container_width=True,
+                    help="Clear this month's transfers and reload a fresh planned schedule from current income, streams, and obligations.",
+                )
+
+            if reset_clicked:
+                result = reset_disbursement_plan_transfers(household_id, selected_month)
+                if result.get("permission_denied"):
+                    st.error("Reset plan requires admin or developer access.")
+                else:
+                    _clear_disbursement_session_guards(household_id, selected_month)
+                    _arm_disbursement_reset_autocomplete_hold(household_id)
+                    st.session_state[editor_rev_key] = editor_rev + 1
+                    changed = (
+                        result.get("cleared", 0)
+                        + result.get("inserted", 0)
+                        + result.get("orphan_expenses", 0)
+                        + result.get("orphan_incomes", 0)
+                    )
+                    if changed:
+                        parts = []
+                        if result.get("cleared"):
+                            parts.append(f"{result['cleared']} transfer(s) cleared")
+                        if result.get("inserted"):
+                            parts.append(f"{result['inserted']} planned row(s) created")
+                        if result.get("orphan_expenses"):
+                            parts.append(f"{result['orphan_expenses']} orphan expense(s) removed")
+                        if result.get("orphan_incomes"):
+                            parts.append(f"{result['orphan_incomes']} orphan income(s) removed")
+                        st.success(
+                            f"Reset plan — {', '.join(parts)}. "
+                            "Past-due rows stay planned until your next sign-in."
+                        )
+                    else:
+                        st.info("Nothing to reset for this month — no transfers or schedule rows found.")
+                rerun_fragment_with_reason("reset_disbursement_plan")
+
+            if update_clicked:
+                override_rows = []
+                for _, row in edited_df.iterrows():
+                    if str(row.get("Status") or "").lower() == "completed":
+                        continue
+                    override_rows.append({
+                        "payment_date": str(row["Pay Date"]),
+                        "stream_id": row.get("_stream_id") or None,
+                        "recipient_username": row["Member"],
+                        "obligation": float(row.get("Obligation ($)") or 0),
+                        "allowance": float(row.get("Allowance ($)") or 0),
+                    })
+
+                n = upsert_planned_transfers_from_schedule(
+                    household_id, selected_month, override_rows=override_rows
+                )
+                if n:
+                    st.success(f"Saved {n} transfer row(s) — planned or updated.")
+                else:
+                    st.info("All planned transfers already match — nothing to update.")
+                rerun_fragment_with_reason("plan_transfers")
+
+        # ── Transfer status & Mark transferred ────────────────────────
+        transfer_rows = saved_transfers
+        if transfer_rows:
+            st.divider()
+            completed_count = sum(1 for r in transfer_rows if r.get("status") == "completed")
+            st.markdown(
+                f"**Transfer status** — {completed_count}/{len(transfer_rows)} completed this month"
+            )
+            due_transfers = get_due_planned_member_transfers(household_id)
+            if due_transfers and _is_budget_admin():
+                due_cols = st.columns([2, 1])
+                with due_cols[0]:
+                    st.caption(
+                        f"{len(due_transfers)} planned transfer(s) are on or past their pay date "
+                        "and can be completed now."
+                    )
+                with due_cols[1]:
+                    if st.button(
+                        f"Complete due transfers ({len(due_transfers)})",
+                        key="complete_due_transfers_btn",
+                        type="primary",
+                        use_container_width=True,
+                    ):
+                        completed_now = complete_due_member_transfers(household_id)
+                        if completed_now < 0:
+                            st.error("Complete due transfers requires admin or developer access.")
+                        elif completed_now:
+                            cleanup_orphan_disbursement_artifacts(household_id, selected_month)
+                            st.success(
+                                f"Completed {completed_now} transfer(s) — "
+                                "household allowance expenses and personal incomes updated."
+                            )
+                        else:
+                            st.info("No due transfers to complete.")
+                        rerun_fragment_with_reason("complete_due_transfers")
+
+            transfer_index = {
+                (r["payment_date"][:10], r["recipient_username"], str(r.get("funding_income_stream_id") or "")): r
+                for r in transfer_rows
+                if r.get("payment_date") and r.get("recipient_username")
+            }
+
+            for entry in paycheck_schedule:
+                pay_date_str = str(entry.get("payment_date", ""))[:10]
+                stream_id_str = str(entry.get("stream_id") or "")
+                stream_label = entry.get("stream_label") or ""
+                payouts = entry.get("payouts") or {}
+                st.markdown(f"**{_format_payment_date(pay_date_str)}** — {stream_label}")
+
+                status_rows = []
+                for member in sorted(payouts):
+                    t = transfer_index.get((pay_date_str, member, stream_id_str))
+                    parts = payouts[member]
+                    status = t["status"] if t else "—"
+                    badge = "✅ Transferred" if status == "completed" else ("🕐 Planned" if status == "planned" else "—")
+                    status_rows.append({
+                        "cells": [
+                            member,
+                            _format_ledger_amount(t["obligation_amount"] if t else parts.get("obligation", 0)),
+                            _format_ledger_amount(t["allowance_amount"] if t else parts.get("allowance", 0)),
+                            _format_ledger_amount(t["total_amount"] if t else parts.get("total", 0)),
+                            badge,
+                        ]
+                    })
+                _render_html_scroll_table(
+                    ["Member", "Obligation", "Allowance", "Total", "Status"],
+                    status_rows,
+                    right_align_from=1,
+                    variant="income",
+                )
+
+                for member in sorted(payouts):
+                    t = transfer_index.get((pay_date_str, member, stream_id_str))
+                    if t and t.get("status") == "planned":
+                        btn_key = f"mark_transferred_{t['id']}"
+                        if st.button(
+                            f"Mark transferred — {member} on {_format_payment_date(pay_date_str)}",
+                            key=btn_key,
+                            type="primary",
+                        ):
+                            if complete_member_transfer(str(t["id"])):
+                                st.success(f"Marked as transferred for {member}.")
+                                rerun_fragment_with_reason("complete_transfer")
+                            else:
+                                st.error("Could not mark transfer as completed.")
+
+
+def _render_obligations_and_disbursements_panel(household_id, selected_month, member_options):
+    """Master Ledger: category assignments and household disbursement planning."""
+    with st.expander("Obligations & Disbursements", expanded=False):
+        tab_assignments, tab_plan = st.tabs(["Category assignments", "Disbursement plan"])
+        with tab_assignments:
+            _render_obligation_assignments_tab(household_id, selected_month, member_options)
+        with tab_plan:
+            _render_disbursement_plan_tab(household_id, selected_month)
 
 
 def _render_family_member_budgets(household_id, selected_month, household_users):
@@ -1190,7 +2148,7 @@ def _render_family_member_budgets(household_id, selected_month, household_users)
         merged_df["actual_amount"] = merged_df["amount"].fillna(0.0)
 
         year, month = map(int, selected_month.split("-"))
-        stream_projections, recurring_schedule = get_expense_stream_projections(
+        _, recurring_schedule = get_expense_stream_projections(
             household_id,
             selected_month,
             is_personal_spend=True,
@@ -1203,7 +2161,6 @@ def _render_family_member_budgets(household_id, selected_month, household_users)
             recurring_schedule,
             selected_month,
             filter_key=f"family_breakdown_{selected_member}",
-            stream_projections=stream_projections,
         )
 
         annual_df = merged_df[merged_df["category_name"] == "Annual Subscriptions"]
@@ -1329,8 +2286,46 @@ def _format_money(amount):
     return f"${_to_number(amount, 0):,.2f}"
 
 
+def _apply_budget_chart_typography(fig):
+    """Readable chart hierarchy: title > axis labels > ticks."""
+    fig.update_layout(
+        font=dict(
+            family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif",
+            size=13,
+            color="#111827",
+        ),
+        title=dict(font=dict(size=17, color="#111827")),
+        legend=dict(font=dict(size=12)),
+        margin=dict(t=72, b=56, l=48, r=24),
+    )
+    fig.update_xaxes(
+        title_font=dict(size=14, color="#374151"),
+        tickfont=dict(size=12, color="#374151"),
+    )
+    fig.update_yaxes(
+        title_font=dict(size=14, color="#374151"),
+        tickfont=dict(size=12, color="#374151"),
+    )
+    fig.update_traces(
+        textfont=dict(size=12, color="#111827"),
+        selector=dict(type="bar"),
+    )
+    fig.update_traces(
+        textfont=dict(size=12),
+        insidetextfont=dict(size=13),
+        selector=dict(type="pie"),
+    )
+    fig.update_traces(
+        textfont=dict(size=13),
+        insidetextfont=dict(size=12),
+        selector=dict(type="treemap"),
+    )
+    return fig
+
+
 def _plotly_chart_locked(fig, **kwargs):
     fig.update_layout(dragmode=False)
+    _apply_budget_chart_typography(fig)
     config = {
         "displaylogo": False,
         "scrollZoom": False,
@@ -1372,7 +2367,7 @@ def _add_chart_corner_total(fig, total: float, *, label: str = "Total Over Budge
         bordercolor="#DC2626",
         borderwidth=1,
         borderpad=6,
-        font=dict(size=12, color="#991B1B"),
+        font=dict(size=14, color="#991B1B"),
     )
 
 
@@ -1590,19 +2585,12 @@ def _build_period_summary(household_id, year, mode, scope, username=None, auth_u
     merged_df["actual_amount"] = merged_df["amount"].fillna(0.0)
     merged_df = _exclude_system_categories(merged_df)
 
-    stream_projections = sum_expense_stream_projections_for_months(
-        household_id,
-        months,
-        is_personal_spend=is_personal,
-        username=username if is_personal else None,
-    )
-
     category_groups = []
-    for parent in merged_df["category_name"].unique():
+    for parent in _sorted_parent_category_names(merged_df["category_name"].unique()):
         parent_mask = merged_df["category_name"] == parent
         parent_target = float(
             sum(
-                _category_projected_amount(row, stream_projections, month_count=month_count)
+                _category_projected_amount(row, month_count=month_count)
                 for _, row in merged_df[parent_mask].iterrows()
             )
         )
@@ -1613,7 +2601,7 @@ def _build_period_summary(household_id, year, mode, scope, username=None, auth_u
         sub_rows = []
         parent_purchase_count = 0
         for _, row in merged_df[parent_mask].iterrows():
-            target = _category_projected_amount(row, stream_projections, month_count=month_count)
+            target = _category_projected_amount(row, month_count=month_count)
             actual = float(row["actual_amount"])
             if target == 0 and actual == 0:
                 continue
@@ -1942,6 +2930,23 @@ def _can_edit_projects_module():
 
 def _can_access_monthly_module():
     return _is_budget_admin()
+
+
+def render_disbursement_surplus_alert_if_needed() -> None:
+    """App-level banner when saved allowance transfers exceed current surplus."""
+    if not _can_access_monthly_module():
+        return
+    household_id = st.session_state.get("household_id")
+    if not household_id or household_id == "unassigned":
+        return
+
+    month_year = datetime.now(ZoneInfo("America/Chicago")).strftime("%Y-%m")
+    flags = get_disbursement_allowance_surplus_flags(household_id, month_year)
+    for flag in flags:
+        if flag.get("kind") == "allowance_exceeds_surplus":
+            st.error(flag["message"])
+        else:
+            st.warning(flag["message"])
 
 
 def render_budget_module(show_back_to_hub=False):
@@ -2458,7 +3463,7 @@ def _render_budget_fragment(show_back_to_hub=False):
                 merged_df["actual_amount"] = merged_df["amount"].fillna(0.0)
                 merged_df = _exclude_system_categories(merged_df)
 
-                stream_projections, recurring_schedule = get_expense_stream_projections(
+                _, recurring_schedule = get_expense_stream_projections(
                     household_id,
                     selected_month,
                     is_personal_spend=False,
@@ -2470,19 +3475,20 @@ def _render_budget_fragment(show_back_to_hub=False):
                     recurring_schedule,
                     selected_month,
                     filter_key="hh_breakdown_category",
-                    stream_projections=stream_projections,
                 )
-
-                projected_income = sum_income_for_month(incomes_df, selected_month)
-                projected_savings = _compute_household_projected_savings(
-                    projected_income,
-                    merged_df,
-                    stream_projections,
-                )
-                _, savings_col = st.columns([3, 1])
-                with savings_col:
-                    _render_projected_savings_metric(projected_savings)
             st.divider()
+
+            if _is_budget_admin():
+                hh_users = get_household_users_for_admin()
+                member_options = [
+                    _clean_text(u.get("username"))
+                    for u in hh_users
+                    if _clean_text(u.get("username"))
+                ]
+                if member_options:
+                    _render_obligations_and_disbursements_panel(
+                        household_id, selected_month, member_options
+                    )
             
             # 🟢 SINKING FUNDS TRACKER
             annual_df = (
@@ -2500,85 +3506,27 @@ def _render_budget_fragment(show_back_to_hub=False):
             with st.expander("📈 Annual Reports & YTD Summary"):
                 _render_annual_report_launcher("household", "hh_annual")
                 
-        # --- TAB 2: LOG EXPENSE (HOUSEHOLD) ---
+        # --- TAB 2: EXPENSES (HOUSEHOLD) ---
         elif household_view_mode == "💳 Expenses":
-            st.markdown("#### Log a Shared Household Bill/Expense")
-            
+            st.markdown("#### Household Expenses")
+            st.caption("Log new expenses from **Quick Expense** in the sidebar.")
+
             categories_df = get_budget_categories(household_id, is_personal=False)
-            user_categories_df = _exclude_system_categories(categories_df)
             hh_expenses_display_df = _exclude_system_category_expenses(hh_expenses_df, categories_df)
-            
-            if user_categories_df.empty:
-                st.warning("No active categories found. Please add one below.")
-            else:
-                user_categories_df = user_categories_df.copy()
-                user_categories_df["display_name"] = user_categories_df.apply(
-                    lambda row: f"{row['category_name']} - {row['sub_category_name']}"
-                    if pd.notnull(row.get("sub_category_name"))
-                    else row["category_name"],
-                    axis=1,
-                )
-                display_list = user_categories_df["display_name"].tolist()
-
-                selected_display_name = st.selectbox(
-                    "Category",
-                    display_list,
-                    key="hh_expense_category_select",
-                )
-                cat_row = user_categories_df[
-                    user_categories_df["display_name"] == selected_display_name
-                ].iloc[0]
-                is_allowance_payment = is_allowance_subcategory(
-                    cat_row.get("category_name"), cat_row.get("sub_category_name")
-                )
-                allowance_recipient = allowance_recipient_username(
-                    cat_row.get("category_name"),
-                    cat_row.get("sub_category_name"),
-                    username_field=cat_row.get("username"),
-                )
-                if is_allowance_payment and allowance_recipient:
-                    st.caption(
-                        f"This payment will appear as income in **{allowance_recipient}**'s Personal Budget "
-                        "using the same bill frequency you select here."
-                    )
-
-                with st.form("hh_expense_entry", clear_on_submit=True):
-                    a1, a2 = st.columns([1, 1])
-                    date_logged = a1.date_input("Date", value=date.today())
-                    amount_raw = a2.text_input("Amount ($) *")
-
-                    details = st.text_input("Details")
-
-                    pay_frequency = st.selectbox(
-                        "Bill frequency",
-                        EXPENSE_FREQUENCY_OPTIONS,
-                        format_func=expense_pay_frequency_label,
-                        index=EXPENSE_FREQUENCY_OPTIONS.index("monthly"),
-                        key="hh_expense_pay_freq",
-                    )
-
-                    if st.form_submit_button("💾 Save Shared Expense", type="primary", width="stretch"):
-                        parsed_amount = _parse_currency_input(amount_raw)
-                        if "invalid" == parsed_amount or parsed_amount is None:
-                            st.error("Please enter a valid dollar amount.")
-                        else:
-                            success = log_expense_and_check_project(
-                                auth_user_id=auth_user_id, username=username, household_id=household_id,
-                                month_year=date_logged.strftime("%Y-%m"), date_logged=date_logged,
-                                category_id=cat_row["id"], amount=parsed_amount, details=details.strip(),
-                                is_personal_spend=False,
-                                is_recurring=pay_frequency != "one_time",
-                                pay_frequency=pay_frequency,
-                            )
-                            if success:
-                                st.success(f"Logged ${_format_money(parsed_amount)} to Household Ledger.")
-                                rerun_fragment_with_reason("budget_nav")
-                            else:
-                                st.error("Failed to log expense.")
-            
-            st.divider()
+            user_categories_df = _exclude_allowance_categories(_exclude_system_categories(categories_df)) if categories_df is not None and not categories_df.empty else pd.DataFrame()
 
             hh_recurring_df, hh_one_time_df = _split_recurring_expenses(hh_expenses_display_df)
+
+            st.markdown("**One-Time**")
+            _render_expense_manage_rows(
+                hh_one_time_df,
+                "exp_hh_once",
+                "No one-time household expenses logged for this month yet.",
+                categories_df=user_categories_df,
+                can_edit=True,
+            )
+
+            st.divider()
 
             with st.expander("🔄 Recurring Household Expenses", expanded=False):
                 _render_expense_manage_rows(
@@ -2589,15 +3537,6 @@ def _render_budget_fragment(show_back_to_hub=False):
                     can_edit=True,
                 )
 
-            with st.expander("📝 One-Time Household Expenses", expanded=False):
-                _render_expense_manage_rows(
-                    hh_one_time_df,
-                    "exp_hh_once",
-                    "No one-time household expenses logged for this month yet.",
-                    categories_df=user_categories_df,
-                    can_edit=True,
-                )
-            
             st.divider()
 
             with st.expander("⚙️ Manage Expense Categories"):
@@ -2611,7 +3550,9 @@ def _render_budget_fragment(show_back_to_hub=False):
                     st.markdown("**🏷️ Add New Category**")
                     parent_options = ["➕ Create New Parent Category"]
                     if not user_categories_df.empty:
-                        existing_parents = sorted(user_categories_df["category_name"].unique().tolist())
+                        existing_parents = _sorted_parent_category_names(
+                            user_categories_df["category_name"].unique()
+                        )
                         parent_options.extend(existing_parents)
 
                     selected_parent = st.selectbox("Parent Category", parent_options, key="hh_parent_sel")
@@ -2655,10 +3596,12 @@ def _render_budget_fragment(show_back_to_hub=False):
                             axis=1,
                         )
                     ]
+                    editable_cats_df = _sort_categories_dataframe(editable_cats_df)
                     if not editable_cats_df.empty:
-                        edit_cat_options = editable_cats_df.apply(
-                            lambda row: f"{row['category_name']} - {row.get('sub_category_name', '')} (${row.get('target_budget', 0):.2f}/mo)", axis=1
-                        ).tolist()
+                        edit_cat_options = [
+                            _build_category_edit_label(row)
+                            for _, row in editable_cats_df.iterrows()
+                        ]
 
                         selected_edit_str = st.selectbox("Select Category to Edit", edit_cat_options, key="edit_cat_hh_select")
                         selected_edit_idx = edit_cat_options.index(selected_edit_str)
@@ -2747,19 +3690,18 @@ def _render_budget_fragment(show_back_to_hub=False):
         _maybe_auto_rollover(household_id, selected_month)
             
         settings = get_user_finance_settings(household_id, username)
-        indiv_expenses_df = get_individual_expenses(household_id, auth_user_id, selected_month)
+        household_integrated = get_personal_household_integration(household_id, username)
+
+        my_ledger_expenses_df = get_personal_ledger_expenses(
+            household_id, auth_user_id, selected_month, username
+        )
         
-        personal_incomes_df = get_household_incomes(household_id, selected_month, is_personal_income=True, username=username)
+        personal_incomes_df = get_personal_ledger_incomes(household_id, selected_month, username)
         personal_incomes_actual_df = _filter_incomes_for_actual_totals(personal_incomes_df, selected_month)
         total_personal_income = sum_income_for_month(personal_incomes_actual_df, selected_month)
         personal_annual_income_totals = compute_annual_income_totals(personal_incomes_actual_df)
         
-        if not indiv_expenses_df.empty and "is_personal_spend" in indiv_expenses_df.columns:
-            my_personal_df = indiv_expenses_df[indiv_expenses_df["is_personal_spend"] == True]
-        else:
-            my_personal_df = pd.DataFrame()
-            
-        my_actual_df = _filter_expenses_for_actual_totals(my_personal_df, selected_month)
+        my_actual_df = _filter_expenses_for_actual_totals(my_ledger_expenses_df, selected_month)
         total_personal_spend = my_actual_df["amount"].sum() if not my_actual_df.empty else 0.0
         net_personal_cash = total_personal_income - total_personal_spend
 
@@ -2773,6 +3715,23 @@ def _render_budget_fragment(show_back_to_hub=False):
         if allow_family_view != current_share_status:
             if update_user_privacy_toggle(household_id, username, allow_family_view):
                 rerun_fragment_with_reason("budget_nav")
+
+        current_integration = household_integrated
+        integrate_household = st.toggle(
+            "Integrate household budget on my personal ledger",
+            value=current_integration,
+            help=(
+                "When enabled: obligation support from completed transfers appears on this ledger, "
+                "your household paycheck income is shown read-only, and you can log expenses against "
+                "your assigned household obligation categories. Allowance is always on your personal "
+                "ledger automatically — it is your individual spend money."
+            ),
+        )
+        if integrate_household != current_integration:
+            if update_personal_household_integration(household_id, username, integrate_household):
+                rerun_fragment_with_reason("household_integration_toggle")
+            else:
+                st.error("Could not save household integration setting.")
                 
         personal_options = _personal_submodule_options(username)
         _sync_selector_option("personal_view_mode", personal_options)
@@ -2792,20 +3751,23 @@ def _render_budget_fragment(show_back_to_hub=False):
                 {"label": "Net Personal Cash Flow", "signed_amount": net_personal_cash},
             ], desktop_columns=3)
             st.divider()
-
-            st.markdown("**Income this month**")
-            _render_income_streams_list(
-                personal_incomes_df,
-                is_personal=True,
-                annual_totals=None,
-            )
-            st.divider()
             
             st.markdown(f"#### {username.title()}'s Budget Breakdown")
             
             categories_df = get_budget_categories(household_id, is_personal=True, username=username)
+            obligation_cats_df = (
+                get_member_obligation_expense_categories(household_id, username)
+                if household_integrated
+                else pd.DataFrame()
+            )
+            breakdown_categories_df = categories_df
+            if household_integrated and obligation_cats_df is not None and not obligation_cats_df.empty:
+                breakdown_categories_df = pd.concat(
+                    [categories_df, obligation_cats_df],
+                    ignore_index=True,
+                )
             
-            if categories_df.empty:
+            if breakdown_categories_df.empty:
                 st.info("No personal categories setup yet. Build your blank slate below!")
             else:
                 if not my_actual_df.empty:
@@ -2813,10 +3775,10 @@ def _render_budget_fragment(show_back_to_hub=False):
                 else:
                     exp_summary = pd.DataFrame(columns=["category_id", "amount"])
                 
-                merged_df = pd.merge(categories_df, exp_summary, left_on="id", right_on="category_id", how="left")
+                merged_df = pd.merge(breakdown_categories_df, exp_summary, left_on="id", right_on="category_id", how="left")
                 merged_df["actual_amount"] = merged_df["amount"].fillna(0.0)
                 
-                stream_projections, recurring_schedule = get_expense_stream_projections(
+                _, recurring_schedule = get_expense_stream_projections(
                     household_id,
                     selected_month,
                     is_personal_spend=True,
@@ -2825,11 +3787,10 @@ def _render_budget_fragment(show_back_to_hub=False):
 
                 _render_household_budget_breakdown(
                     merged_df,
-                    my_personal_df,
+                    my_ledger_expenses_df,
                     recurring_schedule,
                     selected_month,
                     filter_key="pers_breakdown_category",
-                    stream_projections=stream_projections,
                 )
 
                 annual_df = merged_df[merged_df["category_name"] == "Annual Subscriptions"]
@@ -2843,78 +3804,166 @@ def _render_budget_fragment(show_back_to_hub=False):
 
             st.divider()
 
-        # --- TAB 2: LOG EXPENSE (PERSONAL) ---
+        # --- TAB 2: EXPENSES (PERSONAL) ---
         elif personal_view_mode == "💳 Expenses":
-            st.markdown("#### Log a Personal Expense")
+            st.markdown("#### Personal Expenses")
+            st.caption("Log new expenses from **Quick Expense** in the sidebar.")
+
             categories_df = get_budget_categories(household_id, is_personal=True, username=username)
-            
-            if categories_df.empty:
-                st.warning("No personal categories found. Please add one below.")
+            obligation_cats_df = (
+                get_member_obligation_expense_categories(household_id, username)
+                if household_integrated
+                else pd.DataFrame()
+            )
+
+            if my_ledger_expenses_df is None or my_ledger_expenses_df.empty:
+                personal_only_df = pd.DataFrame()
+                household_obl_df = pd.DataFrame()
+            elif "ledger_source" in my_ledger_expenses_df.columns:
+                personal_only_df = my_ledger_expenses_df[
+                    my_ledger_expenses_df["ledger_source"] != "household_obligation"
+                ].copy()
+                household_obl_df = my_ledger_expenses_df[
+                    my_ledger_expenses_df["ledger_source"] == "household_obligation"
+                ].copy()
             else:
-                categories_df["display_name"] = categories_df.apply(lambda row: f"{row['category_name']} - {row['sub_category_name']}" if pd.notnull(row.get('sub_category_name')) else row['category_name'], axis=1)
-                display_list = categories_df["display_name"].tolist()
-                
-                with st.form("pers_expense_entry", clear_on_submit=True):
-                    a1, a2 = st.columns([1, 1])
-                    date_logged = a1.date_input("Date", value=date.today())
-                    amount_raw = a2.text_input("Amount ($) *")
-                    
-                    selected_display_name = st.selectbox("Category", display_list, key="pers_cat_form")
-                    
-                    details = st.text_input("Details")
+                personal_only_df = my_ledger_expenses_df.copy()
+                household_obl_df = pd.DataFrame()
 
-                    pay_frequency = st.selectbox(
-                        "Bill frequency",
-                        EXPENSE_FREQUENCY_OPTIONS,
-                        format_func=expense_pay_frequency_label,
-                        index=EXPENSE_FREQUENCY_OPTIONS.index("monthly"),
-                        key="pers_expense_pay_freq",
-                    )
-                    
-                    if st.form_submit_button("💾 Save Personal Expense", type="primary", width="stretch"):
-                        parsed_amount = _parse_currency_input(amount_raw)
-                        if "invalid" == parsed_amount or parsed_amount is None:
-                            st.error("Please enter a valid dollar amount.")
-                        else:
-                            cat_row = categories_df[categories_df["display_name"] == selected_display_name].iloc[0]
-                            
-                            success = log_expense_and_check_project(
-                                auth_user_id=auth_user_id, username=username, household_id=household_id,
-                                month_year=date_logged.strftime("%Y-%m"), date_logged=date_logged,
-                                category_id=cat_row["id"], amount=parsed_amount, details=details.strip(), 
-                                is_personal_spend=True,
-                                is_recurring=pay_frequency != "one_time",
-                                pay_frequency=pay_frequency,
-                            )
-                            if success:
-                                st.success(f"Logged ${_format_money(parsed_amount)} to Personal Ledger.")
-                                rerun_fragment_with_reason("budget_nav")
-                            else:
-                                st.error("Failed to log expense.")
-                                
+            combined_categories_df = categories_df
+            if household_integrated and obligation_cats_df is not None and not obligation_cats_df.empty:
+                combined_categories_df = pd.concat(
+                    [categories_df, obligation_cats_df],
+                    ignore_index=True,
+                )
+
+            pers_recurring_df, pers_one_time_df = _split_recurring_expenses(personal_only_df)
+
+            st.markdown("**One-Time**")
+            _render_expense_manage_rows(
+                pers_one_time_df,
+                "exp_pers_once",
+                "No one-time personal expenses logged for this month yet.",
+                categories_df=combined_categories_df,
+                can_edit=True,
+            )
+
             st.divider()
-
-            pers_recurring_df, pers_one_time_df = _split_recurring_expenses(my_personal_df)
 
             with st.expander("🔄 Recurring Personal Expenses", expanded=False):
                 _render_expense_manage_rows(
                     pers_recurring_df,
                     "exp_pers_recur",
                     "No recurring personal expenses logged for this month yet.",
-                    categories_df=categories_df,
+                    categories_df=combined_categories_df,
                     can_edit=True,
                 )
 
-            with st.expander("📝 One-Time Personal Expenses", expanded=False):
-                _render_expense_manage_rows(
-                    pers_one_time_df,
-                    "exp_pers_once",
-                    "No one-time personal expenses logged for this month yet.",
-                    categories_df=categories_df,
-                    can_edit=True,
-                )
+            if household_integrated:
+                hh_recurring_df, hh_one_time_df = _split_recurring_expenses(household_obl_df)
+                with st.expander("🏠 Household Obligation Expenses", expanded=False):
+                    if household_obl_df is None or household_obl_df.empty:
+                        st.caption("No household obligation expenses logged this month.")
+                    else:
+                        if not hh_recurring_df.empty:
+                            st.markdown("**Recurring**")
+                            _render_expense_manage_rows(
+                                hh_recurring_df,
+                                "exp_pers_hh_recur",
+                                "No recurring household obligation expenses.",
+                                categories_df=combined_categories_df,
+                                can_edit=True,
+                            )
+                        if not hh_one_time_df.empty:
+                            st.markdown("**One-time**")
+                            _render_expense_manage_rows(
+                                hh_one_time_df,
+                                "exp_pers_hh_once",
+                                "No one-time household obligation expenses.",
+                                categories_df=combined_categories_df,
+                                can_edit=True,
+                            )
             
             st.divider()
+
+            if household_integrated:
+                with st.expander("🏠 Manage obligation expense categories", expanded=False):
+                    parent_names = get_member_obligation_parent_names(household_id, username)
+                    if not parent_names:
+                        st.info("No household obligation categories are assigned to you yet.")
+                    else:
+                        st.caption(
+                            "Add or remove sub-categories under your assigned household obligation parents. "
+                            "You cannot create new parent categories here."
+                        )
+                        add_parent = st.selectbox(
+                            "Parent category",
+                            parent_names,
+                            key="obl_sub_parent_sel",
+                        )
+                        new_sub_name = st.text_input(
+                            "New sub-category name",
+                            placeholder="e.g., Produce, Daycare",
+                            key="obl_sub_name_input",
+                        )
+                        new_sub_budget_raw = st.text_input(
+                            "Projected monthly budget ($)",
+                            placeholder="0",
+                            key="obl_sub_budget_input",
+                        )
+                        if st.button("➕ Add sub-category", key="obl_sub_add_btn"):
+                            parsed_budget = _parse_currency_input(new_sub_budget_raw) if new_sub_budget_raw else 0.0
+                            if not new_sub_name.strip() or parsed_budget == "invalid":
+                                st.error("Sub-category name required; budget must be numeric.")
+                            elif insert_obligation_subcategory(
+                                household_id,
+                                username,
+                                add_parent,
+                                new_sub_name.strip(),
+                                target_budget=parsed_budget or 0.0,
+                            ):
+                                st.success(f"Added {add_parent} → {new_sub_name.strip()}.")
+                                rerun_fragment_with_reason("obl_sub_add")
+                            else:
+                                st.error("Could not add sub-category.")
+
+                        subs_df = obligation_cats_df.copy() if obligation_cats_df is not None else pd.DataFrame()
+                        if subs_df is not None and not subs_df.empty:
+                            subs_df = subs_df[
+                                subs_df["sub_category_name"].notna()
+                                & (subs_df["sub_category_name"].astype(str).str.strip() != "")
+                            ]
+                        if subs_df is None or subs_df.empty:
+                            st.caption("No sub-categories under your assigned parents yet.")
+                        else:
+                            st.markdown("**Remove sub-categories**")
+                            for _, sub_row in _sort_categories_dataframe(subs_df).iterrows():
+                                label = _build_obligation_category_display_name(sub_row)
+                                col_label, col_btn = st.columns([3, 1])
+                                col_label.markdown(label)
+                                if col_btn.button("Remove", key=f"obl_sub_rm_{sub_row['id']}"):
+                                    if deactivate_obligation_subcategory(household_id, username, sub_row["id"]):
+                                        rerun_fragment_with_reason("obl_sub_rm")
+                                    else:
+                                        st.error(f"Could not remove {label}.")
+
+                        inactive_subs_df = get_member_obligation_inactive_subcategories(household_id, username)
+                        if inactive_subs_df is not None and not inactive_subs_df.empty:
+                            st.divider()
+                            st.markdown("**Restore removed sub-categories**")
+                            st.caption(
+                                "Removed sub-categories are hidden from the picker but can be restored here "
+                                "or re-added above with the same name."
+                            )
+                            for _, sub_row in _sort_categories_dataframe(inactive_subs_df).iterrows():
+                                label = _build_obligation_category_display_name(sub_row)
+                                col_label, col_btn = st.columns([3, 1])
+                                col_label.markdown(label)
+                                if col_btn.button("Restore", key=f"obl_sub_restore_{sub_row['id']}"):
+                                    if reactivate_obligation_subcategory(household_id, username, sub_row["id"]):
+                                        rerun_fragment_with_reason("obl_sub_restore")
+                                    else:
+                                        st.error(f"Could not restore {label}.")
 
             with st.expander("⚙️ Manage Personal Categories"):
                 tab_add, tab_edit = st.tabs(["➕ Add New", "✏️ Edit Existing"])
@@ -2923,7 +3972,9 @@ def _render_budget_fragment(show_back_to_hub=False):
                     st.markdown("**🏷️ Add New Personal Category**")
                     parent_options = ["➕ Create New Parent Category"]
                     if not categories_df.empty:
-                        existing_parents = sorted(categories_df["category_name"].unique().tolist())
+                        existing_parents = _sorted_parent_category_names(
+                            categories_df["category_name"].unique()
+                        )
                         parent_options.extend(existing_parents)
                         
                     selected_parent = st.selectbox("Parent Category", parent_options, key="pers_parent_sel")
@@ -2956,13 +4007,15 @@ def _render_budget_fragment(show_back_to_hub=False):
                 with tab_edit:
                     st.markdown("**✏️ Edit or Delete Personal Categories**")
                     if not categories_df.empty:
-                        edit_cat_options = categories_df.apply(
-                            lambda row: f"{row['category_name']} - {row.get('sub_category_name', '')} (${row.get('target_budget', 0):.2f}/mo)", axis=1
-                        ).tolist()
+                        sorted_edit_cats_df = _sort_categories_dataframe(categories_df)
+                        edit_cat_options = [
+                            _build_category_edit_label(row)
+                            for _, row in sorted_edit_cats_df.iterrows()
+                        ]
                         
                         selected_edit_str = st.selectbox("Select Category to Edit", edit_cat_options, key="edit_cat_pers_select")
                         selected_edit_idx = edit_cat_options.index(selected_edit_str)
-                        target_cat_row = categories_df.iloc[selected_edit_idx]
+                        target_cat_row = sorted_edit_cats_df.iloc[selected_edit_idx]
                         target_cat_id = target_cat_row["id"]
                         
                         is_edit_annual = (target_cat_row["category_name"] == "Annual Subscriptions")
@@ -3046,16 +4099,13 @@ def _render_budget_fragment(show_back_to_hub=False):
             st.warning("No active categories found. Please ask an Admin to add categories in the Household Setup.")
             return
             
-        user_categories_df = user_categories_df.copy()
-        user_categories_df["display_name"] = user_categories_df.apply(
-            lambda row: f"{row['category_name']} - {row['sub_category_name']}" if pd.notnull(row.get('sub_category_name')) else row['category_name'], 
-            axis=1
-        )
-        
-        cat_options = user_categories_df["display_name"].tolist()
+        sorted_user_categories_df = _prepare_sorted_category_picker(user_categories_df)
+        cat_options = sorted_user_categories_df["display_name"].tolist()
         selected_display_name = st.selectbox("Category", cat_options)
         
-        cat_row = user_categories_df[user_categories_df["display_name"] == selected_display_name].iloc[0]
+        cat_row = sorted_user_categories_df[
+            sorted_user_categories_df["display_name"] == selected_display_name
+        ].iloc[0]
         category_id = cat_row["id"]
         category_type = cat_row.get("category_type")
         
@@ -3317,6 +4367,7 @@ def _render_budget_fragment(show_back_to_hub=False):
         if yearly_projects:
             overview_all_df = pd.DataFrame(yearly_projects)
             category_costs = overview_all_df.groupby("category", as_index=False)[["_est_low", "_est_high", "_actual"]].sum()
+            category_costs = _sort_dataframe_column_case_insensitive(category_costs, "category")
             if not category_costs.empty:
                 fig_bar = go.Figure(
                     data=[
@@ -3402,7 +4453,14 @@ def _render_budget_fragment(show_back_to_hub=False):
         with over_col2:
             st.markdown(f"#### Completed Over Budget ({selected_year})")
             if completed_over_budget_rows:
-                completed_over_df = pd.DataFrame(completed_over_budget_rows)
+                completed_over_df = _sort_dataframe_column_case_insensitive(
+                    pd.DataFrame(completed_over_budget_rows),
+                    "category",
+                )
+                completed_over_df = _sort_dataframe_column_case_insensitive(
+                    completed_over_df,
+                    "Project",
+                )
                 fig_completed_over = px.bar(
                     completed_over_df,
                     x="category",
@@ -3430,7 +4488,10 @@ def _render_budget_fragment(show_back_to_hub=False):
             chart_col1, chart_col2 = st.columns(2)
 
             with chart_col1:
-                category_df = overview_df.groupby("category", as_index=False)["_est_high"].sum()
+                category_df = _sort_dataframe_column_case_insensitive(
+                    overview_df.groupby("category", as_index=False)["_est_high"].sum(),
+                    "category",
+                )
                 if not category_df.empty and category_df["_est_high"].sum() > 0:
                     fig_donut = px.pie(
                         category_df,
@@ -3452,6 +4513,8 @@ def _render_budget_fragment(show_back_to_hub=False):
                 tree_df = overview_df[overview_df["_est_high"] > 0].copy()
                 if not tree_df.empty:
                     tree_df["remaining"] = tree_df["_est_high"] - tree_df["_actual"]
+                    tree_df = _sort_dataframe_column_case_insensitive(tree_df, "category")
+                    tree_df = _sort_dataframe_column_case_insensitive(tree_df, "item")
                     fig_tree = px.treemap(
                         tree_df,
                         path=["category", "item"],
@@ -3627,7 +4690,7 @@ def _render_budget_fragment(show_back_to_hub=False):
                 b1, b2 = st.columns(2)
                 new_est_low_raw = b1.text_input("Est. Low", value="", placeholder="Enter amount", disabled=not can_edit_projects)
                 new_est_high_raw = b2.text_input("Est. High", value="", placeholder="Enter amount", disabled=not can_edit_projects)
-                st.caption("Actual spent starts at $0.00 and is updated when you log purchases via Add Expense on each project.")
+                st.caption("Actual spent starts at $0.00 and is updated when you log purchases from Manage → Expenses.")
 
                 n1, n2 = st.columns(2)
                 new_vendors = n1.text_input("Vendors", placeholder="Contractor names, stores, links", disabled=not can_edit_projects)
@@ -3684,10 +4747,20 @@ def _render_budget_fragment(show_back_to_hub=False):
                 description = _clean_text(item.get("description"))
                 vendors = _clean_text(item.get("vendors"))
                 notes = _clean_text(item.get("notes"))
+                expense_entries = get_project_purchase_expense_entries(
+                    projects_household_id,
+                    project_id,
+                    legacy_notes=notes,
+                )
+                notes_without_expenses = strip_expense_audit_lines_from_notes(
+                    notes.replace(COMPLETED_TAG, "").strip() if notes else ""
+                )
                 est_low = item.get("_est_low", 0)
                 est_high = item.get("_est_high", 0)
-                actual = item.get("_actual", 0)
-                spent_in_year = current_year_spend_by_project.get(str(project_id or ""), 0)
+                ledger_actual = sum(float(e.get("amount") or 0) for e in expense_entries if not e.get("is_legacy"))
+                legacy_actual = sum(float(e.get("amount") or 0) for e in expense_entries if e.get("is_legacy"))
+                actual = ledger_actual + legacy_actual if expense_entries else item.get("_actual", 0)
+                spent_in_year = sum_project_purchase_expenses_for_year(expense_entries, current_year)
                 project_start_year = item.get("_year")
                 budget_cap = est_high if est_high > 0 else est_low
                 remaining_balance = budget_cap - actual if budget_cap > 0 else None
@@ -3716,17 +4789,10 @@ def _render_budget_fragment(show_back_to_hub=False):
                     )
                     if est_high > 0:
                         pct_used = min(actual / est_high * 100, 999)
-                        left_col.caption(f"Budget used: {pct_used:.0f}% of est. high ({_format_money(actual)} / {_format_money(est_high)})")
-                        if actual > est_high:
-                            left_col.markdown(
-                                f"**Over budget by:** <span style='color:#DC2626; font-weight:700;'>{_format_money(actual - est_high)}</span>",
-                                unsafe_allow_html=True,
-                            )
-                        else:
-                            left_col.markdown(
-                                f"**Under budget by:** <span style='color:#16A34A; font-weight:700;'>{_format_money(est_high - actual)}</span>",
-                                unsafe_allow_html=True,
-                            )
+                        left_col.caption(
+                            f"Budget used: {pct_used:.0f}% of est. high "
+                            f"({_format_money(actual)} / {_format_money(est_high)})"
+                        )
                     elif est_low > 0:
                         left_col.caption(f"Tracking against est. low: {_format_money(actual)} / {_format_money(est_low)}")
 
@@ -3740,58 +4806,41 @@ def _render_budget_fragment(show_back_to_hub=False):
                     if est_high > 0:
                         left_col.progress(min(actual / est_high, 1.0))
 
+                    _render_project_expense_entries(expense_entries, left_col)
+
                     if description:
                         left_col.markdown(f"**Description:** {description}")
                     if vendors:
                         left_col.markdown(f"**Vendors:** {vendors}")
-                    if notes and notes != COMPLETED_TAG:
-                        left_col.markdown(f"**Notes:** {notes.replace(COMPLETED_TAG, '').strip()}")
+                    if notes_without_expenses and notes_without_expenses != COMPLETED_TAG:
+                        left_col.markdown(f"**Notes:** {notes_without_expenses}")
                     if has_vet_discount:
                         left_col.caption("Eligible for veteran discount.")
 
                     if can_edit_projects:
                         project_popover_key = f"project_{project_id}"
                         with right_col.popover("⚙️ Manage", key=manage_popover_key(project_popover_key)):
-                            tab_expense, tab_edit = st.tabs(["➕ Add Expense", "✏️ Edit Project"])
+                            tab_add, tab_edit_exp, tab_edit = st.tabs(
+                                ["➕ Add Expense", "✏️ Edit Expense", "✏️ Edit Project"]
+                            )
 
-                            with tab_expense:
-                                st.markdown(f"**Log purchase for {title}**")
-                                st.caption("Adds to this project's Actual Spent and records a Projects line in the household budget.")
-                                with st.form(f"add_project_expense_form_{project_id}"):
-                                    exp_date = st.date_input(
-                                        "Purchase date",
-                                        value=date.today(),
-                                        key=f"proj_exp_date_{project_id}",
-                                    )
-                                    exp_product = st.text_input(
-                                        "Product or Service",
-                                        placeholder="e.g., Lumber, paint, contractor labor",
-                                        key=f"proj_exp_product_{project_id}",
-                                    )
-                                    exp_amount_raw = st.text_input(
-                                        "Amount ($) *",
-                                        placeholder="e.g., 125.00",
-                                        key=f"proj_exp_amt_{project_id}",
-                                    )
-                                    expense_submit = st.form_submit_button(
-                                        "💾 Add Expense",
-                                        type="primary",
-                                        width="stretch",
-                                    )
+                            with tab_add:
+                                _render_project_expense_manage_popover(
+                                    project_id=project_id,
+                                    project_name=title,
+                                    projects_household_id=projects_household_id,
+                                    project_popover_key=project_popover_key,
+                                    mode="add",
+                                )
 
-                                if expense_submit:
-                                    parsed_exp_amount = _parse_currency_input(exp_amount_raw)
-                                    if parsed_exp_amount == "invalid" or parsed_exp_amount is None:
-                                        st.error("Please enter a valid dollar amount.")
-                                    elif add_project_purchase_expense(
-                                        project_id,
-                                        exp_date,
-                                        parsed_exp_amount,
-                                        product_or_service=exp_product,
-                                    ):
-                                        finish_manage_popover("project_expense_write", project_popover_key, scope="fragment")
-                                    else:
-                                        st.error("Could not log project expense.")
+                            with tab_edit_exp:
+                                _render_project_expense_manage_popover(
+                                    project_id=project_id,
+                                    project_name=title,
+                                    projects_household_id=projects_household_id,
+                                    project_popover_key=project_popover_key,
+                                    mode="edit",
+                                )
 
                             with tab_edit:
                                 st.markdown(f"**Edit: {title}**")
@@ -3823,7 +4872,7 @@ def _render_budget_fragment(show_back_to_hub=False):
                                         key=f"edit_est_high_{project_id}",
                                     )
                                     st.markdown(f"**Actual Spent:** {_format_money(actual)}")
-                                    st.caption("Log purchases on the Add Expense tab to update actual spent.")
+                                    st.caption("Log and edit purchases on the Expenses tab.")
 
                                     if budget_cap > 0:
                                         remaining_preview = budget_cap - actual
@@ -3836,7 +4885,9 @@ def _render_budget_fragment(show_back_to_hub=False):
                                     en1, en2 = st.columns(2)
                                     e_vendors = en1.text_input("Vendors", value=vendors)
                                     e_vet_discount = en2.checkbox("Veteran Discount", value=has_vet_discount)
-                                    cleaned_edit_notes = notes.replace(COMPLETED_TAG, "").strip()
+                                    cleaned_edit_notes = strip_expense_audit_lines_from_notes(
+                                        notes.replace(COMPLETED_TAG, "").strip()
+                                    )
                                     e_notes = st.text_area("Notes", value=cleaned_edit_notes)
 
                                     save_col, complete_col, delete_col = st.columns([2, 1, 1])
@@ -3946,7 +4997,12 @@ def _render_budget_fragment(show_back_to_hub=False):
                 category = item.get("category") or "Uncategorized"
                 actual = item.get("_actual", 0)
                 notes = _clean_text(item.get("notes"))
-                restored_notes = _restore_active_notes(notes)
+                completed_expense_entries = get_project_purchase_expense_entries(
+                    projects_household_id,
+                    project_id,
+                    legacy_notes=notes,
+                )
+                restored_notes = strip_expense_audit_lines_from_notes(_restore_active_notes(notes) or "")
                 completed_date_label = "Unknown"
                 completed_raw = item.get("updated_at") or item.get("created_at")
                 if completed_raw:
@@ -3960,6 +5016,8 @@ def _render_budget_fragment(show_back_to_hub=False):
                     c_left, c_right = st.columns([6, 1])
                     c_left.markdown(f"**{title}**")
                     c_left.caption(f"Category: {category} | Date Completed: {completed_date_label} | Final Actual: ${actual:,.2f}")
+                    if completed_expense_entries:
+                        _render_project_expense_entries(completed_expense_entries, c_left)
                     if restored_notes:
                         c_left.markdown(f"**Notes:** {restored_notes}")
 

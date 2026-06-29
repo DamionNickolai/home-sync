@@ -8,6 +8,8 @@ Usage:
   python maintenance/reset_dev_household_data.py --household-id test_home --apply
   python maintenance/reset_dev_household_data.py --list-households
 
+For stream versions, use port_dev_budget_to_prod.py --scrub-dev (handles household_id-less tables).
+
 Requires SUPABASE_DB_PASSWORD + SUPABASE_URL (or SUPABASE_DB_URL) in .env.
 Only touches *_dev tables — production tables are never modified.
 """
@@ -23,22 +25,35 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from db_connection import connect
 
-# Delete order: ledger rows first, then streams (versions cascade), then categories.
+# Delete order: ledger rows first, then streams, then categories.
+# Stream versions are scrubbed via port_dev_budget_to_prod.py (no household_id column).
 DEV_TABLES: list[str] = [
+    "household_member_transfers_dev",
+    "household_supplement_snapshots_dev",
     "expenses_dev",
     "household_incomes_dev",
+    "income_occurrence_suppressions_dev",
+    "user_disbursement_funding_streams_dev",
+    "household_obligation_assignments_dev",
+    "household_disbursement_settings_dev",
     "household_income_streams_dev",
     "household_expense_streams_dev",
-    "budget_categories_dev",
     "cash_flow_routing_dev",
     "user_finance_settings_dev",
+    "budget_categories_dev",
+    "household_finance_settings_dev",
     "household_tasks_dev",
     "project_budgets_dev",
-    "household_finance_settings_dev",
     "wish_list_dev",
 ]
 
 DEFAULT_HOUSEHOLD_ID = "test_home"
+
+# Tables without household_id — scrub via port_dev_budget_to_prod.py --scrub-dev only.
+STREAM_SCOPED_DEV_TABLES: list[str] = [
+    "household_income_stream_versions_dev",
+    "household_expense_stream_versions_dev",
+]
 
 
 def _table_exists(cur, table_name: str) -> bool:

@@ -1,6 +1,7 @@
 import streamlit as st
 from supabase import create_client, Client
 import pandas as pd
+import json
 from security import encrypt_data, decrypt_text, decrypt_float
 import calendar
 import uuid
@@ -20,12 +21,37 @@ from constants import (
     ALLOWANCE_CATEGORY_NAME,
     ALLOWANCE_INCOME_SOURCE_NAME,
     DEFAULT_BUDGET_CATEGORIES,
+    OBLIGATION_SUPPORT_INCOME_SOURCE_NAME,
+    TRANSFER_ALLOWANCE_EXPENSE_DETAILS,
     PROJECT_EXPENSE_CATEGORY,
     allowance_recipient_username,
     is_allowance_category,
     is_allowance_subcategory,
     is_system_managed_allowance_category,
     is_system_project_expense_category,
+)
+from household_obligations import (
+    aggregate_member_obligations,
+    build_assignment_maps,
+    build_parent_summaries,
+    compute_allowance_coverage,
+    compute_supplement_gap,
+    find_allowance_category_id,
+    is_assignable_household_category,
+    reconcile_displacement,
+    resolve_obligation_lines,
+)
+from household_disbursements import (
+    build_paycheck_disbursement_schedule,
+    compute_member_bundled_amounts,
+    compute_member_transfer_needs,
+    compute_surplus_pool,
+    compute_surplus_shares,
+    disbursement_allowance_surplus_flags,
+    disbursement_review_flags,
+    filter_disbursement_eligible_usernames,
+    sum_transfer_allowance_total,
+    summarize_monthly_disbursement,
 )
 
 # 🟢 DYNAMIC ENVIRONMENT ROUTING
@@ -87,6 +113,21 @@ def income_pay_frequency_label(value) -> str:
 
 def income_is_recurring_frequency(pay_frequency) -> bool:
     return normalize_income_pay_frequency(pay_frequency) != "one_time"
+
+
+# Paycheck frequencies that count toward monthly obligation take-home (excludes
+# annual/quarterly bonuses and one-time windfalls shown in Cash Flow separately).
+OBLIGATION_REGULAR_PAY_FREQUENCIES = frozenset({
+    "monthly",
+    "school_year_monthly",
+    "bi_weekly",
+    "semi_monthly",
+    "weekly",
+})
+
+
+def _freq_is_obligation_regular_pay(pay_frequency) -> bool:
+    return normalize_income_pay_frequency(pay_frequency) in OBLIGATION_REGULAR_PAY_FREQUENCIES
 
 
 def _income_row_is_materialized_occurrence(row) -> bool:
@@ -863,6 +904,85 @@ def get_income_stream_versions_table():
     return get_budget_table("household_income_stream_versions")
 
 
+def get_income_suppressions_table():
+    return get_budget_table("income_occurrence_suppressions")
+
+
+def _fetch_income_suppressions_for_month(household_id, month_year) -> dict[str, set[str]]:
+    """Map stream_id -> suppressed payment_date strings for one month."""
+    table = get_income_suppressions_table()
+    try:
+        response = (
+            supabase.table(table)
+            .select("stream_id, payment_date")
+            .eq("household_id", household_id)
+            .eq("month_year", month_year)
+            .execute()
+        )
+    except Exception as e:
+        print(f"Error fetching income suppressions for {month_year}: {e}")
+        return {}
+    out: dict[str, set[str]] = {}
+    for row in response.data or []:
+        stream_id = str(row.get("stream_id") or "")
+        payment_date = str(row.get("payment_date") or "")[:10]
+        if stream_id and payment_date:
+            out.setdefault(stream_id, set()).add(payment_date)
+    return out
+
+
+def _record_income_occurrence_suppression(
+    *,
+    household_id,
+    stream_id,
+    month_year,
+    payment_date,
+) -> None:
+    """Remember that a stream paycheck was intentionally removed for this month."""
+    date_str = str(payment_date or "")[:10]
+    if not (household_id and stream_id and month_year and date_str):
+        return
+    table = get_income_suppressions_table()
+    try:
+        supabase.table(table).upsert(
+            {
+                "household_id": household_id,
+                "stream_id": str(stream_id),
+                "month_year": month_year,
+                "payment_date": date_str,
+            },
+            on_conflict="household_id,stream_id,month_year,payment_date",
+        ).execute()
+    except Exception as e:
+        print(f"Error recording income suppression ({stream_id}, {month_year}, {date_str}): {e}")
+
+
+def _clear_income_suppressions_for_stream(stream_id) -> None:
+    if not stream_id:
+        return
+    table = get_income_suppressions_table()
+    try:
+        supabase.table(table).delete().eq("stream_id", str(stream_id)).execute()
+    except Exception as e:
+        print(f"Error clearing income suppressions for stream {stream_id}: {e}")
+
+
+def _payment_date_for_income_row(row, stream_id=None) -> str | None:
+    payment_date = row.get("payment_date")
+    if payment_date:
+        if hasattr(payment_date, "isoformat"):
+            return payment_date.isoformat()[:10]
+        return str(payment_date)[:10]
+    month_year = row.get("month_year")
+    if stream_id and month_year:
+        versions = _fetch_stream_versions_raw(stream_id)
+        expected = _expected_income_occurrences(stream_id, versions, month_year)
+        if expected:
+            return expected[0][0].isoformat()
+        return f"{month_year}-01"
+    return None
+
+
 def _parse_iso_date(value) -> date | None:
     if value is None:
         return None
@@ -1080,18 +1200,25 @@ def _materialize_income_occurrence(
     payment_date: date,
     household_id: str,
     existing: dict | None,
+    force: bool = False,
 ) -> bool:
     """Insert/update one paycheck ledger row using a pre-fetched existing row.
 
-    Skips the write entirely when the row is locked or already reflects the
-    current version (idempotent re-materialization).
+    Skips the write when the row is locked or already reflects the current
+    version (idempotent re-materialization). ``force=True`` rewrites the row even
+    when the version id is unchanged, which is required after an in-place version
+    edit (same effective_from, new amount).
     """
     today = datetime.now().date()
     if payment_date > today:
         return False
     if existing and existing.get("is_locked"):
         return False
-    if existing and str(existing.get("version_id") or "") == str(version.get("id") or ""):
+    if (
+        not force
+        and existing
+        and str(existing.get("version_id") or "") == str(version.get("id") or "")
+    ):
         return False
 
     incomes_table = get_budget_table("household_incomes")
@@ -1174,7 +1301,7 @@ def _expected_income_occurrences(stream_id, versions, month_year):
     return [(payment_date, version)]
 
 
-def materialize_income_month(stream_id, month_year, household_id=None) -> bool:
+def materialize_income_month(stream_id, month_year, household_id=None, force=False) -> bool:
     """Create or update ledger rows for each paycheck in month_year.
 
     Idempotent and batched: fetches existing ledger rows for the month in a
@@ -1202,6 +1329,7 @@ def materialize_income_month(stream_id, month_year, household_id=None) -> bool:
         return False
 
     expected = _expected_income_occurrences(stream_id, versions, month_year)
+    suppressed_dates = _fetch_income_suppressions_for_month(house_id, month_year).get(str(stream_id), set())
 
     # Single query: all existing ledger rows for this stream + month.
     existing_res = (
@@ -1222,6 +1350,8 @@ def materialize_income_month(stream_id, month_year, household_id=None) -> bool:
     for payment_date, version in expected:
         date_str = payment_date.isoformat()
         expected_dates.add(date_str)
+        if date_str in suppressed_dates:
+            continue
         if _materialize_income_occurrence(
             stream=stream,
             version=version,
@@ -1229,12 +1359,16 @@ def materialize_income_month(stream_id, month_year, household_id=None) -> bool:
             payment_date=payment_date,
             household_id=house_id,
             existing=existing_by_date.get(date_str),
+            force=force,
         ):
             injected_any = True
 
     # Cleanup stale rows using the already-fetched data (no extra query).
     for date_str, row in existing_by_date.items():
         if row.get("is_locked"):
+            continue
+        if date_str in suppressed_dates:
+            supabase.table(incomes_table).delete().eq("id", row["id"]).execute()
             continue
         if date_str not in expected_dates:
             supabase.table(incomes_table).delete().eq("id", row["id"]).execute()
@@ -1289,10 +1423,10 @@ def _upsert_income_stream_version(
     return version_id
 
 
-def _rematerialize_stream_from_month(stream_id, from_month_year: str, household_id: str) -> None:
+def _rematerialize_stream_from_month(stream_id, from_month_year: str, household_id: str, force: bool = False) -> None:
     """Re-apply versions to unlocked monthly rows at or after from_month_year."""
     incomes_table = get_budget_table("household_incomes")
-    materialize_income_month(stream_id, from_month_year, household_id)
+    materialize_income_month(stream_id, from_month_year, household_id, force=force)
     response = (
         supabase.table(incomes_table)
         .select("month_year")
@@ -1303,7 +1437,7 @@ def _rematerialize_stream_from_month(stream_id, from_month_year: str, household_
     )
     months = sorted({row["month_year"] for row in (response.data or [])})
     for month_year in months:
-        materialize_income_month(stream_id, month_year, household_id)
+        materialize_income_month(stream_id, month_year, household_id, force=force)
 
 
 def schedule_income_change(
@@ -1344,17 +1478,35 @@ def schedule_income_change(
         pay_frequency=freq,
     )
 
-    supabase.table(get_income_streams_table()).update(
-        {"display_name": encrypt_data(source_name), "owner_username": owner_username}
-    ).eq("id", stream_id).execute()
+    # "From effective date forward" means these terms govern everything on or
+    # after effective_from. Remove stale later-dated versions left by previous
+    # edits, otherwise they shadow this change for occurrences after their date.
+    supabase.table(get_income_stream_versions_table()).delete().eq(
+        "stream_id", stream_id
+    ).gt("effective_from", effective_from.isoformat()).execute()
+
+    # Editing a stream "forward" implies it should be live again: clear any
+    # prior end-stream state so re-materialization is not refused as inactive.
+    stream_update = {
+        "display_name": encrypt_data(source_name),
+        "owner_username": owner_username,
+        "is_active": True,
+        "ended_on": None,
+    }
+    supabase.table(get_income_streams_table()).update(stream_update).eq("id", stream_id).execute()
 
     from_month = _month_year_from_date(effective_from)
-    _rematerialize_stream_from_month(stream_id, from_month, household_id)
+    _rematerialize_stream_from_month(stream_id, from_month, household_id, force=True)
     return True
 
 
 def end_income_stream(income_id, end_date=None) -> bool:
-    """Stop future rollover; preserve all monthly ledger rows."""
+    """Stop future rollover and remove the current/future unlocked occurrences.
+
+    Past months (and any locked rows) are preserved as history; the selected
+    income's month and everything after it are cleared so the recurring paycheck
+    visibly stops in the ledger.
+    """
     if not _can_edit_household_income_server_side(income_id):
         return False
     stream_id = ensure_income_stream_for_row(income_id)
@@ -1365,15 +1517,61 @@ def end_income_stream(income_id, end_date=None) -> bool:
     elif isinstance(end_date, str):
         end_date = datetime.strptime(end_date[:10], "%Y-%m-%d").date()
 
+    row = _fetch_household_income_row(income_id)
+    from_month = (row or {}).get("month_year") or end_date.strftime("%Y-%m")
+
     supabase.table(get_income_streams_table()).update(
         {"is_active": False, "ended_on": end_date.isoformat()}
     ).eq("id", stream_id).execute()
+    _clear_income_suppressions_for_stream(stream_id)
+
+    incomes_table = get_budget_table("household_incomes")
+    occ = (
+        supabase.table(incomes_table)
+        .select("id, is_locked")
+        .eq("stream_id", stream_id)
+        .gte("month_year", from_month)
+        .execute()
+    )
+    for occ_row in occ.data or []:
+        if not occ_row.get("is_locked"):
+            delete_household_income(occ_row["id"])
     return True
 
 
 def delete_household_income_month_only(income_id) -> bool:
-    """Remove one monthly ledger row only (does not end the stream)."""
-    return delete_household_income(income_id)
+    """Remove one monthly ledger row only (does not end the stream).
+
+    Records a suppression so auto-materialization does not recreate this paycheck.
+    """
+    if _household_income_is_allowance_linked(income_id):
+        return False
+    if not _can_edit_household_income_server_side(income_id):
+        return False
+
+    row = _fetch_household_income_row(income_id)
+    if not row:
+        return False
+
+    stream_id = row.get("stream_id")
+    if not stream_id:
+        stream_id = ensure_income_stream_for_row(income_id)
+
+    household_id = row.get("household_id")
+    month_year = row.get("month_year")
+    payment_date = _payment_date_for_income_row(row, stream_id=stream_id)
+
+    if not delete_household_income(income_id):
+        return False
+
+    if stream_id and month_year and payment_date:
+        _record_income_occurrence_suppression(
+            household_id=household_id,
+            stream_id=str(stream_id),
+            month_year=month_year,
+            payment_date=payment_date,
+        )
+    return True
 
 
 # ==========================================
@@ -1593,10 +1791,10 @@ def get_expense_stream_projections(
     is_personal_spend: bool = False,
     username: str | None = None,
 ) -> tuple[dict, dict]:
-    """Projected monthly cost and bill-day schedule per category from expense streams.
+    """Bill-day schedule per category from expense streams (for ledger due-date hints).
 
-    Categories present in the returned projections dict should use stream totals
-    instead of static category target_budget values.
+    The projections dict in the return tuple is legacy; category **Projected**
+    columns use target_budget from category management only.
     """
     streams_table = get_expense_streams_table()
     query = (
@@ -1853,21 +2051,8 @@ def sync_category_target_from_stream_monthly(
     household_id: str,
     month_year: str,
 ) -> bool:
-    """Pull stream monthly projection back into category target_budget."""
-    scope = _fetch_category_scope(category_id)
-    if not scope:
-        return False
-    projections, _ = get_expense_stream_projections(
-        household_id,
-        month_year,
-        is_personal_spend=bool(scope.get("is_personal", False)),
-        username=scope.get("username"),
-    )
-    monthly = projections.get(str(category_id))
-    if monthly is None:
-        return False
-    ok = _update_category_target_budget_only(category_id, monthly)
-    return ok
+    """Deprecated: category target_budget is managed only via category edit UI."""
+    return False
 
 
 def _upsert_expense_stream_version(
@@ -2219,8 +2404,6 @@ def schedule_expense_change(
     from_month = _month_year_from_date(effective_from)
     _rematerialize_expense_stream_from_month(stream_id, from_month, household_id, force=True)
     _sync_allowance_for_stream_month(stream_id, from_month, household_id)
-    if row.get("category_id"):
-        sync_category_target_from_stream_monthly(row["category_id"], household_id, from_month)
     return True
 
 
@@ -2274,7 +2457,7 @@ def _sync_allowance_for_stream_month(stream_id, month_year, household_id) -> Non
         supabase.table(expenses_table)
         .select(
             "id, category_id, amount, date_logged, month_year, is_personal_spend, "
-            "is_recurring, pay_frequency"
+            "is_recurring, pay_frequency, details"
         )
         .eq("household_id", household_id)
         .eq("stream_id", stream_id)
@@ -2283,6 +2466,8 @@ def _sync_allowance_for_stream_month(stream_id, month_year, household_id) -> Non
         .execute()
     )
     for row in response.data or []:
+        if is_transfer_allowance_expense_record(row):
+            continue
         category_id = row.get("category_id")
         if not category_id or not is_allowance_subcategory_id(
             category_id, household_id=household_id
@@ -2353,7 +2538,6 @@ def _log_expense_via_stream(
         expense_id = str(response.data[0]["id"])
     else:
         expense_id = None
-    sync_category_target_from_stream_monthly(category_id, household_id, month_year)
     return expense_id
 
 
@@ -2366,10 +2550,10 @@ def get_user_finance_settings(household_id, username):
             data = response.data[0]
             # Decrypt optional future fields if you add them (like personal_savings_goal)
             return data
-        return {"share_budget_with_admin": False, "default_view": "Household"}
+        return {"share_budget_with_admin": False, "default_view": "Household", "show_obligation_transfers_on_personal": False, "integrate_household_on_personal": False}
     except Exception as e:
         print(f"Error fetching finance settings: {e}")
-        return {"share_budget_with_admin": False, "default_view": "Household"}
+        return {"share_budget_with_admin": False, "default_view": "Household", "show_obligation_transfers_on_personal": False, "integrate_household_on_personal": False}
 
 def ensure_household_initialized(household_id):
     """Silent check to inject defaults if the household has no categories."""
@@ -2440,7 +2624,37 @@ def get_household_incomes(household_id, month_year, is_personal_income=False, us
                 if row.get("payment_date") and not isinstance(row.get("payment_date"), str):
                     row["payment_date"] = row["payment_date"].isoformat()
                     
-            return pd.DataFrame(response.data)
+            df = pd.DataFrame(response.data)
+            # When the new transfer-based allowance rows (stream_id IS NULL) exist
+            # alongside old stream-materialized allowance rows (stream_id set), suppress
+            # the stream-based ones so they don't double-count on the personal ledger.
+            if is_personal_income and not df.empty and "stream_id" in df.columns:
+                _dedup_source_names = [ALLOWANCE_INCOME_SOURCE_NAME, OBLIGATION_SUPPORT_INCOME_SOURCE_NAME]
+                mask_these = df["source_name"].isin(_dedup_source_names)
+                if mask_these.any():
+                    for _src in _dedup_source_names:
+                        src_mask = df["source_name"] == _src
+                        has_transfer_row = (src_mask & df["stream_id"].isna()).any()
+                        has_stream_row = (src_mask & df["stream_id"].notna()).any()
+                        if has_transfer_row and has_stream_row:
+                            # Keep only the transfer-based (new-system) rows; drop stream-based ones
+                            df = df[~(src_mask & df["stream_id"].notna())]
+                # Drop expense-mirrored Allowance rows when a disbursement transfer row exists
+                if ALLOWANCE_INCOME_SOURCE_NAME in df["source_name"].values and "source_expense_id" in df.columns:
+                    allow_mask = df["source_name"] == ALLOWANCE_INCOME_SOURCE_NAME
+                    transfer_keys = set()
+                    for _, row in df[allow_mask & df["source_expense_id"].isna()].iterrows():
+                        pay = str(row.get("payment_date") or "")[:10]
+                        transfer_keys.add((row.get("owner_username"), pay))
+                    if transfer_keys:
+                        drop_idx = []
+                        for idx, row in df[allow_mask & df["source_expense_id"].notna()].iterrows():
+                            pay = str(row.get("payment_date") or "")[:10]
+                            if (row.get("owner_username"), pay) in transfer_keys:
+                                drop_idx.append(idx)
+                        if drop_idx:
+                            df = df.drop(drop_idx)
+            return df
         return pd.DataFrame()
     except Exception as e:
         print(f"Error fetching incomes: {e}")
@@ -3080,7 +3294,8 @@ def _fetch_expense_flags(expense_id):
             supabase.table(target_table)
             .select(
                 "is_personal_spend, auth_user_id, household_id, category_id, "
-                "date_logged, month_year, is_recurring, pay_frequency, stream_id"
+                "date_logged, month_year, is_recurring, pay_frequency, stream_id, "
+                "project_budget_id"
             )
             .eq("id", expense_id)
             .limit(1)
@@ -3094,6 +3309,8 @@ def _fetch_expense_flags(expense_id):
 def _can_edit_expense_server_side(expense_id) -> bool:
     record = _fetch_expense_flags(expense_id)
     if not record:
+        return False
+    if is_transfer_allowance_expense_record(record):
         return False
     if record.get("household_id") != get_current_household_id():
         return False
@@ -3378,6 +3595,9 @@ def _sync_allowance_personal_income(
     Recurring allowance → income stream + materialized paycheck rows using the
     household expense pay frequency (monthly, bi-weekly, etc.).
     """
+    if _is_transfer_allowance_expense_id(expense_id):
+        return False
+
     expense_flags = _fetch_expense_flags(expense_id) if expense_id is not None else None
     if is_recurring is None:
         is_recurring = bool(expense_flags and expense_flags.get("is_recurring"))
@@ -3603,7 +3823,7 @@ def _increment_project_actual_from_purchase(
     *,
     product_or_service=None,
 ):
-    """Update a project's lifetime actual_cost and audit notes from a purchase."""
+    """Update a project's lifetime actual_cost from a purchase."""
     house_id = get_current_household_id()
     project_res = (
         supabase.table(PROJECT_BUDGETS_TABLE)
@@ -3621,22 +3841,200 @@ def _increment_project_actual_from_purchase(
     current_actual = decrypt_float(row.get("actual_cost")) or 0.0
     new_actual = current_actual + safe_amount
 
-    existing_notes = decrypt_text(row.get("notes")) or ""
-    cleaned_notes = existing_notes.replace("[COMPLETED]", "").strip() if existing_notes else ""
-    if isinstance(purchase_date, str):
-        purchase_date = datetime.strptime(purchase_date[:10], "%Y-%m-%d").date()
-    product_label = str(product_or_service or "").strip()
-    audit_line = f"[{purchase_date.isoformat()}] Expense logged: ${safe_amount:,.2f}"
-    if product_label:
-        audit_line = f"{audit_line} — {product_label}"
-    new_notes = f"{cleaned_notes}\n{audit_line}".strip() if cleaned_notes else audit_line
-
     if not update_project_budget_item(
         project_id,
-        {"actual_cost": new_actual, "notes": new_notes},
+        {"actual_cost": new_actual},
     ):
         return None
     return decrypt_text(row.get("item")) or "Project"
+
+
+def format_project_purchase_expense_line(purchase_date, amount, product_or_service=None) -> str:
+    """Display line for a project purchase (matches legacy notes audit format)."""
+    if isinstance(purchase_date, str):
+        date_str = purchase_date[:10]
+    elif hasattr(purchase_date, "isoformat"):
+        date_str = purchase_date.isoformat()[:10]
+    else:
+        date_str = str(purchase_date)[:10]
+    line = f"[{date_str}] Expense logged: ${float(amount):,.2f}"
+    product_label = str(product_or_service or "").strip()
+    if product_label:
+        line = f"{line} — {product_label}"
+    return line
+
+
+def strip_expense_audit_lines_from_notes(notes_text) -> str:
+    """Remove purchase audit lines from project notes (now shown on the Expenses row)."""
+    if not notes_text:
+        return ""
+    kept = []
+    for line in str(notes_text).splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and "Expense logged:" in stripped:
+            continue
+        kept.append(line)
+    return "\n".join(kept).strip()
+
+
+def get_project_purchase_expenses(household_id, project_id) -> pd.DataFrame:
+    """Ledger expense rows linked to a project budget item."""
+    expenses_table = get_budget_table("expenses")
+    try:
+        response = (
+            supabase.table(expenses_table)
+            .select("*")
+            .eq("household_id", household_id)
+            .eq("project_budget_id", str(project_id))
+            .order("date_logged")
+            .execute()
+        )
+        if not response.data:
+            return pd.DataFrame()
+        for row in response.data:
+            row["amount"] = decrypt_float(row.get("amount"))
+            row["details"] = decrypt_text(row.get("details"))
+        return pd.DataFrame(response.data)
+    except Exception as e:
+        print(f"Error fetching project purchase expenses for {project_id}: {e}")
+        return pd.DataFrame()
+
+
+def _project_expense_product_from_details(details, project_name) -> str:
+    details_text = str(details or "").strip()
+    project_prefix = f"{project_name} — "
+    if details_text.startswith(project_prefix):
+        return details_text[len(project_prefix):].strip()
+    if " — " in details_text:
+        return details_text.split(" — ", 1)[1].strip()
+    if details_text.endswith(" — project purchase"):
+        return ""
+    return details_text
+
+
+def _reconcile_project_actual_cost(project_id) -> bool:
+    """Set project actual_cost to the sum of linked ledger expenses."""
+    house_id = get_current_household_id()
+    expenses_df = get_project_purchase_expenses(house_id, project_id)
+    total = float(expenses_df["amount"].sum()) if not expenses_df.empty else 0.0
+    return update_project_budget_item(project_id, {"actual_cost": round(total, 2)})
+
+
+def parse_project_purchase_expense_line(line: str) -> dict | None:
+    """Parse a display/legacy audit line into structured purchase data."""
+    text = (line or "").strip()
+    if not text.startswith("[") or "Expense logged:" not in text:
+        return None
+    try:
+        close_idx = text.index("]")
+        date_str = text[1:close_idx]
+        rest = text[close_idx + 1 :].strip()
+        if not rest.startswith("Expense logged:"):
+            return None
+        rest = rest[len("Expense logged:") :].strip()
+        product = ""
+        if " — " in rest:
+            amount_text, product = rest.split(" — ", 1)
+            product = product.strip()
+        else:
+            amount_text = rest
+        amount = float(str(amount_text).strip().lstrip("$").replace(",", ""))
+        display = format_project_purchase_expense_line(date_str, amount, product)
+        return {
+            "date": date_str,
+            "amount": amount,
+            "product": product,
+            "display": display,
+        }
+    except (ValueError, IndexError):
+        return None
+
+
+def get_project_purchase_expense_entries(
+    household_id,
+    project_id,
+    legacy_notes=None,
+) -> list[dict]:
+    """Ledger purchases plus legacy note audit lines (deduped, chronological)."""
+    entries: list[dict] = []
+    seen_display: set[str] = set()
+
+    expenses_df = get_project_purchase_expenses(household_id, project_id)
+    project_name = ""
+    if not expenses_df.empty:
+        try:
+            project_res = (
+                supabase.table(PROJECT_BUDGETS_TABLE)
+                .select("item")
+                .eq("id", str(project_id))
+                .eq("household_id", household_id)
+                .limit(1)
+                .execute()
+            )
+            if project_res.data:
+                project_name = decrypt_text(project_res.data[0].get("item")) or ""
+        except Exception:
+            project_name = ""
+
+    if not expenses_df.empty:
+        for _, row in expenses_df.iterrows():
+            date_str = str(row.get("date_logged") or "")[:10]
+            amt = float(row.get("amount") or 0)
+            product = _project_expense_product_from_details(row.get("details"), project_name)
+            display = format_project_purchase_expense_line(date_str, amt, product)
+            if display in seen_display:
+                continue
+            seen_display.add(display)
+            entries.append(
+                {
+                    "date": date_str,
+                    "amount": amt,
+                    "product": product,
+                    "display": display,
+                    "is_legacy": False,
+                    "expense_id": row.get("id"),
+                }
+            )
+
+    if legacy_notes:
+        for line in str(legacy_notes).splitlines():
+            parsed = parse_project_purchase_expense_line(line)
+            if not parsed or parsed["display"] in seen_display:
+                continue
+            seen_display.add(parsed["display"])
+            entries.append(
+                {
+                    **parsed,
+                    "is_legacy": True,
+                    "expense_id": None,
+                }
+            )
+
+    entries.sort(key=lambda entry: entry.get("date") or "")
+    return entries
+
+
+def get_project_purchase_expense_lines(household_id, project_id, legacy_notes=None) -> list[str]:
+    """Purchase lines for a project from ledger rows plus legacy notes audit entries."""
+    return [
+        entry["display"]
+        for entry in get_project_purchase_expense_entries(
+            household_id, project_id, legacy_notes=legacy_notes
+        )
+    ]
+
+
+def sum_project_purchase_expenses_for_year(entries: list[dict], year) -> float:
+    """Sum purchase amounts whose date falls in the given calendar year."""
+    year_prefix = f"{int(year)}-"
+    return round(
+        sum(
+            float(entry.get("amount") or 0)
+            for entry in entries
+            if str(entry.get("date") or "").startswith(year_prefix)
+        ),
+        2,
+    )
 
 
 def ensure_project_expense_category(household_id):
@@ -3761,7 +4159,7 @@ def repair_allowance_income_links(household_id) -> int:
             supabase.table(target_expenses)
             .select(
                 "id, category_id, amount, date_logged, month_year, is_personal_spend, "
-                "is_recurring, pay_frequency"
+                "is_recurring, pay_frequency, details"
             )
             .eq("household_id", household_id)
             .eq("is_personal_spend", False)
@@ -3803,6 +4201,8 @@ def repair_allowance_income_links(household_id) -> int:
 
         repaired = 0
         for row in expense_rows:
+            if is_transfer_allowance_expense_record(row):
+                continue
             category_id = row.get("category_id")
             recipient = allowance_recipient_by_cat.get(category_id) if category_id else None
             if not recipient:
@@ -3907,6 +4307,94 @@ def add_project_purchase_expense(project_id, purchase_date, amount, product_or_s
         return True
     except Exception as e:
         print(f"Error adding project purchase expense: {e}")
+        return False
+
+
+def update_project_purchase_expense(
+    expense_id,
+    purchase_date,
+    amount,
+    product_or_service=None,
+) -> bool:
+    """Update a project-linked purchase and reconcile the project's actual_cost."""
+    if not _can_edit_projects_server_side():
+        return False
+    expenses_table = get_budget_table("expenses")
+    try:
+        response = (
+            supabase.table(expenses_table)
+            .select("*")
+            .eq("id", expense_id)
+            .limit(1)
+            .execute()
+        )
+        if not response.data:
+            return False
+        row = response.data[0]
+        project_id = row.get("project_budget_id")
+        if not project_id or str(row.get("household_id")) != str(get_current_household_id()):
+            return False
+
+        project_res = (
+            supabase.table(PROJECT_BUDGETS_TABLE)
+            .select("item")
+            .eq("id", str(project_id))
+            .eq("household_id", row.get("household_id"))
+            .limit(1)
+            .execute()
+        )
+        if not project_res.data:
+            return False
+        project_name = decrypt_text(project_res.data[0].get("item")) or "Project"
+
+        if isinstance(purchase_date, str):
+            purchase_date = datetime.strptime(purchase_date[:10], "%Y-%m-%d").date()
+        safe_amount = float(amount)
+        product_label = str(product_or_service or "").strip()
+        details = (
+            f"{project_name} — {product_label}"
+            if product_label
+            else f"{project_name} — project purchase"
+        )
+        supabase.table(expenses_table).update(
+            {
+                "amount": encrypt_data(safe_amount),
+                "details": encrypt_data(details),
+                "date_logged": purchase_date.isoformat(),
+                "month_year": purchase_date.strftime("%Y-%m"),
+                "is_recurring": False,
+                "pay_frequency": "one_time",
+            }
+        ).eq("id", expense_id).execute()
+        return _reconcile_project_actual_cost(str(project_id))
+    except Exception as e:
+        print(f"Error updating project purchase expense {expense_id}: {e}")
+        return False
+
+
+def delete_project_purchase_expense(expense_id) -> bool:
+    """Delete a project-linked purchase and reconcile the project's actual_cost."""
+    if not _can_edit_projects_server_side():
+        return False
+    expenses_table = get_budget_table("expenses")
+    try:
+        response = (
+            supabase.table(expenses_table)
+            .select("household_id, project_budget_id")
+            .eq("id", expense_id)
+            .limit(1)
+            .execute()
+        )
+        if not response.data:
+            return False
+        row = response.data[0]
+        project_id = row.get("project_budget_id")
+        if not project_id or str(row.get("household_id")) != str(get_current_household_id()):
+            return False
+        supabase.table(expenses_table).delete().eq("id", expense_id).execute()
+        return _reconcile_project_actual_cost(str(project_id))
+    except Exception as e:
+        print(f"Error deleting project purchase expense {expense_id}: {e}")
         return False
 
 
@@ -4651,6 +5139,7 @@ def delete_expense(expense_id):
         and is_allowance_subcategory_id(
             record["category_id"], household_id=record.get("household_id")
         )
+        and not is_transfer_allowance_expense_record(record)
     ):
         _delete_allowance_income_for_expense(expense_id)
     target_table = get_budget_table("expenses")
@@ -4975,6 +5464,7 @@ def _rollover_income_streams(household_id, selected_month) -> bool:
                 str(row.get("payment_date") or "")[:10]
             ] = row
 
+        suppressions_by_stream = _fetch_income_suppressions_for_month(household_id, selected_month)
         injected_any = False
         for stream in streams:
             sid = str(stream["id"])
@@ -4983,10 +5473,13 @@ def _rollover_income_streams(household_id, selected_month) -> bool:
                 continue
             expected = _expected_income_occurrences(sid, versions, selected_month)
             existing_by_date = existing_by_stream.get(sid, {})
+            suppressed_dates = suppressions_by_stream.get(sid, set())
             expected_dates: set[str] = set()
             for payment_date, version in expected:
                 ds = payment_date.isoformat()
                 expected_dates.add(ds)
+                if ds in suppressed_dates:
+                    continue
                 if _materialize_income_occurrence(
                     stream=stream,
                     version=version,
@@ -4998,6 +5491,9 @@ def _rollover_income_streams(household_id, selected_month) -> bool:
                     injected_any = True
             for ds, row in existing_by_date.items():
                 if row.get("is_locked"):
+                    continue
+                if ds in suppressed_dates:
+                    supabase.table(incomes_table).delete().eq("id", row["id"]).execute()
                     continue
                 if ds not in expected_dates:
                     supabase.table(incomes_table).delete().eq("id", row["id"]).execute()
@@ -5172,3 +5668,2214 @@ def get_recurring_schedule(household_id, month_year, is_personal=False, username
     except Exception as e:
         print(f"Error fetching recurring schedule: {e}")
         return {}
+
+
+# ==========================================
+# HOUSEHOLD OBLIGATION ASSIGNMENTS & SUPPLEMENTS
+# ==========================================
+
+
+def get_obligation_assignments_table():
+    return get_budget_table("household_obligation_assignments")
+
+
+def get_supplement_snapshots_table():
+    return get_budget_table("household_supplement_snapshots")
+
+
+def get_disbursement_settings_table():
+    return get_budget_table("household_disbursement_settings")
+
+
+def _decrypt_obligation_assignment(row: dict) -> dict:
+    out = dict(row)
+    if out.get("parent_category_name"):
+        out["parent_category_name"] = decrypt_text(out["parent_category_name"])
+    if out.get("label"):
+        out["label"] = decrypt_text(out["label"])
+    if out.get("category_id"):
+        out["category_id"] = str(out["category_id"])
+    return out
+
+
+def get_obligation_assignments(household_id):
+    if not household_id:
+        return []
+    try:
+        response = (
+            supabase.table(get_obligation_assignments_table())
+            .select("*")
+            .eq("household_id", household_id)
+            .eq("is_active", True)
+            .execute()
+        )
+        return [_decrypt_obligation_assignment(row) for row in (response.data or [])]
+    except Exception as e:
+        print(f"Error fetching obligation assignments: {e}")
+        return []
+
+
+def _deactivate_obligation_assignments(household_id, *, assignment_level, parent_category_name=None, category_id=None):
+    table = get_obligation_assignments_table()
+    query = (
+        supabase.table(table)
+        .update({"is_active": False, "updated_at": datetime.now(ZoneInfo("America/Chicago")).isoformat()})
+        .eq("household_id", household_id)
+        .eq("assignment_level", assignment_level)
+        .eq("is_active", True)
+    )
+    if parent_category_name is not None:
+        query = query.eq("parent_category_name", encrypt_data(parent_category_name))
+    if category_id is not None:
+        query = query.eq("category_id", category_id)
+    query.execute()
+
+
+def upsert_parent_assignment(household_id, parent_category_name, member_username) -> bool:
+    if not _can_edit_monthly_budget_server_side():
+        return False
+    parent = (parent_category_name or "").strip()
+    member = (member_username or "").strip()
+    if not parent or not member:
+        return False
+    try:
+        _deactivate_obligation_assignments(
+            household_id, assignment_level="parent", parent_category_name=parent
+        )
+        now = datetime.now(ZoneInfo("America/Chicago")).isoformat()
+        supabase.table(get_obligation_assignments_table()).insert(
+            {
+                "household_id": household_id,
+                "member_username": member,
+                "parent_category_name": encrypt_data(parent),
+                "category_id": None,
+                "assignment_level": "parent",
+                "label": None,
+                "is_active": True,
+                "created_at": now,
+                "updated_at": now,
+            }
+        ).execute()
+        return True
+    except Exception as e:
+        print(f"Error upserting parent assignment: {e}")
+        return False
+
+
+def clear_parent_assignment(household_id, parent_category_name) -> bool:
+    if not _can_edit_monthly_budget_server_side():
+        return False
+    try:
+        _deactivate_obligation_assignments(
+            household_id,
+            assignment_level="parent",
+            parent_category_name=(parent_category_name or "").strip(),
+        )
+        return True
+    except Exception as e:
+        print(f"Error clearing parent assignment: {e}")
+        return False
+
+
+def upsert_subcategory_override(household_id, category_id, member_username) -> bool:
+    if not _can_edit_monthly_budget_server_side():
+        return False
+    member = (member_username or "").strip()
+    if not category_id or not member:
+        return False
+    try:
+        _deactivate_obligation_assignments(
+            household_id, assignment_level="subcategory", category_id=str(category_id)
+        )
+        now = datetime.now(ZoneInfo("America/Chicago")).isoformat()
+        supabase.table(get_obligation_assignments_table()).insert(
+            {
+                "household_id": household_id,
+                "member_username": member,
+                "parent_category_name": None,
+                "category_id": str(category_id),
+                "assignment_level": "subcategory",
+                "label": None,
+                "is_active": True,
+                "created_at": now,
+                "updated_at": now,
+            }
+        ).execute()
+        return True
+    except Exception as e:
+        print(f"Error upserting subcategory override: {e}")
+        return False
+
+
+def clear_subcategory_override(household_id, category_id) -> bool:
+    if not _can_edit_monthly_budget_server_side():
+        return False
+    try:
+        _deactivate_obligation_assignments(
+            household_id, assignment_level="subcategory", category_id=str(category_id)
+        )
+        return True
+    except Exception as e:
+        print(f"Error clearing subcategory override: {e}")
+        return False
+
+
+def _income_row_allowance_linked(row) -> bool:
+    val = row.get("source_expense_id")
+    if val is None:
+        return False
+    text = str(val).strip().lower()
+    return text not in ("", "none", "nan")
+
+
+def _username_key(value) -> str:
+    text = str(value or "").strip().lower()
+    if text in ("", "none", "nan", "unassigned"):
+        return ""
+    return text
+
+
+def _income_row_stream_id(row) -> str:
+    sid = row.get("stream_id")
+    if sid is None or (isinstance(sid, float) and pd.isna(sid)):
+        return ""
+    text = str(sid).strip()
+    if text.lower() in ("", "none", "nan"):
+        return ""
+    return text
+
+
+def _fetch_household_income_stream_owners(household_id) -> dict[str, str]:
+    """Map stream_id -> owner_username for active household income streams."""
+    try:
+        response = (
+            supabase.table(get_income_streams_table())
+            .select("id, owner_username")
+            .eq("household_id", household_id)
+            .eq("is_personal_income", False)
+            .eq("is_active", True)
+            .execute()
+        )
+        return {
+            str(row["id"]): row.get("owner_username")
+            for row in (response.data or [])
+            if row.get("id")
+        }
+    except Exception as e:
+        print(f"Error fetching income stream owners: {e}")
+        return {}
+
+
+def _member_recurring_take_home_from_streams(
+    household_id,
+    member_key: str,
+    month_year: str,
+    member_stream_ids: list[str],
+    *,
+    obligation_pay_only: bool = False,
+) -> float:
+    """One normalized monthly take-home per active recurring stream for this member."""
+    if not member_stream_ids:
+        return 0.0
+
+    try:
+        versions_res = (
+            supabase.table(get_income_stream_versions_table())
+            .select("*")
+            .in_("stream_id", member_stream_ids)
+            .order("effective_from", desc=False)
+            .execute()
+        )
+    except Exception as e:
+        print(f"Error fetching income stream versions: {e}")
+        return 0.0
+
+    versions_by_stream: dict[str, list] = {}
+    for version in versions_res.data or []:
+        versions_by_stream.setdefault(str(version["stream_id"]), []).append(version)
+
+    year, month = map(int, month_year.split("-"))
+    _, last_day = calendar.monthrange(year, month)
+    month_end = date(year, month, last_day)
+
+    total = 0.0
+    for stream_id in member_stream_ids:
+        versions = versions_by_stream.get(stream_id) or []
+        if not versions:
+            continue
+        version = resolve_version_at_date(versions, month_end)
+        if not version:
+            version = resolve_version_at_date(versions, date(year, month, 1))
+        if not version:
+            continue
+        effective_from = _parse_iso_date(version.get("effective_from"))
+        if effective_from and _month_year_from_date(effective_from) > month_year:
+            continue
+        take_home = decrypt_float(version.get("take_home_amount"))
+        freq = normalize_income_pay_frequency(version.get("pay_frequency") or "monthly")
+        if obligation_pay_only and not _freq_is_obligation_regular_pay(freq):
+            continue
+        monthly = normalize_income_amount_for_month(
+            take_home, freq, month_year=month_year
+        )
+        total += monthly
+    return total
+
+
+def _member_household_take_home(household_id, member_username, month_year) -> float:
+    """Regular monthly take-home for one member (matches Cash Flow paycheck rows).
+
+    Uses ledger rows for regular paycheck frequencies (monthly, school-year, bi-weekly,
+    etc.) assigned to the member. Annual/quarterly/one-time entries are excluded from
+    obligation math. Falls back to configured streams when no ledger rows exist yet.
+    """
+    member_key = _username_key(member_username)
+    if not member_key:
+        return 0.0
+
+    incomes_df = get_household_incomes(household_id, month_year, is_personal_income=False)
+    obligation_rows = []
+    if incomes_df is not None and not incomes_df.empty:
+        for _, row in incomes_df.iterrows():
+            if _income_row_allowance_linked(row):
+                continue
+            if _username_key(row.get("owner_username")) != member_key:
+                continue
+            if not _freq_is_obligation_regular_pay(_income_row_frequency(row)):
+                continue
+            obligation_rows.append(row)
+
+    if obligation_rows:
+        return sum_income_for_month(pd.DataFrame(obligation_rows), month_year)
+
+    stream_owners = _fetch_household_income_stream_owners(household_id)
+    member_stream_ids = [
+        sid for sid, owner in stream_owners.items() if _username_key(owner) == member_key
+    ]
+    return _member_recurring_take_home_from_streams(
+        household_id,
+        member_key,
+        month_year,
+        member_stream_ids,
+        obligation_pay_only=True,
+    )
+
+
+def _member_allowance_logged(household_id, member_username, month_year, category_rows) -> float:
+    cat_id = find_allowance_category_id(category_rows, member_username)
+    if not cat_id:
+        return 0.0
+    expenses_df = get_monthly_expenses(household_id, month_year, include_private_members=True)
+    if expenses_df is None or expenses_df.empty:
+        return 0.0
+    allowance_rows = expenses_df[expenses_df["category_id"].astype(str) == str(cat_id)]
+    if allowance_rows.empty:
+        return 0.0
+    return float(allowance_rows["amount"].sum())
+
+
+def _member_recurring_allowance_amount(household_id, member_username, category_rows) -> float:
+    """Configured monthly amount on the member's recurring Allowance expense stream."""
+    cat_id = find_allowance_category_id(category_rows, member_username)
+    if not cat_id:
+        return 0.0
+    existing = _find_recurring_allowance_expense(household_id, cat_id)
+    if not existing or not existing.get("stream_id"):
+        return 0.0
+    versions = get_expense_stream_versions(existing["stream_id"])
+    if not versions:
+        return 0.0
+    version = resolve_version_at_date(versions, date.today())
+    if not version:
+        version = versions[0]
+    if version.get("amount") is None:
+        return 0.0
+    return float(decrypt_float(version.get("amount")))
+
+
+def compute_household_obligations(household_id, month_year):
+    categories_df = get_budget_categories(household_id, is_personal=False)
+    if categories_df is None or categories_df.empty:
+        return {
+            "lines": [],
+            "displacement": reconcile_displacement([]),
+            "parent_summaries": [],
+            "by_member": {},
+            "assignments": [],
+        }
+
+    category_rows = [
+        row.to_dict() for _, row in categories_df.iterrows() if is_assignable_household_category(row)
+    ]
+    assignments = get_obligation_assignments(household_id)
+    parent_map, override_map = build_assignment_maps(assignments)
+    lines = resolve_obligation_lines(category_rows, parent_map, override_map)
+    displacement = reconcile_displacement(lines)
+    parent_summaries = build_parent_summaries(lines, parent_map)
+    obligation_totals = aggregate_member_obligations(lines)
+
+    members = set(obligation_totals.keys())
+    for row in assignments:
+        member = (row.get("member_username") or "").strip()
+        if member:
+            members.add(member)
+
+    by_member = {}
+    for member in sorted(members):
+        total_obligation = round(obligation_totals.get(member, 0.0), 2)
+        take_home = round(_member_household_take_home(household_id, member, month_year), 2)
+        gap = round(compute_supplement_gap(total_obligation, take_home), 2)
+        allowance_logged = round(
+            _member_allowance_logged(household_id, member, month_year, category_rows), 2
+        )
+        recurring_allowance = round(
+            _member_recurring_allowance_amount(household_id, member, category_rows), 2
+        )
+        if recurring_allowance <= 0 and allowance_logged > 0:
+            recurring_allowance = allowance_logged
+        coverage = compute_allowance_coverage(
+            total_obligation, take_home, recurring_allowance
+        )
+        member_lines = [line for line in lines if line.get("member_username") == member]
+        by_member[member] = {
+            "total_obligation": total_obligation,
+            "member_take_home": take_home,
+            "supplement_gap": gap,
+            "allowance_logged": allowance_logged,
+            "current_recurring_allowance": coverage["current_recurring_allowance"],
+            "target_recurring_allowance": coverage["target_recurring_allowance"],
+            "total_available": coverage["total_available"],
+            "shortfall": coverage["shortfall"],
+            "allowance_adjustment": coverage["allowance_adjustment"],
+            "is_covered": coverage["is_covered"],
+            "needs_allowance_update": coverage["needs_allowance_update"],
+            "recommended_allowance": coverage["target_recurring_allowance"],
+            "obligation_lines": member_lines,
+            "warnings": [],
+        }
+        if total_obligation > 0 and take_home == 0 and recurring_allowance <= 0:
+            by_member[member]["warnings"].append(
+                f"No household income found for '{member}' — verify the Earner "
+                "on Cash Flow & Treasury income matches this username."
+            )
+        if coverage["needs_allowance_update"] and coverage["target_recurring_allowance"] > 0:
+            cur = coverage["current_recurring_allowance"]
+            tgt = coverage["target_recurring_allowance"]
+            by_member[member]["warnings"].append(
+                f"Recurring Allowance is ${cur:,.2f}; set to ${tgt:,.2f} to cover assigned obligations."
+            )
+
+    return {
+        "lines": lines,
+        "displacement": displacement,
+        "parent_summaries": parent_summaries,
+        "by_member": by_member,
+        "assignments": assignments,
+    }
+
+
+def _total_household_regular_income(household_id, month_year) -> float:
+    users = _fetch_household_users_cached(household_id) or []
+    total = 0.0
+    for row in users:
+        username = row.get("username")
+        if username:
+            total += _member_household_take_home(household_id, username, month_year)
+    return round(total, 2)
+
+
+def get_household_income_stream_options(household_id) -> list[dict]:
+    """Active household income streams for disbursement funding picker."""
+    try:
+        response = (
+            supabase.table(get_income_streams_table())
+            .select("id, owner_username, display_name, is_active")
+            .eq("household_id", household_id)
+            .eq("is_personal_income", False)
+            .eq("is_active", True)
+            .execute()
+        )
+        options = []
+        for row in response.data or []:
+            versions = get_income_stream_versions(str(row["id"]))
+            if not versions:
+                continue
+            version = resolve_version_at_date(versions, date.today()) or versions[-1]
+            freq = normalize_income_pay_frequency(version.get("pay_frequency") or "monthly")
+            label_name = decrypt_text(row.get("display_name")) if row.get("display_name") else "Income"
+            owner = row.get("owner_username") or "—"
+            options.append(
+                {
+                    "stream_id": str(row["id"]),
+                    "owner_username": owner,
+                    "label": f"{label_name} ({owner}) · {income_pay_frequency_label(freq)}",
+                    "pay_frequency": freq,
+                }
+            )
+        return sorted(options, key=lambda item: item.get("label") or "")
+    except Exception as e:
+        print(f"Error listing income streams: {e}")
+        return []
+
+
+def get_disbursement_settings(household_id) -> dict:
+    if not household_id:
+        return {}
+    try:
+        response = (
+            supabase.table(get_disbursement_settings_table())
+            .select("*")
+            .eq("household_id", household_id)
+            .limit(1)
+            .execute()
+        )
+        return response.data[0] if response.data else {}
+    except Exception as e:
+        print(f"Error fetching disbursement settings: {e}")
+        return {}
+
+
+def upsert_disbursement_settings(household_id, funding_income_stream_id) -> bool:
+    if not _can_edit_monthly_budget_server_side():
+        return False
+    stream_id = str(funding_income_stream_id).strip() if funding_income_stream_id else None
+    if stream_id in ("", "none", "None"):
+        stream_id = None
+    try:
+        existing = get_disbursement_settings(household_id)
+        payload = {
+            "household_id": household_id,
+            "funding_income_stream_id": stream_id,
+            "updated_at": datetime.now(ZoneInfo("America/Chicago")).isoformat(),
+            "updated_by": st.session_state.get("username"),
+        }
+        if existing.get("id"):
+            supabase.table(get_disbursement_settings_table()).update(payload).eq(
+                "id", existing["id"]
+            ).execute()
+        else:
+            supabase.table(get_disbursement_settings_table()).insert(payload).execute()
+        return True
+    except Exception as e:
+        print(f"Error saving disbursement settings: {e}")
+        return False
+
+
+def get_member_disbursement_streams_table():
+    return get_budget_table("user_disbursement_funding_streams")
+
+
+def get_member_funding_streams(household_id, username) -> list[str]:
+    """Return all disbursement funding stream_ids selected by a member."""
+    try:
+        rows = (
+            supabase.table(get_member_disbursement_streams_table())
+            .select("stream_id")
+            .eq("household_id", household_id)
+            .eq("username", username)
+            .execute()
+        ).data or []
+        return [str(r["stream_id"]) for r in rows if r.get("stream_id")]
+    except Exception as e:
+        print(f"Error fetching funding streams for {username}: {e}")
+        return []
+
+
+def set_member_funding_streams(household_id, username, stream_ids: list[str]) -> bool:
+    """Replace the full set of funding streams for a member (delete + insert)."""
+    if not _can_edit_monthly_budget_server_side():
+        return False
+    table = get_member_disbursement_streams_table()
+    try:
+        supabase.table(table).delete().eq("household_id", household_id).eq("username", username).execute()
+        for sid in stream_ids or []:
+            safe = str(sid).strip()
+            if safe:
+                supabase.table(table).insert({
+                    "household_id": household_id,
+                    "username": username,
+                    "stream_id": safe,
+                }).execute()
+        return True
+    except Exception as e:
+        print(f"Error setting funding streams for {username}: {e}")
+        return False
+
+
+# Keep the singular helpers as thin wrappers for backward compat.
+def get_member_funding_stream(household_id, username) -> str | None:
+    streams = get_member_funding_streams(household_id, username)
+    return streams[0] if streams else None
+
+
+def set_member_funding_stream(household_id, username, stream_id) -> bool:
+    ids = [str(stream_id)] if stream_id else []
+    return set_member_funding_streams(household_id, username, ids)
+
+
+def _fetch_stream_info(stream_id: str) -> dict:
+    """Return label and owner for a single income stream."""
+    try:
+        stream_res = (
+            supabase.table(get_income_streams_table())
+            .select("id, owner_username, display_name")
+            .eq("id", stream_id)
+            .limit(1)
+            .execute()
+        )
+        if not stream_res.data:
+            return {}
+        row = stream_res.data[0]
+        label = decrypt_text(row.get("display_name")) if row.get("display_name") else None
+        return {
+            "stream_id": stream_id,
+            "owner_username": row.get("owner_username"),
+            "label": label,
+        }
+    except Exception as e:
+        print(f"Error fetching stream info for {stream_id}: {e}")
+        return {}
+
+
+def _stream_pay_dates_for_month(stream_id: str, month_year: str) -> tuple[list[date], str]:
+    """Return (sorted pay_dates, normalized_frequency) for one stream in month_year."""
+    try:
+        versions = get_income_stream_versions(stream_id)
+        if not versions:
+            return [], "monthly"
+        occurrences = paycheck_occurrences_in_month(versions, month_year)
+        pay_dates = sorted(occ["payment_date"] for occ in occurrences)
+        version = resolve_version_at_date(versions, date.today()) or versions[-1]
+        freq = normalize_income_pay_frequency(version.get("pay_frequency") or "monthly")
+        return pay_dates, freq
+    except Exception as e:
+        print(f"Error getting pay dates for stream {stream_id}: {e}")
+        return [], "monthly"
+
+
+def _member_combined_pay_dates(household_id: str, username: str, month_year: str) -> tuple[list[tuple], list[dict]]:
+    """Collect all paycheck occurrences across a member's selected funding streams.
+
+    Returns (occurrences, stream_details) where occurrences is a list of
+    (pay_date, stream_id) tuples sorted by date. Each paycheck occurrence from every
+    stream is counted separately — two streams landing on the same calendar date
+    produce two occurrences. Total paycheck count = len(occurrences).
+    """
+    stream_ids = get_member_funding_streams(household_id, username)
+    if not stream_ids:
+        return [], []
+
+    occurrences: list[tuple] = []
+    stream_details: list[dict] = []
+
+    for sid in stream_ids:
+        info = _fetch_stream_info(sid)
+        pay_dates, freq = _stream_pay_dates_for_month(sid, month_year)
+        for d in pay_dates:
+            occurrences.append((d, sid))
+        stream_details.append({
+            "stream_id": sid,
+            "label": info.get("label") or sid,
+            "frequency": freq,
+            "paycheck_count": len(pay_dates),
+        })
+
+    occurrences.sort(key=lambda x: x[0])
+    return occurrences, stream_details
+
+
+def compute_household_disbursement_plan(household_id, month_year) -> dict:
+    """Transfer needs, admin/dev surplus split, and per-member paycheck schedule.
+
+    Each member's bundle (obligation gap + surplus share) is split across that
+    member's own funding income stream paychecks for the month.
+    """
+    obligations = compute_household_obligations(household_id, month_year)
+    by_member = obligations.get("by_member") or {}
+    displacement = obligations.get("displacement") or {}
+
+    users = _fetch_household_users_cached(household_id) or []
+    eligible = filter_disbursement_eligible_usernames(users)
+
+    member_transfer_needs = compute_member_transfer_needs(by_member)
+    total_regular_income = _total_household_regular_income(household_id, month_year)
+    total_assigned = float(displacement.get("total_assigned") or 0)
+    surplus_pool = compute_surplus_pool(total_regular_income, total_assigned)
+    surplus_shares = compute_surplus_shares(surplus_pool, eligible)
+    monthly_summary = summarize_monthly_disbursement(member_transfer_needs, surplus_shares)
+    member_bundled_amounts = compute_member_bundled_amounts(member_transfer_needs, surplus_shares)
+
+    per_member_monthly: dict[str, float] = {
+        m: round(bundle["total_amount"], 2)
+        for m, bundle in member_bundled_amounts.items()
+    }
+
+    # ── Per-member paycheck schedule ──────────────────────────────────────
+    # Each (pay_date, stream_id) occurrence is a separate schedule slot so that
+    # two streams landing on the same date produce distinct transfer rows.
+    # Keys: f"{pay_date}|{stream_id}" — sorted by date when building final list.
+
+    # Pre-fetch every unique stream once to avoid repeated socket calls when
+    # multiple members share the same funding stream.
+    all_stream_ids: set[str] = set()
+    member_stream_ids: dict[str, list[str]] = {}
+    for member in member_bundled_amounts:
+        sids = get_member_funding_streams(household_id, member)
+        member_stream_ids[member] = sids
+        all_stream_ids.update(sids)
+
+    stream_info_cache: dict[str, dict] = {sid: _fetch_stream_info(sid) for sid in all_stream_ids}
+    stream_dates_cache: dict[str, tuple] = {
+        sid: _stream_pay_dates_for_month(sid, month_year) for sid in all_stream_ids
+    }
+
+    schedule_by_slot: dict[str, dict] = {}
+    per_member_stream_info: dict[str, dict] = {}
+
+    for member, bundle in member_bundled_amounts.items():
+        sids = member_stream_ids.get(member) or []
+        occurrences: list[tuple] = []
+        stream_details: list[dict] = []
+
+        for sid in sids:
+            info = stream_info_cache.get(sid) or {}
+            pay_dates, freq = stream_dates_cache.get(sid) or ([], "monthly")
+            for d in pay_dates:
+                occurrences.append((d, sid))
+            stream_details.append({
+                "stream_id": sid,
+                "label": info.get("label") or sid,
+                "frequency": freq,
+                "paycheck_count": len(pay_dates),
+            })
+
+        occurrences.sort(key=lambda x: x[0])
+        paycheck_count = len(occurrences)
+
+        stream_label_map = {s["stream_id"]: s["label"] for s in stream_details}
+        per_member_stream_info[member] = {
+            "stream_ids": [s["stream_id"] for s in stream_details],
+            "streams": stream_details,
+            "paycheck_count": paycheck_count,
+            "display": " + ".join(s["label"] for s in stream_details) if stream_details else "",
+        }
+
+        if not occurrences:
+            continue
+
+        for pay_date_val, stream_id in occurrences:
+            pay_date_str = pay_date_val.isoformat() if hasattr(pay_date_val, "isoformat") else str(pay_date_val)[:10]
+            slot_key = f"{pay_date_str}|{stream_id or ''}"
+            if slot_key not in schedule_by_slot:
+                schedule_by_slot[slot_key] = {
+                    "payment_date": pay_date_str,
+                    "stream_id": stream_id,
+                    "stream_label": stream_label_map.get(stream_id, ""),
+                    "payouts": {},
+                    "total": 0.0,
+                }
+            obl = round(float(bundle["obligation_amount"]) / paycheck_count, 2)
+            allow = round(float(bundle["allowance_amount"]) / paycheck_count, 2)
+            schedule_by_slot[slot_key]["payouts"][member] = {
+                "obligation": obl,
+                "allowance": allow,
+                "total": round(obl + allow, 2),
+            }
+
+    # Sort by pay date, recalculate per-slot totals
+    paycheck_schedule = []
+    for slot_key in sorted(schedule_by_slot, key=lambda k: k.split("|")[0]):
+        entry = schedule_by_slot[slot_key]
+        entry["total"] = round(sum(p["total"] for p in entry["payouts"].values()), 2)
+        paycheck_schedule.append(entry)
+
+    review_flags = disbursement_review_flags(per_member_stream_info)
+
+    saved_transfers = get_member_transfers(household_id, month_year)
+    planned_allowance_total = sum_transfer_allowance_total(saved_transfers)
+    recommended_allowance_total = round(sum((surplus_shares or {}).values()), 2)
+    allowance_surplus_flags = disbursement_allowance_surplus_flags(
+        current_surplus_pool=surplus_pool,
+        planned_allowance_total=planned_allowance_total,
+        recommended_allowance_total=recommended_allowance_total,
+    )
+
+    return {
+        "month_year": month_year,
+        "total_regular_income": total_regular_income,
+        "total_assigned_obligations": round(total_assigned, 2),
+        "surplus_pool": round(surplus_pool, 2),
+        "eligible_members": eligible,
+        "member_transfer_needs": member_transfer_needs,
+        "surplus_shares": surplus_shares,
+        "per_member_monthly": per_member_monthly,
+        "member_bundled_amounts": member_bundled_amounts,
+        "monthly_summary": monthly_summary,
+        "per_member_stream_info": per_member_stream_info,
+        "paycheck_schedule": paycheck_schedule,
+        "review_flags": review_flags,
+        "allowance_surplus_flags": allowance_surplus_flags,
+        "planned_allowance_total": planned_allowance_total,
+        "recommended_allowance_total": recommended_allowance_total,
+        "obligations": obligations,
+    }
+
+
+def get_disbursement_allowance_surplus_flags(household_id, month_year) -> list[dict]:
+    """Lightweight allowance-vs-surplus check (no paycheck schedule build)."""
+    if not household_id or not month_year:
+        return []
+
+    obligations = compute_household_obligations(household_id, month_year)
+    displacement = obligations.get("displacement") or {}
+    users = _fetch_household_users_cached(household_id) or []
+    eligible = filter_disbursement_eligible_usernames(users)
+
+    total_regular_income = _total_household_regular_income(household_id, month_year)
+    total_assigned = float(displacement.get("total_assigned") or 0)
+    surplus_pool = compute_surplus_pool(total_regular_income, total_assigned)
+    surplus_shares = compute_surplus_shares(surplus_pool, eligible)
+    recommended_allowance_total = round(sum((surplus_shares or {}).values()), 2)
+    planned_allowance_total = sum_transfer_allowance_total(
+        get_member_transfers(household_id, month_year)
+    )
+
+    return disbursement_allowance_surplus_flags(
+        current_surplus_pool=surplus_pool,
+        planned_allowance_total=planned_allowance_total,
+        recommended_allowance_total=recommended_allowance_total,
+    )
+
+
+def record_supplement_snapshot(
+    household_id,
+    month_year,
+    member_username,
+    member_totals: dict,
+    *,
+    displacement_summary=None,
+    applied_to_allowance=False,
+    allowance_expense_id=None,
+) -> bool:
+    if not _can_edit_monthly_budget_server_side():
+        return False
+    try:
+        payload = {
+            "household_id": household_id,
+            "month_year": month_year,
+            "member_username": member_username,
+            "total_obligation": encrypt_data(member_totals.get("total_obligation", 0)),
+            "member_take_home": encrypt_data(member_totals.get("member_take_home", 0)),
+            "supplement_gap": encrypt_data(member_totals.get("supplement_gap", 0)),
+            "allowance_logged": encrypt_data(member_totals.get("allowance_logged", 0)),
+            "recommended_allowance": encrypt_data(member_totals.get("recommended_allowance", 0)),
+            "obligation_breakdown": encrypt_data(
+                json.dumps(member_totals.get("obligation_lines") or [])
+            ),
+            "displacement_summary": encrypt_data(json.dumps(displacement_summary or {})),
+            "applied_to_allowance": bool(applied_to_allowance),
+            "allowance_expense_id": str(allowance_expense_id) if allowance_expense_id else None,
+            "applied_at": datetime.now(ZoneInfo("America/Chicago")).isoformat()
+            if applied_to_allowance
+            else None,
+            "applied_by": st.session_state.get("username") if applied_to_allowance else None,
+            "computed_at": datetime.now(ZoneInfo("America/Chicago")).isoformat(),
+        }
+        supabase.table(get_supplement_snapshots_table()).insert(payload).execute()
+        return True
+    except Exception as e:
+        print(f"Error recording supplement snapshot: {e}")
+        return False
+
+
+def get_supplement_snapshots(household_id, month_year=None, *, limit=20):
+    try:
+        query = (
+            supabase.table(get_supplement_snapshots_table())
+            .select("*")
+            .eq("household_id", household_id)
+            .order("computed_at", desc=True)
+            .limit(limit)
+        )
+        if month_year:
+            query = query.eq("month_year", month_year)
+        response = query.execute()
+        rows = []
+        for row in response.data or []:
+            rows.append(
+                {
+                    **row,
+                    "total_obligation": decrypt_float(row.get("total_obligation")),
+                    "member_take_home": decrypt_float(row.get("member_take_home")),
+                    "supplement_gap": decrypt_float(row.get("supplement_gap")),
+                    "allowance_logged": decrypt_float(row.get("allowance_logged")),
+                    "recommended_allowance": decrypt_float(row.get("recommended_allowance")),
+                }
+            )
+        return rows
+    except Exception as e:
+        print(f"Error fetching supplement snapshots: {e}")
+        return []
+
+
+def _find_recurring_allowance_expense(household_id, allowance_category_id):
+    expenses_table = get_budget_table("expenses")
+    response = (
+        supabase.table(expenses_table)
+        .select("id, stream_id, date_logged")
+        .eq("household_id", household_id)
+        .eq("category_id", allowance_category_id)
+        .eq("is_personal_spend", False)
+        .eq("is_recurring", True)
+        .order("date_logged", desc=True)
+        .limit(1)
+        .execute()
+    )
+    return response.data[0] if response.data else None
+
+
+def apply_supplement_to_allowance(household_id, member_username, month_year, amount) -> bool:
+    if not _can_edit_monthly_budget_server_side():
+        return False
+    ensure_allowance_categories(household_id)
+    categories_df = get_budget_categories(household_id, is_personal=False)
+    category_rows = categories_df.to_dict("records") if categories_df is not None and not categories_df.empty else []
+    allowance_category_id = find_allowance_category_id(category_rows, member_username)
+    if not allowance_category_id:
+        return False
+
+    safe_amount = round(float(amount or 0), 2)
+    if safe_amount <= 0:
+        return False
+
+    auth_user_id = st.session_state.get("auth_user_id")
+    username = st.session_state.get("username")
+    effective = date.today()
+    expense_id = None
+
+    existing = _find_recurring_allowance_expense(household_id, allowance_category_id)
+    if existing:
+        expense_id = existing.get("id")
+        if not schedule_expense_change(
+            expense_id,
+            effective,
+            safe_amount,
+            ALLOWANCE_INCOME_SOURCE_NAME,
+            "monthly",
+            category_id=allowance_category_id,
+        ):
+            return False
+        # schedule_expense_change rematerializes HH expense; re-sync personal allowance income.
+        expense_flags = _fetch_expense_flags(expense_id)
+        stream_id = (expense_flags or {}).get("stream_id")
+        if stream_id:
+            _sync_allowance_for_stream_month(stream_id, month_year, household_id)
+    else:
+        if not log_expense_and_check_project(
+            auth_user_id=auth_user_id,
+            username=username,
+            household_id=household_id,
+            month_year=month_year,
+            date_logged=effective,
+            category_id=allowance_category_id,
+            amount=safe_amount,
+            details=ALLOWANCE_INCOME_SOURCE_NAME,
+            is_personal_spend=False,
+            is_recurring=True,
+            pay_frequency="monthly",
+        ):
+            return False
+        created = _find_recurring_allowance_expense(household_id, allowance_category_id)
+        expense_id = created.get("id") if created else None
+
+    obligations = compute_household_obligations(household_id, month_year)
+    member_totals = obligations.get("by_member", {}).get(member_username, {})
+    record_supplement_snapshot(
+        household_id,
+        month_year,
+        member_username,
+        member_totals,
+        displacement_summary=obligations.get("displacement"),
+        applied_to_allowance=True,
+        allowance_expense_id=expense_id,
+    )
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Member transfer ledger (migration 032)
+# ---------------------------------------------------------------------------
+
+def get_member_transfers_table():
+    return get_budget_table("household_member_transfers")
+
+
+def get_member_transfers(household_id, month_year) -> list[dict]:
+    """Return all transfer rows for a household/month, decrypted."""
+    try:
+        rows = (
+            supabase.table(get_member_transfers_table())
+            .select("*")
+            .eq("household_id", household_id)
+            .eq("month_year", month_year)
+            .order("payment_date")
+            .execute()
+        ).data or []
+        return [_decrypt_member_transfer(r) for r in rows]
+    except Exception as e:
+        print(f"Error fetching member transfers: {e}")
+        return []
+
+
+def get_due_planned_member_transfers(household_id, as_of=None) -> list[dict]:
+    """Planned transfers whose payment_date is on or before as_of (default: today, US Central)."""
+    if not household_id:
+        return []
+    as_of = as_of or datetime.now(ZoneInfo("America/Chicago")).date()
+    try:
+        rows = (
+            supabase.table(get_member_transfers_table())
+            .select("*")
+            .eq("household_id", household_id)
+            .eq("status", "planned")
+            .lte("payment_date", as_of.isoformat())
+            .order("payment_date")
+            .execute()
+        ).data or []
+        return [_decrypt_member_transfer(r) for r in rows]
+    except Exception as e:
+        print(f"Error fetching due planned transfers: {e}")
+        return []
+
+
+def _decrypt_member_transfer(row: dict) -> dict:
+    out = dict(row)
+    for field in ("allowance_amount", "obligation_amount", "total_amount"):
+        raw = out.get(field)
+        if raw is not None:
+            out[field] = decrypt_float(raw)
+    return out
+
+
+def is_transfer_allowance_expense_record(record) -> bool:
+    """True for auto-created HH allowance expenses tied to disbursement transfers."""
+    if not record:
+        return False
+    raw_details = record.get("details")
+    if raw_details is None:
+        return False
+    details = decrypt_text(raw_details) if not isinstance(raw_details, str) else raw_details
+    return (details or "").strip() == TRANSFER_ALLOWANCE_EXPENSE_DETAILS
+
+
+def _is_transfer_allowance_expense_id(expense_id) -> bool:
+    if not expense_id:
+        return False
+    target_table = get_budget_table("expenses")
+    try:
+        response = (
+            supabase.table(target_table)
+            .select("details")
+            .eq("id", str(expense_id))
+            .limit(1)
+            .execute()
+        )
+        return is_transfer_allowance_expense_record(response.data[0]) if response.data else False
+    except Exception:
+        return False
+
+
+def _prune_transfer_auto_expense_mirror_incomes(household_id, month_year) -> int:
+    """Delete personal Allowance rows mirrored from transfer-auto HH expenses.
+
+    Disbursement transfers create personal income via personal_allowance_income_id.
+    Expense-mirror rows (source_expense_id → transfer-auto expense) are duplicates.
+    """
+    if not household_id or not month_year:
+        return 0
+    expenses_table = get_budget_table("expenses")
+    incomes_table = get_budget_table("household_incomes")
+    try:
+        expense_rows = (
+            supabase.table(expenses_table)
+            .select("id, details")
+            .eq("household_id", household_id)
+            .eq("month_year", month_year)
+            .eq("is_personal_spend", False)
+            .execute()
+        ).data or []
+        transfer_auto_ids = {
+            str(row["id"])
+            for row in expense_rows
+            if is_transfer_allowance_expense_record(row)
+        }
+        if not transfer_auto_ids:
+            return 0
+        income_rows = (
+            supabase.table(incomes_table)
+            .select("id, source_expense_id")
+            .eq("household_id", household_id)
+            .eq("month_year", month_year)
+            .eq("is_personal_income", True)
+            .execute()
+        ).data or []
+        removed = 0
+        for row in income_rows:
+            src = row.get("source_expense_id")
+            if src and str(src) in transfer_auto_ids:
+                if _delete_personal_transfer_income(row["id"]):
+                    removed += 1
+        return removed
+    except Exception as e:
+        print(f"Error pruning transfer-auto mirror incomes: {e}")
+        return 0
+
+
+def _household_budget_actor(household_id) -> tuple[str | None, str | None]:
+    users = _fetch_household_users_cached(household_id) or []
+    for user in users:
+        if user.get("role") in ("admin", "developer"):
+            return user.get("auth_user_id"), user.get("username")
+    if users:
+        return users[0].get("auth_user_id"), users[0].get("username")
+    return None, None
+
+
+def _allowance_category_id_for_member(household_id, member_username) -> str | None:
+    ensure_allowance_categories(household_id)
+    categories_df = get_budget_categories(household_id, is_personal=False)
+    if categories_df is None or categories_df.empty:
+        return None
+    member_key = _username_key(member_username)
+    for _, row in categories_df.iterrows():
+        if not is_allowance_subcategory(row.get("category_name"), row.get("sub_category_name")):
+            continue
+        linked = allowance_recipient_username(
+            row.get("category_name"),
+            row.get("sub_category_name"),
+            username_field=row.get("username"),
+        )
+        if _username_key(linked) == member_key:
+            return str(row.get("id"))
+    return None
+
+
+def _delete_transfer_allowance_household_expense(expense_id) -> bool:
+    if not expense_id:
+        return False
+    target_table = get_budget_table("expenses")
+    try:
+        supabase.table(target_table).delete().eq("id", str(expense_id)).execute()
+        return True
+    except Exception as e:
+        print(f"Error deleting transfer allowance expense {expense_id}: {e}")
+        return False
+
+
+def _find_existing_transfer_allowance_expense(
+    household_id,
+    month_year,
+    category_id,
+    pay_date_str,
+) -> str | None:
+    """Reuse an unlinked auto allowance expense before inserting a duplicate."""
+    expenses_table = get_budget_table("expenses")
+    try:
+        rows = (
+            supabase.table(expenses_table)
+            .select("id, details")
+            .eq("household_id", household_id)
+            .eq("month_year", month_year)
+            .eq("category_id", str(category_id))
+            .eq("date_logged", pay_date_str)
+            .eq("is_personal_spend", False)
+            .execute()
+        ).data or []
+        for row in rows:
+            if is_transfer_allowance_expense_record(row):
+                return str(row["id"])
+    except Exception as e:
+        print(f"Error finding existing transfer allowance expense: {e}")
+    return None
+
+
+def _clear_transfer_side_effects(transfer: dict) -> None:
+    """Remove HH allowance expense and personal incomes linked to a transfer row."""
+    expense_id = transfer.get("household_allowance_expense_id")
+    if expense_id:
+        _delete_allowance_income_for_expense(expense_id)
+        _delete_transfer_allowance_household_expense(expense_id)
+    if transfer.get("personal_allowance_income_id"):
+        _delete_personal_transfer_income(transfer["personal_allowance_income_id"])
+    if transfer.get("personal_obligation_income_id"):
+        _delete_personal_transfer_income(transfer["personal_obligation_income_id"])
+
+
+def cleanup_orphan_disbursement_artifacts(household_id, month_year) -> dict:
+    """Delete transfer-generated expenses/incomes no longer referenced by transfer rows."""
+    stats = {"expenses": 0, "incomes": 0}
+    if not household_id:
+        return stats
+
+    transfers_table = get_member_transfers_table()
+    expenses_table = get_budget_table("expenses")
+    incomes_table = get_budget_table("household_incomes")
+
+    try:
+        transfer_rows = (
+            supabase.table(transfers_table)
+            .select(
+                "household_allowance_expense_id, personal_allowance_income_id, personal_obligation_income_id"
+            )
+            .eq("household_id", household_id)
+            .eq("month_year", month_year)
+            .execute()
+        ).data or []
+    except Exception as e:
+        print(f"Error loading transfers for orphan cleanup: {e}")
+        return stats
+
+    linked_expense_ids = {
+        str(row["household_allowance_expense_id"])
+        for row in transfer_rows
+        if row.get("household_allowance_expense_id")
+    }
+    linked_income_ids = set()
+    for row in transfer_rows:
+        for field in ("personal_allowance_income_id", "personal_obligation_income_id"):
+            if row.get(field):
+                linked_income_ids.add(str(row[field]))
+
+    try:
+        expense_rows = (
+            supabase.table(expenses_table)
+            .select("id, details")
+            .eq("household_id", household_id)
+            .eq("month_year", month_year)
+            .eq("is_personal_spend", False)
+            .execute()
+        ).data or []
+        for row in expense_rows:
+            if not is_transfer_allowance_expense_record(row):
+                continue
+            expense_id = str(row["id"])
+            if expense_id in linked_expense_ids:
+                continue
+            _delete_allowance_income_for_expense(expense_id)
+            if _delete_transfer_allowance_household_expense(expense_id):
+                stats["expenses"] += 1
+    except Exception as e:
+        print(f"Error cleaning orphan transfer expenses: {e}")
+
+    valid_expense_ids = {str(row["id"]) for row in expense_rows}
+    transfer_auto_expense_ids = {
+        str(row["id"])
+        for row in expense_rows
+        if is_transfer_allowance_expense_record(row)
+    }
+
+    transfer_income_sources = {ALLOWANCE_INCOME_SOURCE_NAME, OBLIGATION_SUPPORT_INCOME_SOURCE_NAME}
+    try:
+        income_rows = (
+            supabase.table(incomes_table)
+            .select("id, source_name, source_expense_id")
+            .eq("household_id", household_id)
+            .eq("month_year", month_year)
+            .eq("is_personal_income", True)
+            .execute()
+        ).data or []
+        keeper_by_expense: dict[str, str] = {}
+        for row in income_rows:
+            source = decrypt_text(row.get("source_name")) if row.get("source_name") else ""
+            if source not in transfer_income_sources:
+                continue
+            income_id = str(row["id"])
+            src_exp = row.get("source_expense_id")
+            if src_exp:
+                src_key = str(src_exp)
+                if src_key not in valid_expense_ids:
+                    if _delete_personal_transfer_income(income_id):
+                        stats["incomes"] += 1
+                    continue
+                if src_key in transfer_auto_expense_ids:
+                    if _delete_personal_transfer_income(income_id):
+                        stats["incomes"] += 1
+                    continue
+                existing_keeper = keeper_by_expense.get(src_key)
+                if existing_keeper and existing_keeper != income_id:
+                    drop_id = income_id
+                    if income_id in linked_income_ids and existing_keeper not in linked_income_ids:
+                        keeper_by_expense[src_key] = income_id
+                        drop_id = existing_keeper
+                    if _delete_personal_transfer_income(drop_id):
+                        stats["incomes"] += 1
+                    continue
+                keeper_by_expense[src_key] = income_id
+                continue
+            if income_id in linked_income_ids:
+                continue
+            if _delete_personal_transfer_income(income_id):
+                stats["incomes"] += 1
+    except Exception as e:
+        print(f"Error cleaning orphan transfer incomes: {e}")
+
+    mirror_pruned = _prune_transfer_auto_expense_mirror_incomes(household_id, month_year)
+    stats["incomes"] += mirror_pruned
+
+    return stats
+
+
+def _sync_transfer_allowance_household_expense(row: dict) -> str | None:
+    """Create or update the household allowance expense when a transfer completes."""
+    household_id = row.get("household_id")
+    month_year = row.get("month_year")
+    recipient = row.get("recipient_username")
+    pay_date_str = str(row.get("payment_date") or "")[:10]
+    amount = round(float(row.get("allowance_amount") or 0), 2)
+    existing_expense_id = row.get("household_allowance_expense_id")
+
+    if amount <= 0:
+        if existing_expense_id:
+            _delete_transfer_allowance_household_expense(existing_expense_id)
+        return None
+
+    category_id = _allowance_category_id_for_member(household_id, recipient)
+    if not category_id:
+        return str(existing_expense_id) if existing_expense_id else None
+
+    auth_user_id, username = _household_budget_actor(household_id)
+    if not auth_user_id or not username:
+        return str(existing_expense_id) if existing_expense_id else None
+
+    expenses_table = get_budget_table("expenses")
+    payload = {
+        "household_id": household_id,
+        "auth_user_id": auth_user_id,
+        "username": username,
+        "month_year": month_year,
+        "date_logged": pay_date_str,
+        "category_id": category_id,
+        "amount": encrypt_data(amount),
+        "details": encrypt_data(TRANSFER_ALLOWANCE_EXPENSE_DETAILS),
+        "is_personal_spend": False,
+        "is_recurring": False,
+        "pay_frequency": "one_time",
+    }
+    try:
+        if existing_expense_id:
+            supabase.table(expenses_table).update(payload).eq("id", str(existing_expense_id)).execute()
+            return str(existing_expense_id)
+
+        reuse_id = _find_existing_transfer_allowance_expense(
+            household_id, month_year, category_id, pay_date_str
+        )
+        if reuse_id:
+            supabase.table(expenses_table).update(payload).eq("id", reuse_id).execute()
+            return reuse_id
+
+        response = supabase.table(expenses_table).insert(payload).execute()
+        new_id = (response.data or [{}])[0].get("id")
+        return str(new_id) if new_id else None
+    except Exception as e:
+        print(f"Error syncing transfer allowance expense for transfer {row.get('id')}: {e}")
+        return str(existing_expense_id) if existing_expense_id else None
+
+
+def _upsert_personal_transfer_income(
+    *,
+    household_id: str,
+    month_year: str,
+    recipient: str,
+    pay_date_str: str,
+    source_name: str,
+    amount: float,
+    existing_id=None,
+) -> str | None:
+    """Insert or update a one-time personal income row for a member transfer."""
+    incomes_table = get_budget_table("household_incomes")
+    safe_amt = round(float(amount), 2)
+    if safe_amt <= 0:
+        return existing_id
+    payload = {
+        "household_id": household_id,
+        "month_year": month_year,
+        "source_name": encrypt_data(source_name),
+        "take_home_amount": encrypt_data(safe_amt),
+        "gross_amount": encrypt_data(safe_amt),
+        "is_taxable": False,
+        "owner_username": recipient,
+        "is_windfall": False,
+        "is_recurring": False,
+        "pay_frequency": "one_time",
+        "is_personal_income": True,
+        "payment_date": pay_date_str,
+        "stream_id": None,
+        "version_id": None,
+    }
+    try:
+        if existing_id:
+            supabase.table(incomes_table).update(payload).eq("id", str(existing_id)).execute()
+            return str(existing_id)
+
+        candidates = (
+            supabase.table(incomes_table)
+            .select("id, source_name")
+            .eq("household_id", household_id)
+            .eq("month_year", month_year)
+            .eq("owner_username", recipient)
+            .eq("is_personal_income", True)
+            .eq("payment_date", pay_date_str)
+            .execute()
+        ).data or []
+        matching_ids: list[str] = []
+        for candidate in candidates:
+            dec_name = decrypt_text(candidate.get("source_name")) if candidate.get("source_name") else ""
+            if dec_name == source_name:
+                matching_ids.append(str(candidate["id"]))
+        if matching_ids:
+            keeper = (
+                str(existing_id)
+                if existing_id and str(existing_id) in matching_ids
+                else matching_ids[0]
+            )
+            supabase.table(incomes_table).update(payload).eq("id", keeper).execute()
+            for dup_id in matching_ids:
+                if dup_id != keeper:
+                    _delete_personal_transfer_income(dup_id)
+            return keeper
+
+        res = supabase.table(incomes_table).insert(payload).execute()
+        return (res.data or [{}])[0].get("id")
+    except Exception as e:
+        print(f"Error upserting personal income ({source_name}) for {recipient}: {e}")
+        return str(existing_id) if existing_id else None
+
+
+def _delete_personal_transfer_income(income_id) -> bool:
+    """Delete a transfer-synced personal income row (system-managed, no UI permission gate)."""
+    if not income_id:
+        return False
+    target_table = get_budget_table("household_incomes")
+    try:
+        supabase.table(target_table).delete().eq("id", str(income_id)).execute()
+        return True
+    except Exception as e:
+        print(f"Error deleting personal transfer income {income_id}: {e}")
+        return False
+
+
+def _get_completed_transfers_for_recipient(household_id: str, username: str) -> list[dict]:
+    try:
+        rows = (
+            supabase.table(get_member_transfers_table())
+            .select("*")
+            .eq("household_id", household_id)
+            .eq("recipient_username", username)
+            .eq("status", "completed")
+            .order("payment_date")
+            .execute()
+        ).data or []
+        return [_decrypt_member_transfer(r) for r in rows]
+    except Exception as e:
+        print(f"Error fetching completed transfers for {username}: {e}")
+        return []
+
+
+def _sync_allowance_transfer_income_for_member(household_id: str, username: str) -> None:
+    """Ensure personal Allowance income exists for all completed transfers (always on)."""
+    table = get_member_transfers_table()
+    now_ts = datetime.now(ZoneInfo("America/Chicago")).isoformat()
+    for transfer in _get_completed_transfers_for_recipient(household_id, username):
+        allowance_amt = float(transfer.get("allowance_amount") or 0)
+        if allowance_amt <= 0:
+            continue
+        pay_date_str = str(transfer.get("payment_date") or "")[:10]
+        month_year = transfer.get("month_year")
+        allowance_income_id = transfer.get("personal_allowance_income_id")
+        new_id = _upsert_personal_transfer_income(
+            household_id=household_id,
+            month_year=month_year,
+            recipient=username,
+            pay_date_str=pay_date_str,
+            source_name=ALLOWANCE_INCOME_SOURCE_NAME,
+            amount=allowance_amt,
+            existing_id=allowance_income_id,
+        )
+        if new_id and str(new_id) != str(allowance_income_id or ""):
+            supabase.table(table).update({
+                "personal_allowance_income_id": str(new_id),
+                "updated_at": now_ts,
+            }).eq("id", transfer.get("id")).execute()
+
+
+def _sync_transfer_personal_income_for_member(household_id: str, username: str, *, enabled: bool) -> None:
+    """Apply or remove Obligation Support personal income for completed transfers.
+
+    Allowance transfer income is always synced separately and is not gated by integration.
+    """
+    _sync_allowance_transfer_income_for_member(household_id, username)
+    table = get_member_transfers_table()
+    now_ts = datetime.now(ZoneInfo("America/Chicago")).isoformat()
+    for transfer in _get_completed_transfers_for_recipient(household_id, username):
+        transfer_id = transfer.get("id")
+        pay_date_str = str(transfer.get("payment_date") or "")[:10]
+        month_year = transfer.get("month_year")
+        obl_amt = float(transfer.get("obligation_amount") or 0)
+        obl_income_id = transfer.get("personal_obligation_income_id")
+        updates = {}
+
+        if enabled and obl_amt > 0:
+            new_id = _upsert_personal_transfer_income(
+                household_id=household_id,
+                month_year=month_year,
+                recipient=username,
+                pay_date_str=pay_date_str,
+                source_name=OBLIGATION_SUPPORT_INCOME_SOURCE_NAME,
+                amount=obl_amt,
+                existing_id=obl_income_id,
+            )
+            if new_id and str(new_id) != str(obl_income_id or ""):
+                updates["personal_obligation_income_id"] = str(new_id)
+        elif not enabled and obl_income_id:
+            if _delete_personal_transfer_income(obl_income_id):
+                updates["personal_obligation_income_id"] = None
+
+        if updates:
+            updates["updated_at"] = now_ts
+            supabase.table(table).update(updates).eq("id", transfer_id).execute()
+
+
+def _sync_obligation_personal_income_for_member(household_id: str, username: str, *, enabled: bool) -> None:
+    """Deprecated alias — use _sync_transfer_personal_income_for_member."""
+    _sync_transfer_personal_income_for_member(household_id, username, enabled=enabled)
+
+
+def _transfer_rows_from_disbursement_schedule(household_id, month_year) -> list[dict]:
+    """Build planned transfer row dicts from the computed paycheck schedule."""
+    plan = compute_household_disbursement_plan(household_id, month_year)
+    schedule = plan.get("paycheck_schedule") or []
+    rows: list[dict] = []
+    for entry in schedule:
+        pay_date_str = str(entry["payment_date"])[:10]
+        stream_id = entry.get("stream_id")
+        for member, parts in (entry.get("payouts") or {}).items():
+            rows.append({
+                "payment_date": pay_date_str,
+                "stream_id": stream_id,
+                "recipient_username": member,
+                "obligation": float(parts.get("obligation") or 0),
+                "allowance": float(parts.get("allowance") or 0),
+            })
+    return rows
+
+
+def upsert_planned_transfers_from_schedule(
+    household_id,
+    month_year,
+    *,
+    override_rows: list[dict] | None = None,
+    force: bool = False,
+) -> int:
+    """Materialize planned transfer rows from the disbursement plan.
+
+    Idempotent per (household, month, payment_date, recipient, stream_id).
+    Returns the number of rows inserted or updated.
+
+    Args:
+        override_rows: Optional list of dicts with keys
+            {payment_date, stream_id, recipient_username, obligation, allowance}.
+            When provided, these amounts are used instead of the auto-computed plan.
+            Useful when the user edits amounts in the UI before saving.
+        force: When True (disbursement reset), replace existing rows for the month
+            instead of skipping completed or already-planned matches.
+    """
+    if not _can_edit_monthly_budget_server_side():
+        return 0
+
+    if override_rows is not None:
+        rows_to_insert = override_rows
+    else:
+        rows_to_insert = _transfer_rows_from_disbursement_schedule(household_id, month_year)
+
+    if not rows_to_insert:
+        return 0
+
+    table = get_member_transfers_table()
+    existing_rows = get_member_transfers(household_id, month_year)
+    # Key → full row so we can compare amounts and check status before updating
+    existing_by_key = {
+        (r["payment_date"][:10], r["recipient_username"], str(r.get("funding_income_stream_id") or "")): r
+        for r in existing_rows
+        if r.get("payment_date") and r.get("recipient_username")
+    }
+
+    inserted = 0
+    updated = 0
+    for row in rows_to_insert:
+        pay_date_str = str(row["payment_date"])[:10]
+        member = row["recipient_username"]
+        stream_id = row.get("stream_id")
+        key = (pay_date_str, member, str(stream_id or ""))
+        obl = round(float(row.get("obligation") or 0), 2)
+        allow = round(float(row.get("allowance") or 0), 2)
+        total = round(obl + allow, 2)
+
+        existing = existing_by_key.get(key)
+        if existing:
+            if existing.get("status") == "completed" and not force:
+                continue
+            if override_rows is None and not force:
+                continue
+            if force:
+                _clear_transfer_side_effects(existing)
+                try:
+                    supabase.table(table).delete().eq("id", str(existing["id"])).execute()
+                except Exception as e:
+                    print(f"Error replacing transfer ({pay_date_str}, {member}): {e}")
+                    continue
+                existing_by_key.pop(key, None)
+                existing = None
+            else:
+                # override_rows mode: update planned rows if amounts changed
+                existing_obl = round(float(existing.get("obligation_amount") or 0), 2)
+                existing_allow = round(float(existing.get("allowance_amount") or 0), 2)
+                if existing_obl == obl and existing_allow == allow:
+                    continue  # No change — skip
+                update_payload = {
+                    "obligation_amount": encrypt_data(obl),
+                    "allowance_amount": encrypt_data(allow),
+                    "total_amount": encrypt_data(total),
+                    "updated_at": datetime.now(ZoneInfo("America/Chicago")).isoformat(),
+                }
+                try:
+                    supabase.table(table).update(update_payload).eq("id", str(existing["id"])).execute()
+                    updated += 1
+                except Exception as e:
+                    print(f"Error updating planned transfer ({pay_date_str}, {member}): {e}")
+                continue
+
+        # Row doesn't exist (or was deleted for force replace) — insert it
+        payload = {
+            "household_id": household_id,
+            "month_year": month_year,
+            "payment_date": pay_date_str,
+            "recipient_username": member,
+            "funding_income_stream_id": str(stream_id) if stream_id else None,
+            "allowance_amount": encrypt_data(allow),
+            "obligation_amount": encrypt_data(obl),
+            "total_amount": encrypt_data(total),
+            "status": "planned",
+        }
+        try:
+            supabase.table(table).insert(payload).execute()
+            inserted += 1
+        except Exception as e:
+            print(f"Error inserting planned transfer ({pay_date_str}, {member}, {stream_id}): {e}")
+
+    return inserted + updated
+
+
+def reset_disbursement_plan_transfers(household_id, month_year) -> dict:
+    """Reset a month's disbursement plan from the current computed schedule.
+
+    Clears completed/planned transfer rows for the month (and linked side effects),
+    removes orphan transfer expenses/incomes, then materializes a fresh planned schedule.
+    """
+    empty = {
+        "cleared": 0,
+        "inserted": 0,
+        "orphan_expenses": 0,
+        "orphan_incomes": 0,
+        "permission_denied": False,
+    }
+    if not _can_edit_monthly_budget_server_side():
+        return {**empty, "permission_denied": True}
+
+    table = get_member_transfers_table()
+    existing_rows = get_member_transfers(household_id, month_year)
+    cleared = 0
+    for transfer in existing_rows:
+        _clear_transfer_side_effects(transfer)
+        try:
+            supabase.table(table).delete().eq("id", str(transfer["id"])).execute()
+            cleared += 1
+        except Exception as e:
+            print(f"Error deleting transfer {transfer.get('id')}: {e}")
+
+    orphan_stats = cleanup_orphan_disbursement_artifacts(household_id, month_year)
+    inserted = upsert_planned_transfers_from_schedule(household_id, month_year, force=True)
+
+    return {
+        "cleared": cleared,
+        "inserted": inserted,
+        "orphan_expenses": orphan_stats.get("expenses", 0),
+        "orphan_incomes": orphan_stats.get("incomes", 0),
+    }
+
+
+def auto_materialize_disbursement_plan(household_id, month_year) -> int:
+    """Create missing planned transfer rows for a month from the computed schedule.
+
+    Idempotent: never overwrites existing planned or completed rows. Intended to run
+    automatically when a new month is opened so users do not need to click Plan transfers
+    every month.
+    """
+    if not _can_edit_monthly_budget_server_side():
+        return 0
+    return upsert_planned_transfers_from_schedule(household_id, month_year)
+
+
+def _apply_member_transfer_completion(row: dict, *, actor_username: str | None = None) -> bool:
+    """Mark a transfer completed and sync linked personal income rows."""
+    table = get_member_transfers_table()
+    transfer_id = row.get("id")
+    if not transfer_id:
+        return False
+
+    recipient = row["recipient_username"]
+    month_year = row["month_year"]
+    pay_date_str = row["payment_date"][:10]
+    household_id = row["household_id"]
+    allowance_amt = float(row.get("allowance_amount") or 0)
+    obligation_amt = float(row.get("obligation_amount") or 0)
+
+    now_ts = datetime.now(ZoneInfo("America/Chicago")).isoformat()
+    actor = actor_username
+    if actor is None:
+        try:
+            actor = st.session_state.get("username")
+        except Exception:
+            actor = None
+    if not actor:
+        actor = "auto"
+
+    personal_allowance_income_id = row.get("personal_allowance_income_id")
+    personal_obligation_income_id = row.get("personal_obligation_income_id")
+
+    integrated = get_personal_household_integration(household_id, recipient)
+
+    if allowance_amt > 0:
+        personal_allowance_income_id = _upsert_personal_transfer_income(
+            household_id=household_id,
+            month_year=month_year,
+            recipient=recipient,
+            pay_date_str=pay_date_str,
+            source_name=ALLOWANCE_INCOME_SOURCE_NAME,
+            amount=allowance_amt,
+            existing_id=personal_allowance_income_id,
+        )
+
+    if integrated and obligation_amt > 0:
+        personal_obligation_income_id = _upsert_personal_transfer_income(
+            household_id=household_id,
+            month_year=month_year,
+            recipient=recipient,
+            pay_date_str=pay_date_str,
+            source_name=OBLIGATION_SUPPORT_INCOME_SOURCE_NAME,
+            amount=obligation_amt,
+            existing_id=personal_obligation_income_id,
+        )
+    elif not integrated and personal_obligation_income_id:
+        if _delete_personal_transfer_income(personal_obligation_income_id):
+            personal_obligation_income_id = None
+
+    household_allowance_expense_id = _sync_transfer_allowance_household_expense(row)
+    if household_allowance_expense_id:
+        _delete_allowance_income_for_expense(household_allowance_expense_id)
+
+    update_payload = {
+        "status": "completed",
+        "transferred_at": now_ts,
+        "transferred_by": actor,
+        "personal_allowance_income_id": str(personal_allowance_income_id) if personal_allowance_income_id else None,
+        "personal_obligation_income_id": str(personal_obligation_income_id) if personal_obligation_income_id else None,
+        "household_allowance_expense_id": str(household_allowance_expense_id) if household_allowance_expense_id else None,
+        "updated_at": now_ts,
+    }
+    try:
+        supabase.table(table).update(update_payload).eq("id", transfer_id).execute()
+        return True
+    except Exception as e:
+        print(f"Error completing transfer {transfer_id}: {e}")
+        return False
+
+
+def ensure_completed_transfer_allowance_expenses(household_id, month_year) -> int:
+    """Backfill HH allowance expenses for completed transfers missing a linked expense row."""
+    if not household_id:
+        return 0
+    table = get_member_transfers_table()
+    updated = 0
+    for transfer in get_member_transfers(household_id, month_year):
+        if transfer.get("status") != "completed":
+            continue
+        if round(float(transfer.get("allowance_amount") or 0), 2) <= 0:
+            continue
+        if transfer.get("household_allowance_expense_id"):
+            continue
+        expense_id = _sync_transfer_allowance_household_expense(transfer)
+        if not expense_id:
+            continue
+        try:
+            supabase.table(table).update(
+                {
+                    "household_allowance_expense_id": str(expense_id),
+                    "updated_at": datetime.now(ZoneInfo("America/Chicago")).isoformat(),
+                }
+            ).eq("id", str(transfer["id"])).execute()
+            updated += 1
+        except Exception as e:
+            print(f"Error linking allowance expense to transfer {transfer.get('id')}: {e}")
+    return updated
+
+
+def auto_complete_due_member_transfers(household_id, as_of=None) -> int:
+    """Complete planned transfers on or after their payment date (session automation)."""
+    if not household_id:
+        return 0
+    completed = 0
+    for row in get_due_planned_member_transfers(household_id, as_of=as_of):
+        if _apply_member_transfer_completion(row, actor_username="auto"):
+            completed += 1
+    return completed
+
+
+def complete_due_member_transfers(household_id, as_of=None) -> int:
+    """Admin-triggered bulk completion for planned transfers on or before today.
+
+    Returns the number completed, 0 when none are due, or -1 when not permitted.
+    """
+    if not _can_edit_monthly_budget_server_side():
+        return -1
+    return auto_complete_due_member_transfers(household_id, as_of=as_of)
+
+
+def complete_member_transfer(transfer_id: str) -> bool:
+    """Mark a planned transfer as completed and sync personal income rows.
+
+    Allowance income is always created on the recipient's personal ledger.
+    Obligation Support income is created only when integrate_household_on_personal is on.
+    """
+    if not _can_edit_monthly_budget_server_side():
+        return False
+    table = get_member_transfers_table()
+    try:
+        rows = (
+            supabase.table(table).select("*").eq("id", transfer_id).limit(1).execute()
+        ).data or []
+    except Exception as e:
+        print(f"Error fetching transfer {transfer_id}: {e}")
+        return False
+    if not rows:
+        return False
+
+    row = _decrypt_member_transfer(rows[0])
+    return _apply_member_transfer_completion(row)
+
+
+def get_personal_household_integration(household_id, username) -> bool:
+    """Return whether household is integrated into this member's personal budget."""
+    try:
+        rows = (
+            supabase.table(get_budget_table("user_finance_settings"))
+            .select("integrate_household_on_personal, show_obligation_transfers_on_personal")
+            .eq("household_id", household_id)
+            .eq("username", username)
+            .limit(1)
+            .execute()
+        ).data or []
+        if rows:
+            row = rows[0]
+            if row.get("integrate_household_on_personal") is not None:
+                return bool(row["integrate_household_on_personal"])
+            return bool(row.get("show_obligation_transfers_on_personal", False))
+    except Exception as e:
+        print(f"Error fetching household integration for {username}: {e}")
+    return False
+
+
+def _get_obligation_transfer_visibility(household_id, username) -> bool:
+    """Deprecated alias — use get_personal_household_integration."""
+    return get_personal_household_integration(household_id, username)
+
+
+def _can_edit_own_finance_settings(username) -> bool:
+    return bool(username) and username == st.session_state.get("username")
+
+
+def update_personal_household_integration(household_id, username, enabled: bool) -> bool:
+    """Toggle integrate_household_on_personal for a member (self-service or admin)."""
+    if not (_can_edit_monthly_budget_server_side() or _can_edit_own_finance_settings(username)):
+        return False
+    settings_table = get_budget_table("user_finance_settings")
+    try:
+        existing = (
+            supabase.table(settings_table)
+            .select("id")
+            .eq("household_id", household_id)
+            .eq("username", username)
+            .limit(1)
+            .execute()
+        ).data or []
+        flag = bool(enabled)
+        payload = {
+            "integrate_household_on_personal": flag,
+            "show_obligation_transfers_on_personal": flag,
+        }
+        if existing:
+            supabase.table(settings_table).update(payload).eq("id", existing[0]["id"]).execute()
+        else:
+            payload.update({
+                "household_id": household_id,
+                "username": username,
+                "share_budget_with_admin": False,
+            })
+            supabase.table(settings_table).insert(payload).execute()
+        _sync_transfer_personal_income_for_member(household_id, username, enabled=flag)
+        return True
+    except Exception as e:
+        print(f"Error updating household integration for {username}: {e}")
+        return False
+
+
+def update_obligation_transfer_visibility(household_id, username, enabled: bool) -> bool:
+    """Deprecated alias — use update_personal_household_integration."""
+    return update_personal_household_integration(household_id, username, enabled)
+
+
+_TRANSFER_INCOME_SOURCES = {
+    OBLIGATION_SUPPORT_INCOME_SOURCE_NAME,
+}
+
+
+def get_personal_ledger_incomes(household_id, month_year, username) -> pd.DataFrame:
+    """Personal ledger incomes: native personal rows plus optional household mirror.
+
+    Allowance income always appears (personal spend, not household-linked).
+    Obligation Support and household paycheck mirror require integration to be on.
+    """
+    integrated = get_personal_household_integration(household_id, username)
+    personal_df = get_household_incomes(
+        household_id, month_year, is_personal_income=True, username=username
+    )
+    frames = []
+
+    if personal_df is not None and not personal_df.empty:
+        work = personal_df.copy()
+        if not integrated:
+            work = work[~work["source_name"].isin(_TRANSFER_INCOME_SOURCES)]
+        if not work.empty:
+            work["ledger_source"] = "personal"
+            obl_mask = work["source_name"] == OBLIGATION_SUPPORT_INCOME_SOURCE_NAME
+            work.loc[obl_mask, "ledger_source"] = "transfer"
+            frames.append(work)
+
+    if integrated:
+        hh_df = get_household_incomes(household_id, month_year, is_personal_income=False)
+        if hh_df is not None and not hh_df.empty:
+            member_key = _username_key(username)
+            mirror_rows = []
+            for _, row in hh_df.iterrows():
+                if _income_row_allowance_linked(row):
+                    continue
+                if _username_key(row.get("owner_username")) != member_key:
+                    continue
+                if not _freq_is_obligation_regular_pay(_income_row_frequency(row)):
+                    continue
+                mirror = row.to_dict()
+                mirror["ledger_source"] = "household_mirror"
+                mirror["id"] = f"mirror_{row.get('id')}"
+                mirror_rows.append(mirror)
+            if mirror_rows:
+                frames.append(pd.DataFrame(mirror_rows))
+
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def get_member_obligation_parent_names(household_id, username) -> list[str]:
+    """Parent category names assigned to a member for obligation spending."""
+    member_key = _username_key(username)
+    if not member_key:
+        return []
+    parents = set()
+    for assignment in get_obligation_assignments(household_id):
+        if assignment.get("assignment_level") != "parent":
+            continue
+        if not assignment.get("is_active", True):
+            continue
+        if _username_key(assignment.get("member_username")) != member_key:
+            continue
+        parent = (assignment.get("parent_category_name") or "").strip()
+        if parent:
+            parents.add(parent)
+    return sorted(parents)
+
+
+def get_member_obligation_expense_categories(household_id, username) -> pd.DataFrame:
+    """Household expense categories assigned to a member for obligation spending."""
+    member_key = _username_key(username)
+    if not member_key:
+        return pd.DataFrame()
+
+    categories_df = get_budget_categories(household_id, is_personal=False)
+    if categories_df is None or categories_df.empty:
+        return pd.DataFrame()
+
+    category_rows = [
+        row.to_dict()
+        for _, row in categories_df.iterrows()
+        if is_assignable_household_category(row)
+    ]
+    if not category_rows:
+        return pd.DataFrame()
+
+    parent_map, override_map = build_assignment_maps(get_obligation_assignments(household_id))
+    lines = resolve_obligation_lines(category_rows, parent_map, override_map)
+    member_cat_ids = {
+        str(line["category_id"])
+        for line in lines
+        if _username_key(line.get("member_username")) == member_key
+        and line.get("source") in ("parent", "override")
+    }
+    if not member_cat_ids:
+        return pd.DataFrame()
+
+    return categories_df[categories_df["id"].astype(str).isin(member_cat_ids)].copy()
+
+
+def insert_obligation_subcategory(
+    household_id,
+    username,
+    parent_category_name,
+    sub_category_name,
+    target_budget=0.0,
+) -> bool:
+    """Add a sub-category under an assigned obligation parent (integration must be on).
+
+    Reactivates a previously removed sub-category when the same parent/sub name exists.
+    """
+    if not get_personal_household_integration(household_id, username):
+        return False
+    if not (_can_edit_own_finance_settings(username) or _is_budget_privileged()):
+        return False
+    parent = (parent_category_name or "").strip()
+    sub = (sub_category_name or "").strip()
+    if not parent or not sub:
+        return False
+    if parent not in set(get_member_obligation_parent_names(household_id, username)):
+        return False
+    if is_system_project_expense_category(parent, sub):
+        return False
+    if is_system_managed_allowance_category(parent, sub):
+        return False
+
+    inactive_id = _find_inactive_obligation_subcategory_id(household_id, parent, sub)
+    if inactive_id:
+        return reactivate_obligation_subcategory(household_id, username, inactive_id, target_budget=target_budget)
+
+    target_table = get_budget_table("budget_categories")
+    try:
+        safe_target = float(target_budget) if target_budget not in [None, ""] else 0.0
+        payload = {
+            "household_id": household_id,
+            "category_name": encrypt_data(parent),
+            "sub_category_name": encrypt_data(sub),
+            "is_active": True,
+            "is_personal": False,
+            "username": None,
+            "target_budget": encrypt_data(safe_target),
+        }
+        supabase.table(target_table).insert(payload).execute()
+        return True
+    except Exception as e:
+        print(f"Error inserting obligation sub-category: {e}")
+        return False
+
+
+def _find_inactive_obligation_subcategory_id(household_id, parent_category_name, sub_category_name) -> str | None:
+    inactive = get_member_obligation_inactive_subcategories(household_id, username=None)
+    if inactive is None or inactive.empty:
+        return None
+    parent = (parent_category_name or "").strip()
+    sub = (sub_category_name or "").strip()
+    for _, row in inactive.iterrows():
+        if row.get("category_name") == parent and row.get("sub_category_name") == sub:
+            return str(row.get("id"))
+    return None
+
+
+def get_member_obligation_inactive_subcategories(household_id, username=None) -> pd.DataFrame:
+    """Inactive household sub-categories under obligation-assigned parents."""
+    if username:
+        parents = set(get_member_obligation_parent_names(household_id, username))
+    else:
+        parents = set()
+        for assignment in get_obligation_assignments(household_id):
+            if assignment.get("assignment_level") != "parent":
+                continue
+            parent = (assignment.get("parent_category_name") or "").strip()
+            if parent:
+                parents.add(parent)
+    if not parents:
+        return pd.DataFrame()
+
+    target_table = get_budget_table("budget_categories")
+    try:
+        response = (
+            supabase.table(target_table)
+            .select("*")
+            .eq("household_id", household_id)
+            .eq("is_active", False)
+            .eq("is_personal", False)
+            .execute()
+        )
+        if not response.data:
+            return pd.DataFrame()
+        rows = []
+        for row in response.data:
+            if row.get("category_name"):
+                row["category_name"] = decrypt_text(row.get("category_name"))
+            if row.get("sub_category_name"):
+                row["sub_category_name"] = decrypt_text(row.get("sub_category_name"))
+            if row.get("target_budget") is not None:
+                row["target_budget"] = decrypt_float(row.get("target_budget"))
+            else:
+                row["target_budget"] = 0.0
+            sub = row.get("sub_category_name")
+            if sub is None or (isinstance(sub, float) and pd.isna(sub)) or str(sub).strip() == "":
+                continue
+            if row.get("category_name") not in parents:
+                continue
+            rows.append(row)
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
+    except Exception as e:
+        print(f"Error fetching inactive obligation sub-categories: {e}")
+        return pd.DataFrame()
+
+
+def reactivate_obligation_subcategory(
+    household_id,
+    username,
+    category_id,
+    *,
+    target_budget=None,
+) -> bool:
+    """Restore a previously removed obligation sub-category."""
+    if not get_personal_household_integration(household_id, username):
+        return False
+    if not (_can_edit_own_finance_settings(username) or _is_budget_privileged()):
+        return False
+
+    inactive = get_member_obligation_inactive_subcategories(household_id, username)
+    if inactive is None or inactive.empty:
+        return False
+    match = inactive[inactive["id"].astype(str) == str(category_id)]
+    if match.empty:
+        return False
+
+    target_table = get_budget_table("budget_categories")
+    payload = {"is_active": True}
+    if target_budget is not None and target_budget != "":
+        payload["target_budget"] = encrypt_data(float(target_budget))
+    try:
+        supabase.table(target_table).update(payload).eq("id", category_id).execute()
+        return True
+    except Exception as e:
+        print(f"Error reactivating obligation sub-category: {e}")
+        return False
+
+
+def deactivate_obligation_subcategory(household_id, username, category_id) -> bool:
+    """Soft-delete a sub-category under an assigned obligation parent."""
+    if not get_personal_household_integration(household_id, username):
+        return False
+    if not (_can_edit_own_finance_settings(username) or _is_budget_privileged()):
+        return False
+    cats = get_member_obligation_expense_categories(household_id, username)
+    if cats is None or cats.empty:
+        return False
+    match = cats[cats["id"].astype(str) == str(category_id)]
+    if match.empty:
+        return False
+    row = match.iloc[0]
+    sub = row.get("sub_category_name")
+    if sub is None or (isinstance(sub, float) and pd.isna(sub)) or str(sub).strip() == "":
+        return False
+    if is_system_project_expense_category(row.get("category_name"), sub):
+        return False
+    if is_system_managed_allowance_category(row.get("category_name"), sub):
+        return False
+
+    target_table = get_budget_table("budget_categories")
+    try:
+        supabase.table(target_table).update({"is_active": False}).eq("id", category_id).execute()
+        return True
+    except Exception as e:
+        print(f"Error deactivating obligation sub-category: {e}")
+        return False
+
+
+def get_personal_ledger_expenses(household_id, auth_user_id, month_year, username) -> pd.DataFrame:
+    """Personal ledger expenses: native personal rows plus obligation household rows when integrated."""
+    all_df = get_individual_expenses(household_id, auth_user_id, month_year)
+    if all_df is None or all_df.empty:
+        return pd.DataFrame()
+
+    integrated = get_personal_household_integration(household_id, username)
+    frames = []
+
+    personal = all_df[all_df["is_personal_spend"] == True].copy()
+    if not personal.empty:
+        personal["ledger_source"] = "personal"
+        frames.append(personal)
+
+    if integrated:
+        obl_cats = get_member_obligation_expense_categories(household_id, username)
+        if obl_cats is not None and not obl_cats.empty:
+            obl_ids = set(obl_cats["id"].astype(str))
+            household = all_df[all_df["is_personal_spend"] == False].copy()
+            if not household.empty:
+                household = household[household["category_id"].astype(str).isin(obl_ids)]
+                if not household.empty:
+                    household["ledger_source"] = "household_obligation"
+                    frames.append(household)
+
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def log_household_expense_from_personal(
+    auth_user_id,
+    username,
+    household_id,
+    month_year,
+    date_logged,
+    category_id,
+    amount,
+    details,
+    *,
+    is_recurring=False,
+    pay_frequency=None,
+) -> bool:
+    """Log a household expense against a member's assigned obligation categories."""
+    allowed = get_member_obligation_expense_categories(household_id, username)
+    if allowed is None or allowed.empty:
+        return False
+    if str(category_id) not in allowed["id"].astype(str).tolist():
+        return False
+    return log_expense_and_check_project(
+        auth_user_id=auth_user_id,
+        username=username,
+        household_id=household_id,
+        month_year=month_year,
+        date_logged=date_logged,
+        category_id=category_id,
+        amount=amount,
+        details=details,
+        is_personal_spend=False,
+        is_recurring=is_recurring,
+        pay_frequency=pay_frequency,
+    )

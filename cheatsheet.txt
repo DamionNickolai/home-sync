@@ -103,6 +103,9 @@ BACKFILL ENCRYPTED SESSION TOKENS:
 .\venv\Scripts\python.exe maintenance/migrate_user_sessions_refresh_tokens.py
 .\venv\Scripts\python.exe maintenance/migrate_user_sessions_refresh_tokens.py --apply
 
+RESET MEMBER TRANSFERS IN DEV:
+python maintenance/cleanup_disbursement_phantoms.py --household-id test_home --month-year 2026-06 --apply
+
 ENCRYPTION KEY NOTE:
 Home Sync and Get Fit Together must use the same ENCRYPTION_KEY in production because they share the user_sessions table.
 
@@ -120,6 +123,5 @@ python push_to_prod.py
 ENTER VIRTUAL ENV:
 .\venv\Scripts\activate
 
-(Hot reload: .streamlit/config.toml enables runOnSave + poll watcher on Windows. Restart once after pulling config changes.)
 RUN APP:
 python -m streamlit run home_sync.py

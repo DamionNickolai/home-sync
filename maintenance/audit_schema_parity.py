@@ -51,6 +51,11 @@ TABLE_PAIRS: list[tuple[str, str]] = [
     ("project_budgets_dev", "project_budgets"),
     ("household_finance_settings_dev", "household_finance_settings"),
     ("wish_list_dev", "wish_list"),
+    ("household_obligation_assignments_dev", "household_obligation_assignments"),
+    ("household_supplement_snapshots_dev", "household_supplement_snapshots"),
+    ("household_disbursement_settings_dev", "household_disbursement_settings"),
+    ("household_member_transfers_dev", "household_member_transfers"),
+    ("user_disbursement_funding_streams_dev", "user_disbursement_funding_streams"),
 ]
 
 # expenses.id is intentionally UUID in dev, BIGINT in prod.

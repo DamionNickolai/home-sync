@@ -45,6 +45,8 @@ def is_system_project_expense_category(category_name, sub_category_name=None) ->
 
 ALLOWANCE_CATEGORY_NAME = "Allowance"
 ALLOWANCE_INCOME_SOURCE_NAME = "Allowance"
+TRANSFER_ALLOWANCE_EXPENSE_DETAILS = "Disbursement transfer (auto)"
+OBLIGATION_SUPPORT_INCOME_SOURCE_NAME = "Obligation Support"
 
 
 def is_allowance_category(category_name, sub_category_name=None) -> bool:

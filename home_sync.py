@@ -16,7 +16,13 @@ from admin_module import (
     render_admin_module_access_page,
     render_admin_sidebar_entry,
 )
-from budget_module import render_budget_module
+from quick_expense_module import (
+    close_quick_expense_page,
+    is_quick_expense_page_active,
+    render_quick_expense_page,
+    render_quick_expense_sidebar_entry,
+)
+from budget_module import render_budget_module, maybe_run_household_automation, render_disbursement_surplus_alert_if_needed
 from database import get_all_backlog_items, get_current_app_version, add_backlog_item, update_backlog_item, delete_backlog_item, cut_release, get_current_user_permissions
 from todo_module import render_todo_view
 from ui_helpers import (
@@ -79,6 +85,7 @@ def render_rerun_debug_panel() -> None:
 def mark_top_nav_change() -> None:
     st.session_state.pop("main_dashboard_lock", None)
     close_module_access_page()
+    close_quick_expense_page()
     queue_rerun_reason("top_nav")
 
 
@@ -284,24 +291,24 @@ st.markdown("""
         width: 100%;
         table-layout: fixed;
         border-collapse: collapse;
-        font-size: 0.8125rem;
-        line-height: 1.4;
+        font-size: 0.875rem;
+        line-height: 1.45;
     }
     .hs-budget-table thead tr {
         background: rgba(148, 163, 184, 0.12);
     }
     .hs-budget-table thead th {
         font-weight: 700;
-        font-size: 0.68rem;
+        font-size: 0.8125rem;
         text-transform: uppercase;
-        letter-spacing: 0.05em;
+        letter-spacing: 0.04em;
         white-space: nowrap;
-        padding: 0.45rem 0.35rem;
+        padding: 0.55rem 0.4rem;
         border-bottom: 2px solid rgba(148, 163, 184, 0.45);
     }
     .hs-budget-table th,
     .hs-budget-table td {
-        padding: 0.28rem 0.35rem;
+        padding: 0.35rem 0.4rem;
         border-bottom: 1px solid rgba(128, 128, 128, 0.3);
         vertical-align: top;
     }
@@ -310,21 +317,41 @@ st.markdown("""
         text-align: right;
         white-space: nowrap;
     }
-    .hs-budget-table tr.parent td:first-child {
+    /* Parent category rows — larger than sub-categories */
+    .hs-budget-table tr.parent td {
+        font-size: 0.9375rem;
         font-weight: 600;
     }
+    .hs-budget-table tr.parent td:first-child {
+        font-weight: 700;
+    }
+    .hs-budget-table tr.parent td.num {
+        font-weight: 600;
+    }
+    /* Sub-category rows — smallest label tier */
+    .hs-budget-table tr.indent td {
+        font-size: 0.8125rem;
+        font-weight: 400;
+    }
     .hs-budget-table tr.indent td:first-child {
-        padding-left: 0.65rem;
-        font-size: 0.92em;
-        opacity: 0.92;
+        padding-left: 0.75rem;
+        opacity: 0.95;
     }
     .hs-budget-table tr.indent td:first-child::before {
         content: "• ";
-        opacity: 0.65;
+        opacity: 0.55;
     }
+    .hs-budget-table tr.indent td.num {
+        font-size: 0.8125rem;
+    }
+    /* Totals / summary rows — largest data tier (below headers) */
     .hs-budget-table tr.emphasis td {
-        font-weight: 600;
-        border-top: 1px solid rgba(148, 163, 184, 0.35);
+        font-size: 0.975rem;
+        font-weight: 700;
+        border-top: 2px solid rgba(148, 163, 184, 0.35);
+    }
+    .hs-budget-table tr.emphasis td.num {
+        font-weight: 700;
     }
     /* Ledger breakdown */
     .hs-budget-table-wrap.ledger .hs-budget-table th:first-child,
@@ -337,12 +364,15 @@ st.markdown("""
     .hs-budget-table-wrap.ledger .hs-budget-table td.num {
         width: 17.5%;
     }
-    /* Sinking funds */
+    /* Sinking funds — subscription names at sub-category tier */
     .hs-budget-table-wrap.sinking .hs-budget-table th:first-child,
     .hs-budget-table-wrap.sinking .hs-budget-table td:first-child {
         width: 44%;
         white-space: normal;
         word-break: break-word;
+    }
+    .hs-budget-table-wrap.sinking .hs-budget-table td:first-child {
+        font-size: 0.8125rem;
     }
     .hs-budget-table-wrap.sinking .hs-budget-table th.num,
     .hs-budget-table-wrap.sinking .hs-budget-table td.num {
@@ -357,16 +387,22 @@ st.markdown("""
     .hs-budget-table-wrap.income .hs-budget-table td:nth-child(2) {
         width: 14%;
     }
-    /* Expense lists */
+    /* Expense lists — category column larger than sub-category */
     .hs-budget-table-wrap.expense .hs-budget-table th:nth-child(1),
     .hs-budget-table-wrap.expense .hs-budget-table td:nth-child(1) {
         width: 13%;
+        font-size: 0.8125rem;
     }
     .hs-budget-table-wrap.expense .hs-budget-table th:nth-child(2),
-    .hs-budget-table-wrap.expense .hs-budget-table td:nth-child(2),
+    .hs-budget-table-wrap.expense .hs-budget-table td:nth-child(2) {
+        width: 16%;
+        font-size: 0.9375rem;
+        font-weight: 600;
+    }
     .hs-budget-table-wrap.expense .hs-budget-table th:nth-child(3),
     .hs-budget-table-wrap.expense .hs-budget-table td:nth-child(3) {
         width: 16%;
+        font-size: 0.8125rem;
     }
     .hs-budget-table-wrap.expense .hs-budget-table th:nth-child(4),
     .hs-budget-table-wrap.expense .hs-budget-table td:nth-child(4) {
@@ -560,6 +596,16 @@ def maybe_refresh_permissions(min_interval_seconds: int = 90) -> bool:
 
 maybe_refresh_permissions()
 
+household_id = st.session_state.get("household_id")
+if (
+    household_id
+    and household_id != "unassigned"
+    and st.session_state.get("can_view_budget")
+):
+    maybe_run_household_automation(household_id, rerun_scope="app")
+
+render_disbursement_surplus_alert_if_needed()
+
 # ==========================================
 # 🚧 ENVIRONMENT DETECTION & BANNER
 # ==========================================
@@ -586,6 +632,8 @@ user_role = st.session_state.get("user_role", "member")
 
 with st.sidebar:
     st.header("Navigation")
+
+    render_quick_expense_sidebar_entry()
 
     # ==========================================
     # ⚙️ ADMIN PANEL (Called from our new module!)
@@ -694,8 +742,9 @@ if st.session_state.get("main_dashboard_view") not in dashboard_sections:
 
 active_hub_view = st.session_state.get("active_hub_view", "main_menu")
 module_access_active = is_module_access_page_active()
+quick_expense_active = is_quick_expense_page_active()
 current_main_view = st.session_state.get("main_dashboard_view", dashboard_sections[0])
-hide_main_dashboard_selector = module_access_active or is_dashboard_drilldown_active(current_main_view)
+hide_main_dashboard_selector = module_access_active or quick_expense_active or is_dashboard_drilldown_active(current_main_view)
 
 if hide_main_dashboard_selector:
     selected_dashboard_view = st.session_state.get("main_dashboard_view", dashboard_sections[0])
@@ -703,13 +752,15 @@ else:
     render_main_dashboard_selector(dashboard_sections)
     selected_dashboard_view = st.session_state.get("main_dashboard_view", dashboard_sections[0])
 
-show_app_header = not module_access_active and not is_dashboard_drilldown_active(selected_dashboard_view)
+show_app_header = not module_access_active and not quick_expense_active and not is_dashboard_drilldown_active(selected_dashboard_view)
 
 if show_app_header:
     st.title("🏠 Home Sync Dashboard")
 
 if module_access_active:
     render_admin_module_access_page()
+elif quick_expense_active:
+    render_quick_expense_page()
 elif selected_dashboard_view == "🏠 Household Hub":
     # 1. Initialize the session state for this tab
     if "active_hub_view" not in st.session_state:

@@ -48,6 +48,15 @@ MIGRATION_026 = ROOT / "migrations" / "026_expense_paycheck_occurrences.sql"
 MIGRATION_027 = ROOT / "migrations" / "027_expense_stream_category_id_dev.sql"
 MIGRATION_028 = ROOT / "migrations" / "028_project_funds_rollover.sql"
 MIGRATION_029 = ROOT / "migrations" / "029_projects_funds_opening_text.sql"
+MIGRATION_030 = ROOT / "migrations" / "030_household_obligation_assignments.sql"
+MIGRATION_031 = ROOT / "migrations" / "031_household_disbursement_settings.sql"
+MIGRATION_032 = ROOT / "migrations" / "032_household_member_transfers.sql"
+MIGRATION_033 = ROOT / "migrations" / "033_member_disbursement_funding_stream.sql"
+MIGRATION_034 = ROOT / "migrations" / "034_member_disbursement_funding_streams.sql"
+MIGRATION_035 = ROOT / "migrations" / "035_fix_member_transfers_unique_constraint.sql"
+MIGRATION_036 = ROOT / "migrations" / "036_integrate_household_on_personal.sql"
+MIGRATION_037 = ROOT / "migrations" / "037_income_occurrence_suppressions.sql"
+MIGRATION_038 = ROOT / "migrations" / "038_member_transfer_allowance_expense.sql"
 
 BUDGET_PROD_TABLES = [
     "budget_categories",
@@ -118,6 +127,42 @@ def _print_migration_plan(need_017: bool) -> None:
     print()
     print(f"  Step {step}: {MIGRATION_029.name}")
     print("          projects_funds_opening TEXT (encrypted ciphertext, like projects_funds).")
+    step += 1
+    print()
+    print(f"  Step {step}: {MIGRATION_030.name}")
+    print("          Obligation assignments + supplement snapshot tables.")
+    step += 1
+    print()
+    print(f"  Step {step}: {MIGRATION_031.name}")
+    print("          Disbursement funding income stream settings.")
+    step += 1
+    print()
+    print(f"  Step {step}: {MIGRATION_032.name}")
+    print("          Member transfer ledger + obligation toggle on user_finance_settings.")
+    step += 1
+    print()
+    print(f"  Step {step}: {MIGRATION_033.name}")
+    print("          Per-member disbursement funding stream on user_finance_settings.")
+    step += 1
+    print()
+    print(f"  Step {step}: {MIGRATION_034.name}")
+    print("          Per-member multi-stream disbursement funding junction table.")
+    step += 1
+    print()
+    print(f"  Step {step}: {MIGRATION_035.name}")
+    print("          Expand member transfers unique constraint to include funding stream ID.")
+    step += 1
+    print()
+    print(f"  Step {step}: {MIGRATION_036.name}")
+    print("          Master integrate_household_on_personal toggle on user_finance_settings.")
+    step += 1
+    print()
+    print(f"  Step {step}: {MIGRATION_037.name}")
+    print("          Suppressions for deleted stream income occurrences.")
+    step += 1
+    print()
+    print(f"  Step {step}: {MIGRATION_038.name}")
+    print("          Link member transfers to auto-created household allowance expenses.")
     print()
     print("To apply, re-run with --apply:")
     print("  python maintenance/apply_schema_parity.py --apply")
@@ -242,6 +287,60 @@ def main() -> int:
             with conn.cursor() as cur2:
                 cur2.execute(sql_029)
             print(f"  ✓  {MIGRATION_029.name} applied.")
+
+            sql_030 = MIGRATION_030.read_text(encoding="utf-8")
+            print(f"Applying {MIGRATION_030.name} ...")
+            with conn.cursor() as cur2:
+                cur2.execute(sql_030)
+            print(f"  ✓  {MIGRATION_030.name} applied.")
+
+            sql_031 = MIGRATION_031.read_text(encoding="utf-8")
+            print(f"Applying {MIGRATION_031.name} ...")
+            with conn.cursor() as cur2:
+                cur2.execute(sql_031)
+            print(f"  ✓  {MIGRATION_031.name} applied.")
+
+            sql_032 = MIGRATION_032.read_text(encoding="utf-8")
+            print(f"Applying {MIGRATION_032.name} ...")
+            with conn.cursor() as cur2:
+                cur2.execute(sql_032)
+            print(f"  ✓  {MIGRATION_032.name} applied.")
+
+            sql_033 = MIGRATION_033.read_text(encoding="utf-8")
+            print(f"Applying {MIGRATION_033.name} ...")
+            with conn.cursor() as cur2:
+                cur2.execute(sql_033)
+            print(f"  ✓  {MIGRATION_033.name} applied.")
+
+            sql_034 = MIGRATION_034.read_text(encoding="utf-8")
+            print(f"Applying {MIGRATION_034.name} ...")
+            with conn.cursor() as cur2:
+                cur2.execute(sql_034)
+            print(f"  ✓  {MIGRATION_034.name} applied.")
+
+            sql_035 = MIGRATION_035.read_text(encoding="utf-8")
+            print(f"Applying {MIGRATION_035.name} ...")
+            with conn.cursor() as cur2:
+                cur2.execute(sql_035)
+            print(f"  ✓  {MIGRATION_035.name} applied.")
+
+            sql_036 = MIGRATION_036.read_text(encoding="utf-8")
+            print(f"Applying {MIGRATION_036.name} ...")
+            with conn.cursor() as cur2:
+                cur2.execute(sql_036)
+            print(f"  ✓  {MIGRATION_036.name} applied.")
+
+            sql_037 = MIGRATION_037.read_text(encoding="utf-8")
+            print(f"Applying {MIGRATION_037.name} ...")
+            with conn.cursor() as cur2:
+                cur2.execute(sql_037)
+            print(f"  ✓  {MIGRATION_037.name} applied.")
+
+            sql_038 = MIGRATION_038.read_text(encoding="utf-8")
+            print(f"Applying {MIGRATION_038.name} ...")
+            with conn.cursor() as cur2:
+                cur2.execute(sql_038)
+            print(f"  ✓  {MIGRATION_038.name} applied.")
 
             # 4. Re-audit to confirm
             print()
