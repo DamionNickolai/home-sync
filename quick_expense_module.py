@@ -1,9 +1,10 @@
 """Quick Expense sidebar tool.
 
 Provides a full-width overlay page (same pattern as Admin Settings) for fast
-expense entry. Personal categories are always available; household obligation
-categories are optional via an in-page toggle (independent of the Personal
-ledger integration setting).
+expense entry.  Two modes are available via a tab toggle:
+
+  Quick Entry  — single-expense form (personal + optional HH obligation)
+  Scan Receipt — upload image/PDF, OCR-extract lines, review and post
 """
 
 import streamlit as st
@@ -21,6 +22,10 @@ from ui_helpers import rerun_with_reason
 
 QUICK_EXPENSE_PAGE_KEY = "show_quick_expense_page"
 _INCLUDE_OBLIGATIONS_KEY = "quick_expense_include_obligations"
+_MODE_KEY = "quick_expense_mode"
+
+_MODE_QUICK = "Quick Entry"
+_MODE_SCAN = "Scan Receipt"
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +79,7 @@ def render_quick_expense_sidebar_entry() -> None:
 # ---------------------------------------------------------------------------
 
 def render_quick_expense_page() -> None:
-    """Full-width Quick Expense entry page."""
+    """Full-width Quick Expense page with Quick Entry / Scan Receipt modes."""
     household_id = st.session_state.get("household_id")
     auth_user_id = st.session_state.get("auth_user_id")
     username = st.session_state.get("username", "")
@@ -93,6 +98,24 @@ def render_quick_expense_page() -> None:
         st.warning("You do not have permission to log expenses.")
         return
 
+    # Mode tabs
+    tab_entry, tab_scan = st.tabs([_MODE_QUICK, _MODE_SCAN])
+
+    with tab_entry:
+        _render_quick_entry(household_id, auth_user_id, username)
+
+    with tab_scan:
+        # Lazy import to avoid circular dependencies; receipt_expense_module
+        # imports from this module for shared constants only.
+        from receipt_expense_module import render_scan_receipt_tab
+        render_scan_receipt_tab(household_id, auth_user_id, username)
+
+
+# ---------------------------------------------------------------------------
+# Quick Entry form (unchanged from prior implementation)
+# ---------------------------------------------------------------------------
+
+def _render_quick_entry(household_id: str, auth_user_id: str, username: str) -> None:
     has_obligation_assignments = _member_has_obligation_categories(household_id, username)
 
     if has_obligation_assignments:

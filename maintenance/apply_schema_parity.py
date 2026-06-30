@@ -57,6 +57,7 @@ MIGRATION_035 = ROOT / "migrations" / "035_fix_member_transfers_unique_constrain
 MIGRATION_036 = ROOT / "migrations" / "036_integrate_household_on_personal.sql"
 MIGRATION_037 = ROOT / "migrations" / "037_income_occurrence_suppressions.sql"
 MIGRATION_038 = ROOT / "migrations" / "038_member_transfer_allowance_expense.sql"
+MIGRATION_041 = ROOT / "migrations" / "041_income_member_transfer_link.sql"
 
 BUDGET_PROD_TABLES = [
     "budget_categories",
@@ -163,6 +164,10 @@ def _print_migration_plan(need_017: bool) -> None:
     print()
     print(f"  Step {step}: {MIGRATION_038.name}")
     print("          Link member transfers to auto-created household allowance expenses.")
+    step += 1
+    print()
+    print(f"  Step {step}: {MIGRATION_041.name}")
+    print("          Plaintext source_member_transfer_id on household incomes.")
     print()
     print("To apply, re-run with --apply:")
     print("  python maintenance/apply_schema_parity.py --apply")
@@ -341,6 +346,12 @@ def main() -> int:
             with conn.cursor() as cur2:
                 cur2.execute(sql_038)
             print(f"  ✓  {MIGRATION_038.name} applied.")
+
+            sql_041 = MIGRATION_041.read_text(encoding="utf-8")
+            print(f"Applying {MIGRATION_041.name} ...")
+            with conn.cursor() as cur2:
+                cur2.execute(sql_041)
+            print(f"  ✓  {MIGRATION_041.name} applied.")
 
             # 4. Re-audit to confirm
             print()

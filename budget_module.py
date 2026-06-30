@@ -21,6 +21,8 @@ from database import (
     format_project_purchase_expense_line,
     _project_expense_product_from_details,
     ensure_project_expense_category,
+    ensure_household_taxes_category,
+    ensure_personal_taxes_category,
     strip_expense_audit_lines_from_notes,
     ensure_allowance_categories,
     allowance_categories_in_sync,
@@ -86,6 +88,7 @@ from database import (
     clear_subcategory_override,
     compute_household_disbursement_plan,
     get_disbursement_allowance_surplus_flags,
+    get_disbursement_automation_audit_flags,
     get_household_income_stream_options,
     get_member_transfers,
     upsert_planned_transfers_from_schedule,
@@ -95,6 +98,8 @@ from database import (
     complete_due_member_transfers,
     get_due_planned_member_transfers,
     ensure_completed_transfer_allowance_expenses,
+    repair_all_disbursement_allowance_incomes,
+    repair_disbursement_allowance_incomes,
     auto_materialize_disbursement_plan,
     complete_member_transfer,
     update_personal_household_integration,
@@ -144,6 +149,7 @@ def _clear_disbursement_session_guards(household_id, month_year) -> None:
         f"disburse_materialized_{household_id}_",
         f"transfer_allowance_expenses_{household_id}_",
         f"disbursement_orphan_cleanup_{household_id}_",
+        f"disburse_income_repair_{household_id}_",
         f"rollover_checked_{household_id}_",
     )
     for key in list(st.session_state.keys()):
@@ -158,6 +164,26 @@ def _arm_disbursement_reset_autocomplete_hold(household_id) -> None:
     tz = ZoneInfo("America/Chicago")
     today = datetime.now(tz).date().isoformat()
     st.session_state[f"transfers_auto_completed_{household_id}_{today}"] = True
+
+
+# Bump when allowance income repair logic changes so existing sessions re-run once.
+DISBURSEMENT_INCOME_REPAIR_VERSION = 5
+
+
+def maybe_run_disbursement_income_repair(household_id, selected_month=None) -> None:
+    """Repair transfer-linked Allowance personal incomes (all household members)."""
+    if not household_id:
+        return
+    tz = ZoneInfo("America/Chicago")
+    month_year = selected_month or datetime.now(tz).strftime("%Y-%m")
+    guard = (
+        f"disburse_income_repair_{household_id}_{month_year}"
+        f"_v{DISBURSEMENT_INCOME_REPAIR_VERSION}"
+    )
+    if st.session_state.get(guard):
+        return
+    repair_all_disbursement_allowance_incomes(household_id)
+    st.session_state[guard] = True
 
 
 def maybe_run_household_automation(household_id, selected_month=None, *, rerun_scope: str = "fragment") -> None:
@@ -199,6 +225,12 @@ def maybe_run_household_automation(household_id, selected_month=None, *, rerun_s
         orphan_stats = cleanup_orphan_disbursement_artifacts(household_id, month_year)
         st.session_state[orphan_guard] = True
         changed = changed or bool(orphan_stats.get("expenses") or orphan_stats.get("incomes"))
+
+    # Always reconcile the active month after automation — idempotent and fixes
+    # same-day paycheck rows that orphan cleanup may have disrupted.
+    repair_disbursement_allowance_incomes(household_id, month_year)
+
+    maybe_run_disbursement_income_repair(household_id, month_year)
 
     if changed:
         rerun_with_reason("household_automation", scope=rerun_scope)
@@ -630,6 +662,7 @@ def build_household_expense_picker_df(household_id):
     Returns an empty DataFrame when no eligible categories exist.
     Columns guaranteed: id, category_name, sub_category_name, display_name.
     """
+    ensure_household_taxes_category(household_id)
     cats = get_budget_categories(household_id, is_personal=False)
     if cats is None or cats.empty:
         return pd.DataFrame()
@@ -653,6 +686,7 @@ def build_personal_expense_picker_df(
     tagged with `is_household_obligation=True`.
     Returns an empty DataFrame when nothing is available.
     """
+    ensure_personal_taxes_category(household_id, username)
     frames = []
 
     personal_cats = get_budget_categories(household_id, is_personal=True, username=username)
@@ -2933,20 +2967,27 @@ def _can_access_monthly_module():
 
 
 def render_disbursement_surplus_alert_if_needed() -> None:
-    """App-level banner when saved allowance transfers exceed current surplus."""
-    if not _can_access_monthly_module():
-        return
+    """App-level banners for disbursement automation audit flags."""
     household_id = st.session_state.get("household_id")
     if not household_id or household_id == "unassigned":
         return
 
     month_year = datetime.now(ZoneInfo("America/Chicago")).strftime("%Y-%m")
-    flags = get_disbursement_allowance_surplus_flags(household_id, month_year)
+    flags = get_disbursement_automation_audit_flags(household_id, month_year)
+    if _can_access_monthly_module():
+        pass  # admins see all flags below
+    else:
+        flags = [f for f in flags if f.get("kind") == "duplicate_allowance_income"]
+
     for flag in flags:
-        if flag.get("kind") == "allowance_exceeds_surplus":
-            st.error(flag["message"])
+        severity = flag.get("severity", "warning")
+        message = flag.get("message", "")
+        if not message:
+            continue
+        if severity == "error":
+            st.error(message)
         else:
-            st.warning(flag["message"])
+            st.warning(message)
 
 
 def render_budget_module(show_back_to_hub=False):
@@ -2960,6 +3001,7 @@ def _render_budget_fragment(show_back_to_hub=False):
         guard_key = f"project_category_ready_{household_id}"
         if not st.session_state.get(guard_key):
             ensure_project_expense_category(household_id)
+            ensure_household_taxes_category(household_id)
             st.session_state[guard_key] = True
         allowance_guard = f"allowance_categories_ready_{household_id}"
         # Sync allowance categories once per session; the per-render in-sync DB

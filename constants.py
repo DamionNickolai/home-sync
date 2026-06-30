@@ -15,6 +15,7 @@ DEFAULT_BUDGET_CATEGORIES = [
     {"name": "Personal", "sub": "Clothing", "type": "Variable Expense"},
     {"name": "Personal", "sub": "Subscriptions", "type": "Fixed Expense"},
     {"name": "Health", "sub": "Medical/Dental", "type": "Variable Expense"},
+    {"name": "Taxes", "sub": "General", "type": "Variable Expense"},
     {"name": "Projects", "sub": "Home Improvement", "type": "Project"},
     {"name": "Income", "sub": "Paycheck", "type": "Income"},
     {"name": "Income", "sub": "Bonus/Windfall", "type": "Income"}
@@ -25,6 +26,23 @@ PROJECT_EXPENSE_CATEGORY = {
     "name": "Projects",
     "sub": "General Purchases",
 }
+
+# System bucket for receipt line items that cannot be categorized at post time.
+RECEIPT_UNCATEGORIZED = {"name": "Receipt", "sub": "Uncategorized"}
+
+# Auto-created for HH shared and personal ledgers (Quick Expense + receipt logger).
+TAXES_EXPENSE_CATEGORY = {
+    "name": "Taxes",
+    "sub": "General",
+}
+
+
+def is_taxes_expense_category(category_name, sub_category_name=None) -> bool:
+    if str(category_name or "").strip() != TAXES_EXPENSE_CATEGORY["name"]:
+        return False
+    if sub_category_name is None:
+        return True
+    return normalize_sub_category_name(sub_category_name) == TAXES_EXPENSE_CATEGORY["sub"]
 
 
 def normalize_sub_category_name(value) -> str:
@@ -47,6 +65,34 @@ ALLOWANCE_CATEGORY_NAME = "Allowance"
 ALLOWANCE_INCOME_SOURCE_NAME = "Allowance"
 TRANSFER_ALLOWANCE_EXPENSE_DETAILS = "Disbursement transfer (auto)"
 OBLIGATION_SUPPORT_INCOME_SOURCE_NAME = "Obligation Support"
+
+# Plaintext income→transfer link (not encrypted). Format: "{transfer_uuid}#allowance|obligation"
+MEMBER_TRANSFER_INCOME_LINK_SEP = "#"
+
+
+def member_transfer_income_link_key(transfer_id, source_name: str) -> str:
+    """Stable plaintext key tying one personal income row to one transfer side."""
+    tid = str(transfer_id or "").strip()
+    if source_name == ALLOWANCE_INCOME_SOURCE_NAME:
+        kind = "allowance"
+    elif source_name == OBLIGATION_SUPPORT_INCOME_SOURCE_NAME:
+        kind = "obligation"
+    else:
+        kind = "other"
+    return f"{tid}{MEMBER_TRANSFER_INCOME_LINK_SEP}{kind}"
+
+
+def parse_member_transfer_income_link_key(link_key: str) -> tuple[str, str] | None:
+    """Return (transfer_id, kind) from a link key, or None if invalid."""
+    text = str(link_key or "").strip()
+    if MEMBER_TRANSFER_INCOME_LINK_SEP not in text:
+        return None
+    transfer_id, kind = text.split(MEMBER_TRANSFER_INCOME_LINK_SEP, 1)
+    transfer_id = transfer_id.strip()
+    kind = kind.strip()
+    if not transfer_id or not kind:
+        return None
+    return transfer_id, kind
 
 
 def is_allowance_category(category_name, sub_category_name=None) -> bool:

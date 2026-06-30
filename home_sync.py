@@ -22,7 +22,12 @@ from quick_expense_module import (
     render_quick_expense_page,
     render_quick_expense_sidebar_entry,
 )
-from budget_module import render_budget_module, maybe_run_household_automation, render_disbursement_surplus_alert_if_needed
+from budget_module import (
+    render_budget_module,
+    maybe_run_household_automation,
+    maybe_run_disbursement_income_repair,
+    render_disbursement_surplus_alert_if_needed,
+)
 from database import get_all_backlog_items, get_current_app_version, add_backlog_item, update_backlog_item, delete_backlog_item, cut_release, get_current_user_permissions
 from todo_module import render_todo_view
 from ui_helpers import (
@@ -597,12 +602,11 @@ def maybe_refresh_permissions(min_interval_seconds: int = 90) -> bool:
 maybe_refresh_permissions()
 
 household_id = st.session_state.get("household_id")
-if (
-    household_id
-    and household_id != "unassigned"
-    and st.session_state.get("can_view_budget")
-):
-    maybe_run_household_automation(household_id, rerun_scope="app")
+if household_id and household_id != "unassigned":
+    if st.session_state.get("can_view_budget"):
+        maybe_run_household_automation(household_id, rerun_scope="app")
+    else:
+        maybe_run_disbursement_income_repair(household_id)
 
 render_disbursement_surplus_alert_if_needed()
 
