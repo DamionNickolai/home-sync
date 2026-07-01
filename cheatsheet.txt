@@ -106,9 +106,6 @@ BACKFILL ENCRYPTED SESSION TOKENS:
 RESET MEMBER TRANSFERS IN DEV:
 python maintenance/cleanup_disbursement_phantoms.py --household-id test_home --month-year 2026-06 --apply
 
-ENCRYPTION KEY NOTE:
-Home Sync and Get Fit Together must use the same ENCRYPTION_KEY in production because they share the user_sessions table.
-
 INSTALL PACKAGES:
 pip install -r requirements.txt
 

@@ -65,7 +65,7 @@ def render_scan_receipt_tab(household_id: str, auth_user_id: str, username: str)
         "Personal ledger, a Household Obligation, the shared HH budget, or a Project."
     )
     st.info(
-        "Receipt images are sent to Gemini (same provider as Get Fit Together) "
+        "Receipt images are sent to Gemini"
         "for text extraction. Do not upload documents containing passwords or "
         "unrelated sensitive data.",
         icon="ℹ️",

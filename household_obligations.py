@@ -7,6 +7,7 @@ from constants import (
     allowance_recipient_username,
     is_allowance_subcategory,
     is_system_project_expense_category,
+    is_taxes_expense_category,
 )
 
 
@@ -20,6 +21,8 @@ def is_assignable_household_category(row) -> bool:
     if str(parent or "").strip() == ALLOWANCE_CATEGORY_NAME:
         return False
     if is_allowance_subcategory(parent, sub):
+        return False
+    if is_taxes_expense_category(parent, sub):
         return False
     return True
 

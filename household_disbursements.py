@@ -6,6 +6,88 @@ from datetime import date
 
 ADMIN_DEVELOPER_ROLES = frozenset({"admin", "developer"})
 
+# Allowance-vs-surplus comparisons tolerate small split/ledger drift (≤ $0.10).
+DISBURSEMENT_CENT_TOLERANCE = 0.10
+
+
+def split_amount_across_slots(amount: float, slot_count: int) -> list[float]:
+    """Split a dollar amount across N slots; cent remainder distributed to early slots."""
+    if slot_count <= 0:
+        return []
+    total_cents = int(round(float(amount or 0) * 100))
+    if total_cents <= 0:
+        return [0.0] * slot_count
+    base, remainder = divmod(total_cents, slot_count)
+    return [(base + (1 if i < remainder else 0)) / 100.0 for i in range(slot_count)]
+
+
+def transfer_slot_amounts_match(
+    saved: tuple[float, float] | None,
+    computed: tuple[float, float] | None,
+    tolerance: float = DISBURSEMENT_CENT_TOLERANCE,
+) -> bool:
+    """True when saved and computed (obligation, allowance) pairs match within tolerance."""
+    if saved is None and computed is None:
+        return True
+    if saved is None or computed is None:
+        return False
+    return all(abs(a - b) <= tolerance for a, b in zip(saved, computed))
+
+
+def aggregate_member_monthly_amounts(
+    slot_map: dict[tuple, tuple[float, float]],
+) -> dict[str, tuple[float, float]]:
+    """Sum obligation/allowance per member across all paycheck slots."""
+    by_member: dict[str, tuple[float, float]] = {}
+    for (_pay_date, member, _stream_id), (obl, allow) in slot_map.items():
+        o, a = by_member.get(member, (0.0, 0.0))
+        by_member[member] = (round(o + float(obl), 2), round(a + float(allow), 2))
+    return by_member
+
+
+def member_monthly_plan_stale(
+    saved_slots: dict[tuple, tuple[float, float]],
+    computed_slots: dict[tuple, tuple[float, float]],
+    tolerance: float = DISBURSEMENT_CENT_TOLERANCE,
+) -> bool:
+    """Stale when slot keys differ or any member's monthly totals differ beyond tolerance."""
+    if set(saved_slots) != set(computed_slots):
+        return True
+    saved_members = aggregate_member_monthly_amounts(saved_slots)
+    computed_members = aggregate_member_monthly_amounts(computed_slots)
+    for member in set(saved_members) | set(computed_members):
+        if not transfer_slot_amounts_match(
+            saved_members.get(member),
+            computed_members.get(member),
+            tolerance,
+        ):
+            return True
+    return False
+
+
+def per_slot_split_drift_lines(
+    saved_slots: dict[tuple, tuple[float, float]],
+    computed_slots: dict[tuple, tuple[float, float]],
+    tolerance: float = DISBURSEMENT_CENT_TOLERANCE,
+) -> list[str]:
+    """Per-paycheck diffs when monthly member totals already match."""
+    if member_monthly_plan_stale(saved_slots, computed_slots, tolerance):
+        return []
+    lines: list[str] = []
+    for key in sorted(set(saved_slots) | set(computed_slots)):
+        pay_date, member, _stream_id = key
+        saved = saved_slots.get(key)
+        computed = computed_slots.get(key)
+        if saved is None or computed is None:
+            continue
+        if not transfer_slot_amounts_match(saved, computed, tolerance):
+            lines.append(
+                f"{member} on {pay_date}: saved ${sum(saved):,.2f}, "
+                f"current plan ${sum(computed):,.2f}"
+            )
+    return lines
+
+
 # Typical paycheck slots in a normal calendar month (not the occasional extra-pay period).
 TYPICAL_PAYCHECKS_BY_FREQUENCY = {
     "weekly": 4,
@@ -67,7 +149,7 @@ def disbursement_allowance_surplus_flags(
     current_surplus_pool: float,
     planned_allowance_total: float,
     recommended_allowance_total: float | None = None,
-    tolerance: float = 0.02,
+    tolerance: float = DISBURSEMENT_CENT_TOLERANCE,
 ) -> list[dict]:
     """Warn when planned allowance disbursements exceed available household surplus."""
     flags: list[dict] = []
@@ -141,8 +223,9 @@ def compute_surplus_shares(surplus_pool: float, eligible_usernames: list[str]) -
     """Even split of surplus pool among eligible (admin/developer) members."""
     if not eligible_usernames or surplus_pool <= 0.005:
         return {}
-    share = surplus_pool / len(eligible_usernames)
-    return {name: round(share, 2) for name in eligible_usernames}
+    names = sorted(eligible_usernames)
+    parts = split_amount_across_slots(surplus_pool, len(names))
+    return {name: part for name, part in zip(names, parts)}
 
 
 def compute_member_bundled_amounts(
@@ -195,15 +278,24 @@ def build_paycheck_disbursement_schedule(
     if not pay_dates:
         return []
 
-    paycheck_count = len(pay_dates)
+    sorted_dates = sorted(pay_dates)
+    paycheck_count = len(sorted_dates)
     monthly_bundles = compute_member_bundled_amounts(member_transfer_needs, surplus_shares)
     schedule: list[dict] = []
 
-    for pay_date in sorted(pay_dates):
+    per_member_splits: dict[str, tuple[list[float], list[float]]] = {}
+    for member, bundle in monthly_bundles.items():
+        per_member_splits[member] = (
+            split_amount_across_slots(bundle["obligation_amount"], paycheck_count),
+            split_amount_across_slots(bundle["allowance_amount"], paycheck_count),
+        )
+
+    for idx, pay_date in enumerate(sorted_dates):
         payouts: dict[str, dict] = {}
         for member, bundle in monthly_bundles.items():
-            obl = round(bundle["obligation_amount"] / paycheck_count, 2)
-            allow = round(bundle["allowance_amount"] / paycheck_count, 2)
+            obl_parts, allow_parts = per_member_splits[member]
+            obl = obl_parts[idx]
+            allow = allow_parts[idx]
             payouts[member] = {
                 "obligation": obl,
                 "allowance": allow,

@@ -101,6 +101,12 @@ from database import (
     repair_all_disbursement_allowance_incomes,
     repair_disbursement_allowance_incomes,
     auto_materialize_disbursement_plan,
+    sync_disbursement_plan,
+    get_disbursement_reconciliation,
+    get_disbursement_plan_drift,
+    acknowledge_disbursement_plan,
+    get_disbursement_readiness,
+    ensure_member_funding_streams_defaults,
     complete_member_transfer,
     update_personal_household_integration,
     get_personal_household_integration,
@@ -140,17 +146,14 @@ from constants import (
 
 
 def _clear_disbursement_session_guards(household_id, month_year) -> None:
-    """Allow materialization/backfill editors to refresh after a disbursement reset.
-
-    Does not clear the per-day auto-complete guard — reset arms that separately so
-    past-due planned rows stay planned until the next session/day.
-    """
+    """Clear per-session automation guards so the next render re-runs automation."""
     prefixes = (
         f"disburse_materialized_{household_id}_",
         f"transfer_allowance_expenses_{household_id}_",
         f"disbursement_orphan_cleanup_{household_id}_",
         f"disburse_income_repair_{household_id}_",
         f"rollover_checked_{household_id}_",
+        f"transfers_auto_completed_{household_id}_",
     )
     for key in list(st.session_state.keys()):
         if any(key.startswith(prefix) for prefix in prefixes):
@@ -182,12 +185,61 @@ def maybe_run_disbursement_income_repair(household_id, selected_month=None) -> N
     )
     if st.session_state.get(guard):
         return
-    repair_all_disbursement_allowance_incomes(household_id)
+    repair_disbursement_allowance_incomes(household_id, month_year)
     st.session_state[guard] = True
 
 
+def _run_disbursement_automation_server_side(household_id, month_year) -> int:
+    """Run plan-sync + completion for one month without requiring an admin session.
+
+    Returns the number of meaningful changes made (rows inserted, updated, deleted,
+    or transfers completed). Safe to call from any user's session.
+    """
+    if not household_id or not month_year:
+        return 0
+
+    tz = ZoneInfo("America/Chicago")
+    cur_month = datetime.now(tz).strftime("%Y-%m")
+    cur_year, cur_month_int = map(int, cur_month.split("-"))
+    next_month = (
+        f"{cur_year + 1}-01" if cur_month_int == 12
+        else f"{cur_year}-{cur_month_int + 1:02d}"
+    )
+
+    changes = 0
+
+    ensure_member_funding_streams_defaults(household_id)
+
+    # 1. Stale-check current month (freeze: no row changes if rows exist)
+    result_current = sync_disbursement_plan(household_id, cur_month)
+    changes += result_current.get("inserted", 0) + result_current.get("updated", 0)
+
+    # 2. Full sync for next month (insert/update/delete planned rows)
+    result_next = sync_disbursement_plan(household_id, next_month)
+    changes += (
+        result_next.get("inserted", 0)
+        + result_next.get("updated", 0)
+        + result_next.get("deleted", 0)
+    )
+
+    # 3. Auto-complete due transfers
+    changes += auto_complete_due_member_transfers(household_id)
+
+    # 4. Ensure completed transfer allowance expenses
+    changes += ensure_completed_transfer_allowance_expenses(household_id, month_year)
+
+    # 5. Cleanup orphan disbursement artifacts
+    orphan_stats = cleanup_orphan_disbursement_artifacts(household_id, month_year)
+    changes += (orphan_stats.get("expenses", 0) or 0) + (orphan_stats.get("incomes", 0) or 0)
+
+    # 6. Repair transfer-linked Allowance incomes
+    repair_disbursement_allowance_incomes(household_id, month_year)
+
+    return changes
+
+
 def maybe_run_household_automation(household_id, selected_month=None, *, rerun_scope: str = "fragment") -> None:
-    """Run rollover, disbursement materialization, and due transfer completion once per session."""
+    """Run rollover, disbursement plan sync, and due transfer completion once per session."""
     if not household_id:
         return
     tz = ZoneInfo("America/Chicago")
@@ -195,6 +247,7 @@ def maybe_run_household_automation(household_id, selected_month=None, *, rerun_s
     today = datetime.now(tz).date().isoformat()
     changed = False
 
+    # Expense + income rollover
     guard_key = f"rollover_checked_{household_id}_{month_year}"
     if not st.session_state.get(guard_key):
         expense_rolled = auto_rollover_recurring_expenses(household_id, month_year)
@@ -202,34 +255,30 @@ def maybe_run_household_automation(household_id, selected_month=None, *, rerun_s
         st.session_state[guard_key] = True
         changed = changed or bool(expense_rolled or income_rolled)
 
+    # Disbursement sync (current month stale-check + next month full sync)
     disburse_guard = f"disburse_materialized_{household_id}_{month_year}"
     if not st.session_state.get(disburse_guard):
-        disburse_inserted = auto_materialize_disbursement_plan(household_id, month_year)
+        n = _run_disbursement_automation_server_side(household_id, month_year)
         st.session_state[disburse_guard] = True
-        changed = changed or bool(disburse_inserted)
+        # Also mark the per-day transfer completion guard so we don't double-complete
+        st.session_state[f"transfers_auto_completed_{household_id}_{today}"] = True
+        changed = changed or n > 0
 
-    transfer_guard = f"transfers_auto_completed_{household_id}_{today}"
-    if not st.session_state.get(transfer_guard):
-        transfers_completed = auto_complete_due_member_transfers(household_id)
-        st.session_state[transfer_guard] = True
-        changed = changed or transfers_completed > 0
-
+    # Backfill transfer allowance expenses (idempotent catch-up)
     backfill_guard = f"transfer_allowance_expenses_{household_id}_{month_year}"
     if not st.session_state.get(backfill_guard):
         backfilled = ensure_completed_transfer_allowance_expenses(household_id, month_year)
         st.session_state[backfill_guard] = True
         changed = changed or backfilled > 0
 
+    # Orphan cleanup
     orphan_guard = f"disbursement_orphan_cleanup_{household_id}_{month_year}"
     if not st.session_state.get(orphan_guard):
         orphan_stats = cleanup_orphan_disbursement_artifacts(household_id, month_year)
         st.session_state[orphan_guard] = True
         changed = changed or bool(orphan_stats.get("expenses") or orphan_stats.get("incomes"))
 
-    # Always reconcile the active month after automation — idempotent and fixes
-    # same-day paycheck rows that orphan cleanup may have disrupted.
-    repair_disbursement_allowance_incomes(household_id, month_year)
-
+    # Repair transfer-linked Allowance incomes for the active month (idempotent)
     maybe_run_disbursement_income_repair(household_id, month_year)
 
     if changed:
@@ -469,6 +518,16 @@ def _project_purchase_expense_label(row, project_name: str) -> str:
     return format_project_purchase_expense_line(date_str, row.get("amount"), product)
 
 
+def _clear_project_expense_add_form(project_id) -> None:
+    """Reset Add Expense fields so another purchase can be logged in a row."""
+    for key in (
+        f"proj_exp_date_{project_id}",
+        f"proj_exp_product_{project_id}",
+        f"proj_exp_amt_{project_id}",
+    ):
+        st.session_state.pop(key, None)
+
+
 def _render_project_expense_manage_popover(
     *,
     project_id,
@@ -512,7 +571,8 @@ def _render_project_expense_manage_popover(
                 parsed_exp_amount,
                 product_or_service=exp_product,
             ):
-                finish_manage_popover("project_expense_write", project_popover_key, scope="fragment")
+                _clear_project_expense_add_form(project_id)
+                rerun_fragment_with_reason("project_expense_write")
             else:
                 st.error("Could not log project expense.")
         return
@@ -739,7 +799,7 @@ def submit_expense_from_picker(
             household_id=household_id,
             month_year=month_year,
             date_logged=date_logged,
-            category_id=cat_row["id"],
+            category_id=int(cat_row["id"]),
             amount=amount,
             details=details,
             is_personal_spend=False,
@@ -755,7 +815,7 @@ def submit_expense_from_picker(
             household_id=household_id,
             month_year=month_year,
             date_logged=date_logged,
-            category_id=cat_row["id"],
+            category_id=int(cat_row["id"]),
             amount=amount,
             details=details,
             is_recurring=pay_frequency != "one_time",
@@ -769,7 +829,7 @@ def submit_expense_from_picker(
         household_id=household_id,
         month_year=month_year,
         date_logged=date_logged,
-        category_id=cat_row["id"],
+        category_id=int(cat_row["id"]),
         amount=amount,
         details=details,
         is_personal_spend=True,
@@ -1701,73 +1761,202 @@ def _render_obligation_assignments_tab(household_id, selected_month, member_opti
                 rerun_fragment_with_reason("obligation_override")
 
 
+DISBURSEMENT_FLASH_KEY = "disbursement_action_flash"
+
+
+def _set_disbursement_flash(level: str, message: str) -> None:
+    st.session_state[DISBURSEMENT_FLASH_KEY] = (level, message)
+
+
+def _render_disbursement_flash() -> None:
+    flash = st.session_state.pop(DISBURSEMENT_FLASH_KEY, None)
+    if not flash:
+        return
+    level, message = flash
+    if level == "success":
+        st.success(message)
+    elif level == "error":
+        st.error(message)
+    elif level == "info":
+        st.info(message)
+    else:
+        st.warning(message)
+
+
+def _build_disbursement_editor_rows(
+    paycheck_schedule: list,
+    saved_transfers: list,
+    stream_options: list,
+) -> list[dict]:
+    """Rows for the editable transfer plan table (computed + saved orphans)."""
+    stream_label_by_id = {
+        str(opt.get("stream_id") or ""): opt.get("label") or ""
+        for opt in (stream_options or [])
+    }
+    saved_by_key = {
+        (r["payment_date"][:10], r["recipient_username"], str(r.get("funding_income_stream_id") or "")): r
+        for r in saved_transfers
+        if r.get("payment_date") and r.get("recipient_username")
+    }
+    editor_rows: list[dict] = []
+    seen_keys: set[tuple] = set()
+
+    for entry in paycheck_schedule or []:
+        pay_date_str = str(entry.get("payment_date", ""))[:10]
+        stream_id = str(entry.get("stream_id") or "")
+        stream_label = entry.get("stream_label") or stream_label_by_id.get(stream_id, stream_id)
+        for member in sorted(entry.get("payouts") or {}):
+            parts = entry["payouts"][member]
+            plan_obl = round(float(parts.get("obligation") or 0), 2)
+            plan_allow = round(float(parts.get("allowance") or 0), 2)
+            key = (pay_date_str, member, stream_id)
+            saved = saved_by_key.get(key)
+            if saved:
+                obl = round(float(saved.get("obligation_amount") or 0), 2)
+                allow = round(float(saved.get("allowance_amount") or 0), 2)
+                status = (saved.get("status") or "planned").title()
+            else:
+                obl, allow = plan_obl, plan_allow
+                status = "—"
+            editor_rows.append({
+                "Pay Date": pay_date_str,
+                "Stream": stream_label,
+                "Member": member,
+                "Obligation ($)": obl,
+                "Allowance ($)": allow,
+                "Status": status,
+                "_stream_id": stream_id,
+                "_plan_obligation": plan_obl,
+                "_plan_allowance": plan_allow,
+            })
+            seen_keys.add(key)
+
+    for key, saved in saved_by_key.items():
+        if key in seen_keys:
+            continue
+        pay_date_str, member, stream_id = key
+        editor_rows.append({
+            "Pay Date": pay_date_str,
+            "Stream": stream_label_by_id.get(stream_id, stream_id or "—"),
+            "Member": member,
+            "Obligation ($)": round(float(saved.get("obligation_amount") or 0), 2),
+            "Allowance ($)": round(float(saved.get("allowance_amount") or 0), 2),
+            "Status": (saved.get("status") or "planned").title(),
+            "_stream_id": stream_id,
+            "_plan_obligation": round(float(saved.get("obligation_amount") or 0), 2),
+            "_plan_allowance": round(float(saved.get("allowance_amount") or 0), 2),
+        })
+
+    editor_rows.sort(key=lambda r: (r["Pay Date"], r["Stream"], r["Member"]))
+    return editor_rows
+
+
 def _render_disbursement_plan_tab(household_id, selected_month):
-    """Bundled transfer schedule with per-member paycheck stream selectors."""
-    st.caption(
-        "Plan real banking transfers: obligation shortfalls for members, plus an even "
-        "split of remaining household income among admins/developers. Each member sets "
-        "their own paycheck streams — transfers are split across those paychecks."
-    )
+    """Hands-off disbursement schedule — setup, read-only schedule, audit banners, advanced overrides."""
+    is_admin = _is_budget_admin()
+    _render_disbursement_flash()
+
     plan = compute_household_disbursement_plan(household_id, selected_month)
     summary = plan.get("monthly_summary") or {}
     review_flags = plan.get("review_flags") or []
-    allowance_surplus_flags = plan.get("allowance_surplus_flags") or []
+    bundled = plan.get("member_bundled_amounts") or {}
+    per_member_stream_info = plan.get("per_member_stream_info") or {}
+    paycheck_schedule = plan.get("paycheck_schedule") or []
+    stream_options = get_household_income_stream_options(household_id)
+    saved_transfers = get_member_transfers(household_id, selected_month)
+    drift = get_disbursement_plan_drift(household_id, selected_month)
+    rec = get_disbursement_reconciliation(household_id, selected_month)
+    plan_is_stale = bool(drift.get("stale"))
 
-    for flag in allowance_surplus_flags:
-        if flag.get("kind") == "allowance_exceeds_surplus":
-            st.error(flag["message"])
+    # ── Section 1: Audit banners ──────────────────────────────────────
+    audit_flags = get_disbursement_automation_audit_flags(household_id, selected_month)
+    for flag in audit_flags:
+        kind = flag.get("kind")
+        msg = flag.get("message", "")
+        sev = flag.get("severity", "warning")
+        if kind == "plan_pending_review" and is_admin:
+            col_msg, col_btn = st.columns([4, 1])
+            col_msg.info(msg)
+            with col_btn:
+                st.write("")
+                if st.button("Plan looks good", key="ack_disbursement_plan_btn", type="primary"):
+                    acknowledge_disbursement_plan(household_id, selected_month)
+                    rerun_fragment_with_reason("plan_acknowledged")
+        elif kind == "plan_stale":
+            st.warning(msg)
+        elif sev == "error":
+            st.error(msg)
+        elif sev == "info":
+            st.info(msg)
         else:
-            st.warning(flag["message"])
+            st.warning(msg)
+
+    if plan_is_stale and drift.get("has_saved_rows"):
+        st.warning(
+            "**This month's saved transfers no longer match the current income/obligations plan.** "
+            "The schedule is frozen so in-flight bank transfers are not changed automatically. "
+            "Changes will apply to **next month** on rollover, or use **Advanced → Reset plan** "
+            "to rebuild this month from the latest data."
+        )
+        diff_preview = drift.get("diff_lines") or []
+        if diff_preview:
+            st.caption("\n".join(f"• {line}" for line in diff_preview[:5]))
+            if len(diff_preview) > 5:
+                st.caption(f"…and {len(diff_preview) - 5} more row(s).")
+    elif drift.get("slot_split_drift"):
+        st.info(
+            "Monthly transfer totals match the current plan, but per-paycheck amounts differ "
+            "(e.g. after a split-calculation update). Use **Advanced → Reset plan** only if you "
+            "want to redistribute amounts across paycheck dates."
+        )
+        split_preview = drift.get("slot_split_lines") or []
+        if split_preview:
+            st.caption("\n".join(f"• {line}" for line in split_preview[:5]))
 
     if review_flags:
         st.warning(
             "**Extra paycheck month — review recommended**\n\n"
-            + "\n".join(f"• {flag['message']}" for flag in review_flags)
+            + "\n".join(f"• {f['message']}" for f in review_flags)
             + "\n\nPer-transfer amounts are lower when split across more checks. "
-            "Adjust in the table below if needed, then click **Update transfer plan** or **Reset plan**."
-        )
-    else:
-        st.caption(
-            "Transfer rows auto-generate each month from your funding streams and obligations. "
-            "On sign-in, any planned transfer whose pay date has arrived is completed automatically (once per day). "
-            "After a **Reset plan** or mid-month schedule change, use **Complete due transfers** when you are ready. "
-            "Use **Mark transferred** on individual rows to complete early."
+            "Adjust in the Advanced section below if needed."
         )
 
+    # Reconciliation last-reviewed line
+    if rec and rec.get("reviewed"):
+        reviewed_by = rec.get("reviewed_by") or ""
+        reviewed_at = str(rec.get("reviewed_at") or "")[:10]
+        st.caption(f"Last reviewed {reviewed_at} · by {reviewed_by}")
+
+    st.caption(
+        "Transfers generate and complete automatically. "
+        "Configure income streams in Cash Flow and set funding streams below."
+    )
+
+    # ── Section 2: Summary metrics ───────────────────────────────────
     render_metrics_grid(
         [
-            {
-                "label": "Household income",
-                "value": f"${plan.get('total_regular_income', 0):,.2f}",
-            },
-            {
-                "label": "Assigned obligations",
-                "value": f"${plan.get('total_assigned_obligations', 0):,.2f}",
-            },
+            {"label": "Household income", "value": f"${plan.get('total_regular_income', 0):,.2f}"},
+            {"label": "Assigned obligations", "value": f"${plan.get('total_assigned_obligations', 0):,.2f}"},
             {
                 "label": "Surplus to split",
                 "value": f"${plan.get('surplus_pool', 0):,.2f}",
                 "help": "Income left after all assigned obligation targets.",
             },
-            {
-                "label": "Monthly transfers",
-                "value": f"${summary.get('monthly_disbursement_total', 0):,.2f}",
-            },
+            {"label": "Monthly transfers", "value": f"${summary.get('monthly_disbursement_total', 0):,.2f}"},
         ],
         desktop_columns=4,
     )
 
-    # ── Per-member funding stream selectors ───────────────────────────
-    bundled = plan.get("member_bundled_amounts") or {}
-    stream_options = get_household_income_stream_options(household_id)
+    # ── Section 3: Setup — funding streams per member ────────────────
+    readiness = get_disbursement_readiness(household_id)
+    if not readiness["has_income_streams"]:
+        st.warning("No household income streams found. Add income streams in Cash Flow & Treasury to enable disbursement.")
+    elif not readiness["has_obligation_assignments"]:
+        st.info("No obligation assignments found. Assign household categories to members in the Category assignments tab.")
 
     if bundled:
-        st.markdown("**Monthly amounts & funding stream per member**")
-        if not stream_options:
-            st.info("Add household income streams in Cash Flow to link paycheck funding.")
-        else:
-            labels = [opt["label"] for opt in stream_options]
-            stream_ids = [opt["stream_id"] for opt in stream_options]
+        st.markdown("**Monthly amounts per member**")
+        if stream_options:
             bundle_rows = []
             for member in sorted(bundled):
                 parts = bundled[member]
@@ -1786,12 +1975,13 @@ def _render_disbursement_plan_tab(household_id, selected_month):
                 variant="ledger",
             )
 
-            st.markdown("**Set each member's funding paycheck streams:**")
+            labels = [opt["label"] for opt in stream_options]
+            stream_ids = [opt["stream_id"] for opt in stream_options]
+            st.markdown("**Funding paycheck streams** — set once; saved until changed:")
             for member in sorted(bundled):
                 current_streams = get_member_funding_streams(household_id, member)
                 default_labels = [
-                    lbl for lbl, sid in zip(labels, stream_ids)
-                    if sid in current_streams
+                    lbl for lbl, sid in zip(labels, stream_ids) if sid in current_streams
                 ]
                 col_sel, col_btn = st.columns([4, 1])
                 with col_sel:
@@ -1800,36 +1990,46 @@ def _render_disbursement_plan_tab(household_id, selected_month):
                         labels,
                         default=default_labels,
                         key=f"member_streams_{member}",
-                        help="Pick one or more income streams. Transfers are split evenly across all their combined pay dates in the month.",
+                        help="Transfers are split across all combined pay dates for selected streams.",
                     )
                 with col_btn:
                     st.write("")
                     if st.button("Save", key=f"save_member_streams_{member}", type="primary"):
                         chosen_ids = [stream_ids[labels.index(lbl)] for lbl in chosen_labels]
                         if set_member_funding_streams(household_id, member, chosen_ids):
+                            sync_disbursement_plan(household_id, selected_month)
+                            tz = ZoneInfo("America/Chicago")
+                            now = datetime.now(tz)
+                            y, m = now.year, now.month
+                            next_month = f"{y + 1}-01" if m == 12 else f"{y}-{m + 1:02d}"
+                            sync_disbursement_plan(household_id, next_month)
+                            _clear_disbursement_session_guards(household_id, selected_month)
+                            _set_disbursement_flash("success", f"Saved funding streams for {member}.")
                             rerun_fragment_with_reason("member_streams_saved")
                         else:
                             st.error(f"Could not save streams for {member}.")
 
-    # ── Paycheck schedule with transfer tracking ──────────────────────
-    per_member_stream_info = plan.get("per_member_stream_info") or {}
-    paycheck_schedule = plan.get("paycheck_schedule") or []
+            if readiness["members_missing_streams"]:
+                st.warning(
+                    "Select funding streams for: "
+                    + ", ".join(readiness["members_missing_streams"])
+                    + " — disbursement schedule cannot be generated until streams are set."
+                )
+        else:
+            st.info("Add household income streams in Cash Flow & Treasury to link paycheck funding.")
 
+    # ── Section 4: Read-only paycheck schedule ────────────────────────
     members_without_stream = [
         m for m in sorted(bundled or {})
         if not (per_member_stream_info.get(m) or {}).get("stream_ids")
     ]
-    if members_without_stream:
-        st.caption(
-            f"No funding streams set for: {', '.join(members_without_stream)}. "
-            "Select streams above to generate a paycheck schedule."
-        )
 
-    if not paycheck_schedule:
-        if any((per_member_stream_info.get(m) or {}).get("stream_ids") for m in (bundled or {})):
-            st.caption("No paychecks land in this month for the configured funding streams.")
-    else:
-        # Summary: one line per member — streams + real paycheck count
+    if paycheck_schedule:
+        stream_label_by_id = {
+            str(opt.get("stream_id") or ""): opt.get("label") or ""
+            for opt in (stream_options or [])
+        }
+
         summary_parts = []
         for member in sorted(per_member_stream_info):
             info = per_member_stream_info[member]
@@ -1842,117 +2042,155 @@ def _render_disbursement_plan_tab(household_id, selected_month):
         if summary_parts:
             st.markdown("  \n".join(summary_parts))
 
-        # ── Editable schedule table ───────────────────────────────────
-        saved_transfers = get_member_transfers(household_id, selected_month)
         saved_by_key = {
             (r["payment_date"][:10], r["recipient_username"], str(r.get("funding_income_stream_id") or "")): r
             for r in saved_transfers
             if r.get("payment_date") and r.get("recipient_username")
         }
-        stream_label_by_id = {
-            str(opt.get("stream_id") or ""): opt.get("label") or ""
-            for opt in (stream_options or [])
-        }
+        transfer_index = saved_by_key
 
-        st.markdown("**Planned transfer amounts** — saved plan shown when locked in:")
-        editor_rows = []
-        seen_keys: set[tuple] = set()
-        for entry in paycheck_schedule:
-            pay_date_str = str(entry.get("payment_date", ""))[:10]
-            stream_id = str(entry.get("stream_id") or "")
-            stream_label = entry.get("stream_label") or stream_label_by_id.get(stream_id, stream_id)
-            for member in sorted(entry.get("payouts") or {}):
-                parts = entry["payouts"][member]
-                plan_obl = round(float(parts.get("obligation") or 0), 2)
-                plan_allow = round(float(parts.get("allowance") or 0), 2)
-                key = (pay_date_str, member, stream_id)
-                saved = saved_by_key.get(key)
-                if saved:
-                    obl = round(float(saved.get("obligation_amount") or 0), 2)
-                    allow = round(float(saved.get("allowance_amount") or 0), 2)
-                    status = (saved.get("status") or "planned").title()
-                else:
-                    obl, allow = plan_obl, plan_allow
-                    status = "—"
-                editor_rows.append({
-                    "Pay Date": pay_date_str,
-                    "Stream": stream_label,
-                    "Member": member,
-                    "Obligation ($)": obl,
-                    "Allowance ($)": allow,
-                    "Status": status,
-                    "_stream_id": stream_id,
-                    "_plan_obligation": plan_obl,
-                    "_plan_allowance": plan_allow,
-                })
-                seen_keys.add(key)
-
-        # Include saved transfers that no longer appear in the current computed schedule
-        for key, saved in saved_by_key.items():
-            if key in seen_keys:
-                continue
-            pay_date_str, member, stream_id = key
-            editor_rows.append({
-                "Pay Date": pay_date_str,
-                "Stream": stream_label_by_id.get(stream_id, stream_id or "—"),
-                "Member": member,
-                "Obligation ($)": round(float(saved.get("obligation_amount") or 0), 2),
-                "Allowance ($)": round(float(saved.get("allowance_amount") or 0), 2),
-                "Status": (saved.get("status") or "planned").title(),
-                "_stream_id": stream_id,
-                "_plan_obligation": round(float(saved.get("obligation_amount") or 0), 2),
-                "_plan_allowance": round(float(saved.get("allowance_amount") or 0), 2),
-            })
-
-        editor_rows.sort(key=lambda r: (r["Pay Date"], r["Stream"], r["Member"]))
-        default_df = pd.DataFrame(editor_rows) if editor_rows else pd.DataFrame()
-        editor_rev_key = f"disbursement_editor_rev_{household_id}_{selected_month}"
-        editor_rev = st.session_state.get(editor_rev_key, 0)
-
-        if not default_df.empty:
-            edited_df = st.data_editor(
-                default_df,
-                column_order=["Pay Date", "Stream", "Member", "Obligation ($)", "Allowance ($)", "Status"],
-                column_config={
-                    "Pay Date": st.column_config.TextColumn("Pay Date", disabled=True),
-                    "Stream": st.column_config.TextColumn("Stream", disabled=True),
-                    "Member": st.column_config.TextColumn("Member", disabled=True),
-                    "Status": st.column_config.TextColumn("Status", disabled=True),
-                    "Obligation ($)": st.column_config.NumberColumn(
-                        "Obligation ($)", format="$%.2f", min_value=0.0, step=0.01,
-                        help="Amount to cover this member's obligation gap this paycheck.",
-                    ),
-                    "Allowance ($)": st.column_config.NumberColumn(
-                        "Allowance ($)", format="$%.2f", min_value=0.0, step=0.01,
-                        help="Surplus share (allowance) for this paycheck.",
-                    ),
-                },
-                disabled=["Pay Date", "Stream", "Member", "Status"],
-                hide_index=True,
-                width='stretch',
-                key=f"transfer_schedule_editor_{household_id}_{selected_month}_{editor_rev}",
+        completed_count = sum(1 for r in saved_transfers if r.get("status") == "completed")
+        if saved_transfers:
+            st.markdown(
+                f"**Transfer status** — {completed_count}/{len(saved_transfers)} completed this month"
             )
 
-            # Warn when the live computed plan differs from saved planned rows
-            _stale_rows = []
-            for _, er in edited_df.iterrows():
-                if str(er.get("Status") or "").lower() == "completed":
-                    continue
-                _plan_obl = round(float(er.get("_plan_obligation") or 0), 2)
-                _plan_all = round(float(er.get("_plan_allowance") or 0), 2)
-                _ed_obl = round(float(er.get("Obligation ($)") or 0), 2)
-                _ed_all = round(float(er.get("Allowance ($)") or 0), 2)
-                if _plan_obl != _ed_obl or _plan_all != _ed_all:
-                    _stale_rows.append(
-                        f"{er['Member']} on {er['Pay Date']}: saved ${_ed_obl + _ed_all:,.2f}, "
-                        f"current plan ${_plan_obl + _plan_all:,.2f}"
-                    )
+        for entry in paycheck_schedule:
+            pay_date_str = str(entry.get("payment_date", ""))[:10]
+            stream_id_str = str(entry.get("stream_id") or "")
+            stream_label = entry.get("stream_label") or stream_label_by_id.get(stream_id_str, stream_id_str)
+            payouts = entry.get("payouts") or {}
+            st.markdown(f"**{_format_payment_date(pay_date_str)}** — {stream_label}")
 
-            if _stale_rows:
-                st.warning(
-                    "Saved amounts differ from the current computed plan:\n" +
-                    "\n".join(f"• {s}" for s in _stale_rows) +
-                    "\n\nClick **Update transfer plan** to save your edits, or **Reset plan** to reload from the current schedule."
+            status_rows = []
+            for member in sorted(payouts):
+                t = transfer_index.get((pay_date_str, member, stream_id_str))
+                parts = payouts[member]
+                status = t["status"] if t else "—"
+                badge = "✅ Transferred" if status == "completed" else ("🕐 Planned" if status == "planned" else "—")
+                status_rows.append({
+                    "cells": [
+                        member,
+                        _format_ledger_amount(t["obligation_amount"] if t else parts.get("obligation", 0)),
+                        _format_ledger_amount(t["allowance_amount"] if t else parts.get("allowance", 0)),
+                        _format_ledger_amount(t["total_amount"] if t else parts.get("total", 0)),
+                        badge,
+                    ]
+                })
+            _render_html_scroll_table(
+                ["Member", "Obligation", "Allowance", "Total", "Status"],
+                status_rows,
+                right_align_from=1,
+                variant="income",
+            )
+
+            # Mark transferred early (always available to admins; not hidden in Advanced)
+            if is_admin:
+                for member in sorted(payouts):
+                    t = transfer_index.get((pay_date_str, member, stream_id_str))
+                    if t and t.get("status") == "planned":
+                        btn_key = f"mark_transferred_{t['id']}"
+                        if st.button(
+                            f"Mark transferred — {member} on {_format_payment_date(pay_date_str)}",
+                            key=btn_key,
+                        ):
+                            if complete_member_transfer(str(t["id"])):
+                                st.success(f"Marked as transferred for {member}.")
+                                rerun_fragment_with_reason("complete_transfer")
+                            else:
+                                st.error("Could not mark transfer as completed.")
+    elif members_without_stream:
+        st.caption(
+            f"No funding streams set for: {', '.join(members_without_stream)}. "
+            "Select streams above to generate a paycheck schedule."
+        )
+    elif bundled:
+        st.caption("No paychecks land in this month for the configured funding streams.")
+
+    # ── Section 5: Advanced (admin-only expander) ─────────────────────
+    if not is_admin:
+        return
+
+    editor_rev_key = f"disbursement_editor_rev_{household_id}_{selected_month}"
+    editor_rev = st.session_state.get(editor_rev_key, 0)
+    editor_rows = _build_disbursement_editor_rows(paycheck_schedule, saved_transfers, stream_options)
+    has_plan_data = bool(editor_rows or saved_transfers)
+    expand_advanced = plan_is_stale or bool(rec and not rec.get("reviewed"))
+
+    with st.expander("Advanced — manual controls", expanded=expand_advanced):
+        st.caption(
+            "Use these when income, obligations, or funding streams changed mid-month. "
+            "**Reset plan** rebuilds this month's transfers from the latest computed schedule. "
+            "**Update transfer plan** saves edited amounts for planned rows only (completed rows are locked)."
+        )
+
+        if not has_plan_data:
+            st.info("No transfer rows for this month yet. Set funding streams above, then reload.")
+        else:
+            due_transfers = get_due_planned_member_transfers(household_id)
+            if due_transfers:
+                due_cols = st.columns([2, 1])
+                with due_cols[0]:
+                    st.caption(
+                        f"{len(due_transfers)} planned transfer(s) are on or past their pay date."
+                    )
+                with due_cols[1]:
+                    if st.button(
+                        f"Complete due ({len(due_transfers)})",
+                        key="complete_due_transfers_btn",
+                        type="primary",
+                        use_container_width=True,
+                    ):
+                        completed_now = complete_due_member_transfers(household_id)
+                        if completed_now < 0:
+                            _set_disbursement_flash("error", "Requires admin access.")
+                        elif completed_now:
+                            cleanup_orphan_disbursement_artifacts(household_id, selected_month)
+                            _set_disbursement_flash(
+                                "success",
+                                f"Completed {completed_now} transfer(s).",
+                            )
+                        else:
+                            _set_disbursement_flash("info", "No due transfers to complete.")
+                        rerun_fragment_with_reason("complete_due_transfers")
+
+            if editor_rows:
+                default_df = pd.DataFrame(editor_rows)
+                all_completed = all(
+                    str(r.get("Status") or "").lower() == "completed" for r in editor_rows
+                )
+                if all_completed:
+                    st.info(
+                        "All transfer rows are **Completed** — amounts are locked. "
+                        "**Update transfer plan** only edits **Planned** rows. "
+                        "Use **Reset plan** to rebuild from the latest income/obligations, "
+                        "then edit before clicking **Complete due**."
+                    )
+                edited_df = st.data_editor(
+                    default_df,
+                    column_order=["Pay Date", "Stream", "Member", "Obligation ($)", "Allowance ($)", "Status"],
+                    column_config={
+                        "Pay Date": st.column_config.TextColumn("Pay Date", disabled=True),
+                        "Stream": st.column_config.TextColumn("Stream", disabled=True),
+                        "Member": st.column_config.TextColumn("Member", disabled=True),
+                        "Status": st.column_config.TextColumn("Status", disabled=True),
+                        "Obligation ($)": st.column_config.NumberColumn(
+                            "Obligation ($)", format="$%.2f", min_value=0.0, step=0.01,
+                        ),
+                        "Allowance ($)": st.column_config.NumberColumn(
+                            "Allowance ($)", format="$%.2f", min_value=0.0, step=0.01,
+                        ),
+                    },
+                    disabled=["Pay Date", "Stream", "Member", "Status"],
+                    hide_index=True,
+                    width="stretch",
+                    key=f"transfer_schedule_editor_{household_id}_{selected_month}_{editor_rev}",
+                )
+            else:
+                edited_df = None
+                st.caption(
+                    "Saved transfers exist but no computed schedule slots match. "
+                    "Use **Reset plan** to rebuild from current income and funding streams."
                 )
 
             btn_update, btn_reset = st.columns(2)
@@ -1962,31 +2200,31 @@ def _render_disbursement_plan_tab(household_id, selected_month):
                     key="plan_transfers_btn",
                     type="secondary",
                     use_container_width=True,
+                    disabled=edited_df is None,
                 )
             with btn_reset:
                 reset_clicked = st.button(
                     "Reset plan",
                     key="reset_disbursement_plan_btn",
-                    type="secondary",
+                    type="primary",
                     use_container_width=True,
-                    help="Clear this month's transfers and reload a fresh planned schedule from current income, streams, and obligations.",
+                    help="Clear this month's transfers and rebuild from the current computed schedule.",
                 )
 
             if reset_clicked:
                 result = reset_disbursement_plan_transfers(household_id, selected_month)
                 if result.get("permission_denied"):
-                    st.error("Reset plan requires admin or developer access.")
+                    _set_disbursement_flash("error", "Reset plan requires admin or developer access.")
                 else:
                     _clear_disbursement_session_guards(household_id, selected_month)
-                    _arm_disbursement_reset_autocomplete_hold(household_id)
                     st.session_state[editor_rev_key] = editor_rev + 1
-                    changed = (
+                    changed_count = (
                         result.get("cleared", 0)
                         + result.get("inserted", 0)
                         + result.get("orphan_expenses", 0)
                         + result.get("orphan_incomes", 0)
                     )
-                    if changed:
+                    if changed_count:
                         parts = []
                         if result.get("cleared"):
                             parts.append(f"{result['cleared']} transfer(s) cleared")
@@ -1996,18 +2234,22 @@ def _render_disbursement_plan_tab(household_id, selected_month):
                             parts.append(f"{result['orphan_expenses']} orphan expense(s) removed")
                         if result.get("orphan_incomes"):
                             parts.append(f"{result['orphan_incomes']} orphan income(s) removed")
-                        st.success(
-                            f"Reset plan — {', '.join(parts)}. "
-                            "Past-due rows stay planned until your next sign-in."
-                        )
+                        _arm_disbursement_reset_autocomplete_hold(household_id)
+                        parts.append("rows stay Planned until you click Complete due or reload tomorrow")
+                        _set_disbursement_flash("success", f"Reset plan — {', '.join(parts)}.")
                     else:
-                        st.info("Nothing to reset for this month — no transfers or schedule rows found.")
+                        _set_disbursement_flash(
+                            "info",
+                            "Nothing to reset for this month — no transfers or schedule rows found.",
+                        )
                 rerun_fragment_with_reason("reset_disbursement_plan")
 
-            if update_clicked:
+            if update_clicked and edited_df is not None:
                 override_rows = []
+                skipped_completed = 0
                 for _, row in edited_df.iterrows():
                     if str(row.get("Status") or "").lower() == "completed":
+                        skipped_completed += 1
                         continue
                     override_rows.append({
                         "payment_date": str(row["Pay Date"]),
@@ -2016,101 +2258,19 @@ def _render_disbursement_plan_tab(household_id, selected_month):
                         "obligation": float(row.get("Obligation ($)") or 0),
                         "allowance": float(row.get("Allowance ($)") or 0),
                     })
-
                 n = upsert_planned_transfers_from_schedule(
                     household_id, selected_month, override_rows=override_rows
                 )
                 if n:
-                    st.success(f"Saved {n} transfer row(s) — planned or updated.")
-                else:
-                    st.info("All planned transfers already match — nothing to update.")
-                rerun_fragment_with_reason("plan_transfers")
-
-        # ── Transfer status & Mark transferred ────────────────────────
-        transfer_rows = saved_transfers
-        if transfer_rows:
-            st.divider()
-            completed_count = sum(1 for r in transfer_rows if r.get("status") == "completed")
-            st.markdown(
-                f"**Transfer status** — {completed_count}/{len(transfer_rows)} completed this month"
-            )
-            due_transfers = get_due_planned_member_transfers(household_id)
-            if due_transfers and _is_budget_admin():
-                due_cols = st.columns([2, 1])
-                with due_cols[0]:
-                    st.caption(
-                        f"{len(due_transfers)} planned transfer(s) are on or past their pay date "
-                        "and can be completed now."
+                    _set_disbursement_flash("success", f"Saved {n} planned transfer row(s).")
+                elif skipped_completed and not override_rows:
+                    _set_disbursement_flash(
+                        "info",
+                        "All rows are completed — use Reset plan to rebuild, or edit planned rows only.",
                     )
-                with due_cols[1]:
-                    if st.button(
-                        f"Complete due transfers ({len(due_transfers)})",
-                        key="complete_due_transfers_btn",
-                        type="primary",
-                        use_container_width=True,
-                    ):
-                        completed_now = complete_due_member_transfers(household_id)
-                        if completed_now < 0:
-                            st.error("Complete due transfers requires admin or developer access.")
-                        elif completed_now:
-                            cleanup_orphan_disbursement_artifacts(household_id, selected_month)
-                            st.success(
-                                f"Completed {completed_now} transfer(s) — "
-                                "household allowance expenses and personal incomes updated."
-                            )
-                        else:
-                            st.info("No due transfers to complete.")
-                        rerun_fragment_with_reason("complete_due_transfers")
-
-            transfer_index = {
-                (r["payment_date"][:10], r["recipient_username"], str(r.get("funding_income_stream_id") or "")): r
-                for r in transfer_rows
-                if r.get("payment_date") and r.get("recipient_username")
-            }
-
-            for entry in paycheck_schedule:
-                pay_date_str = str(entry.get("payment_date", ""))[:10]
-                stream_id_str = str(entry.get("stream_id") or "")
-                stream_label = entry.get("stream_label") or ""
-                payouts = entry.get("payouts") or {}
-                st.markdown(f"**{_format_payment_date(pay_date_str)}** — {stream_label}")
-
-                status_rows = []
-                for member in sorted(payouts):
-                    t = transfer_index.get((pay_date_str, member, stream_id_str))
-                    parts = payouts[member]
-                    status = t["status"] if t else "—"
-                    badge = "✅ Transferred" if status == "completed" else ("🕐 Planned" if status == "planned" else "—")
-                    status_rows.append({
-                        "cells": [
-                            member,
-                            _format_ledger_amount(t["obligation_amount"] if t else parts.get("obligation", 0)),
-                            _format_ledger_amount(t["allowance_amount"] if t else parts.get("allowance", 0)),
-                            _format_ledger_amount(t["total_amount"] if t else parts.get("total", 0)),
-                            badge,
-                        ]
-                    })
-                _render_html_scroll_table(
-                    ["Member", "Obligation", "Allowance", "Total", "Status"],
-                    status_rows,
-                    right_align_from=1,
-                    variant="income",
-                )
-
-                for member in sorted(payouts):
-                    t = transfer_index.get((pay_date_str, member, stream_id_str))
-                    if t and t.get("status") == "planned":
-                        btn_key = f"mark_transferred_{t['id']}"
-                        if st.button(
-                            f"Mark transferred — {member} on {_format_payment_date(pay_date_str)}",
-                            key=btn_key,
-                            type="primary",
-                        ):
-                            if complete_member_transfer(str(t["id"])):
-                                st.success(f"Marked as transferred for {member}.")
-                                rerun_fragment_with_reason("complete_transfer")
-                            else:
-                                st.error("Could not mark transfer as completed.")
+                else:
+                    _set_disbursement_flash("info", "All planned transfers already match — nothing to update.")
+                rerun_fragment_with_reason("plan_transfers")
 
 
 def _render_obligations_and_disbursements_panel(household_id, selected_month, member_options):

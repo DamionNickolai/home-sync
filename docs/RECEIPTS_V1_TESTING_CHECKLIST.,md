@@ -1,115 +1,112 @@
-Receipt Upload v1 — Manual Testing Checklist
-1. Access & Permissions
+# Receipt Upload v1 — Manual Testing Checklist
 
- Regular member sees "➕ Quick Expense" in the sidebar after signing in
+---
 
- Unassigned / signed-out user does NOT see the sidebar button
+## 1. Access & Permissions
 
- Quick Expense page opens as a full-width overlay (Back to Dashboard returns correctly)
+- [x] Regular member sees "➕ Quick Expense" in the sidebar after signing in
+- [x] Unassigned / signed-out user does NOT see the sidebar button
+- [x] Quick Expense page opens as a full-width overlay (Back to Dashboard returns correctly)
+- [x] Quick Entry and Scan Receipt tabs are both visible on the overlay
 
- Quick Entry and Scan Receipt tabs are both visible on the overlay
-2. Upload & OCR (Scan Receipt tab)
+---
 
- File picker accepts .jpg, .jpeg, .png, .webp, .pdf; rejects other types
+## 2. Upload & OCR (Scan Receipt tab)
 
- Uploading a clear grocery receipt image → OCR extracts merchant, date, and line items with amounts pre-filled
+- [x] File picker accepts `.jpg`, `.jpeg`, `.png`, `.webp`, `.pdf`; rejects other types
+- [x] Uploading a clear grocery receipt image → OCR extracts merchant, date, and line items with amounts pre-filled
+- [x] Uploading a blurry/unreadable image → app shows "OCR could not extract line items. Add lines manually." and opens an empty review screen (does not crash)
+- [x] Uploading when `[openai] api_key` is blank in secrets → same graceful fallback to manual entry (no error thrown)
+- [x] Receipt date override field is respected (change date before uploading → review screen shows that date)
 
- Uploading a blurry/unreadable image → app shows "OCR could not extract line items. Add lines manually." and opens an empty review screen (does not crash)
+---
 
- Uploading when [openai] api_key is blank in secrets → same graceful fallback to manual entry (no error thrown)
+## 3. Draft List
 
- Receipt date override field is respected (change date before uploading → review screen shows that date)
-3. Draft List
+- [x] After uploading, navigating away and back to Scan Receipt → the draft appears in the "Resume a draft receipt" list
+- [x] Clicking Resume on a draft loads the review screen with previously saved lines
+- [x] Clicking 🗑 archives the draft; it disappears from the list immediately
 
- After uploading, navigating away and back to Scan Receipt → the draft appears in the "Resume a draft receipt" list
+---
 
- Clicking Resume on a draft loads the review screen with previously saved lines
+## 4. Review Screen — Header
 
- Clicking 🗑 archives the draft; it disappears from the list immediately
-4. Review Screen — Header
+- [x] Merchant, Date, and Total fields are editable and pre-filled from OCR
+- [x] Changing merchant/date/total and clicking Save Draft → values persist when resuming the draft
+- [x] If a storage image was uploaded, an expandable Receipt image section shows the preview
 
- Merchant, Date, and Total fields are editable and pre-filled from OCR
+---
 
- Changing merchant/date/total and clicking Save Draft → values persist when resuming the draft
+## 5. Review Screen — Line Editor
 
- If a storage image was uploaded, an expandable Receipt image section shows the preview
-5. Review Screen — Line Editor
+- [x] Each line shows Description, Amount, and Ledger Target
+- [x] Regular member: Ledger target dropdown only shows Personal (and HH Obligation if they have obligation assignments)
+- [x] Admin/developer: Ledger target shows all four options (Personal, HH Obligation, HH Shared, Project)
+- [x] Switching ledger target updates the Category picker to match that target's options
+- [x] Switching to Project hides the Category picker and shows the Project selector instead
+- [x] ＋ Add line button appends a blank row
+- [] Entering a non-numeric amount → field is ignored at post time (soft, not a hard block in v1)
 
- Each line shows Description, Amount, and Ledger Target
+---
 
- Regular member: Ledger target dropdown only shows Personal (and HH Obligation if they have obligation assignments)
+## 6. Category Picker & Inline Create
 
- Admin/developer: Ledger target shows all four options (Personal, HH Obligation, HH Shared, Project)
+- [x] Personal line → shows only that member's personal categories
+- [x] HH Obligation line → shows only that member's assigned obligation categories
+- [x] HH Shared line → shows household shared categories (admin only)
+- [x] Project line → shows active project list only
+- [x] "Add new category" expander for personal target → entering parent + sub + budget and clicking Create → new category appears in the picker on next reload of the review screen
+- [x] "Add new category" for `hh_shared` → non-admin sees "Only admins can create Household categories" message, no form
+- [OYfDaFoR7MLHYqDbXtivnQ] "Add new category" for project → shows "Projects are managed in the Projects module" message, no form
 
- Switching ledger target updates the Category picker to match that target's options
+---
 
- Switching to Project hides the Category picker and shows the Project selector instead
+## 7. Save Draft
 
- ＋ Add line button appends a blank row
+- [x] Clicking Save Draft without posting → "Draft saved." confirmation; no expense rows appear in Budget → Expenses
+- [x] Resuming the draft afterward shows the same lines in the same state
 
- Entering a non-numeric amount → field is ignored at post time (soft, not a hard block in v1)
-6. Category Picker & Inline Create
+---
 
- Personal line → shows only that member's personal categories
+## 8. Post to Ledger — Happy Paths
 
- HH Obligation line → shows only that member's assigned obligation categories
+- [x] Personal line with category → expense appears in that member's Personal ledger under the selected category
+- [x] HH Obligation line with category → expense appears in the Household ledger under the obligation category; member's personal ledger reflects it if integration is on
+- [x] HH Shared line with category (admin) → expense appears in the Household shared budget
+- [x] Project line with project selected → project actual cost increments; expense logged under the Projects category
+- [x] All lines posted successfully → receipt status changes to posted; review screen closes and returns to the upload form
 
- HH Shared line → shows household shared categories (admin only)
+---
 
- Project line → shows active project list only
+## 9. Post to Ledger — Uncategorized Fallback
 
- "Add new category" expander for personal target → entering parent + sub + budget and clicking Create → new category appears in the picker on next reload of the review screen
+- [x] Allow uncategorized ON (default): posting a personal line with no category selected → Receipt / Uncategorized personal category is auto-created and the expense lands there
+- [x] Allow uncategorized ON: posting an HH Shared line with no category → Receipt / Uncategorized HH category created; expense lands there
+- [x] Allow uncategorized OFF: posting any line with no category → error message "Category required. Select a category or enable uncategorized posting."
+- [x] HH Obligation line with no category → always blocked regardless of the uncategorized toggle (no safe default bucket)
+- [x] Project line with no project selected → always blocked with "No project selected for this line."
+- [x] Expenses in Receipt / Uncategorized are visible and editable in Budget → Expenses (one-time expenses list) for later recategorization
 
- "Add new category" for hh_shared → non-admin sees "Only admins can create Household categories" message, no form
+---
 
- "Add new category" for project → shows "Projects are managed in the Projects module" message, no form
-7. Save Draft
+## 10. Partial Post & Error Recovery
 
- Clicking Save Draft without posting → "Draft saved." confirmation; no expense rows appear in Budget → Expenses
+- [x] Mix of valid and invalid lines (e.g., one personal line ready, one obligation line without a category) → valid line posts; failed line shows inline error; review screen stays open with failed lines editable
+- [x] After fixing a failed line, clicking Post again → remaining line posts; receipt marked posted
 
- Resuming the draft afterward shows the same lines in the same state
-8. Post to Ledger — Happy Paths
+---
 
- Personal line with category → expense appears in that member's Personal ledger under the selected category
+## 11. Permission Guardrails (server-side)
 
- HH Obligation line with category → expense appears in the Household ledger under the obligation category; member's personal ledger reflects it if integration is on
+- [x] Regular member cannot select `hh_shared` or project ledger target (UI hides them; even if tampered, DB write returns false)
+- [x] Member posting to an obligation category not in their assignment list → `log_household_expense_from_personal` rejects it; error shown
+- [x] Receipt draft not visible to another household member who didn't upload it (and is not admin)
 
- HH Shared line with category (admin) → expense appears in the Household shared budget
+---
 
- Project line with project selected → project actual cost increments; expense logged under the Projects category
+## 12. Edge Cases
 
- All lines posted successfully → receipt status changes to posted; review screen closes and returns to the upload form
-9. Post to Ledger — Uncategorized Fallback
-
- Allow uncategorized ON (default): posting a personal line with no category selected → Receipt / Uncategorized personal category is auto-created and the expense lands there
-
- Allow uncategorized ON: posting an HH Shared line with no category → Receipt / Uncategorized HH category created; expense lands there
-
- Allow uncategorized OFF: posting any line with no category → error message "Category required. Select a category or enable uncategorized posting."
-
- HH Obligation line with no category → always blocked regardless of the uncategorized toggle (no safe default bucket)
-
- Project line with no project selected → always blocked with "No project selected for this line."
-
- Expenses in Receipt / Uncategorized are visible and editable in Budget → Expenses (one-time expenses list) for later recategorization
-10. Partial Post & Error Recovery
-
- Mix of valid and invalid lines (e.g., one personal line ready, one obligation line without a category) → valid line posts; failed line shows inline error; review screen stays open with failed lines editable
-
- After fixing a failed line, clicking Post again → remaining line posts; receipt marked posted
-11. Permission Guardrails (server-side)
-
- Regular member cannot select hh_shared or project ledger target (UI hides them; even if tampered, DB write returns false)
-
- Member posting to an obligation category not in their assignment list → log_household_expense_from_personal rejects it; error shown
-
- Receipt draft not visible to another household member who didn't upload it (and is not admin)
-12. Edge Cases
-
- Uploading a second receipt while a draft is already open → draft list shows both; each resumes independently
-
- Receipt with a single line item → posts normally (no "empty lines" error)
-
- Line amount of $0.00 or blank → blocked with "Amount must be greater than zero" at post time
-
- Very long description (200+ chars) → truncated gracefully; does not break the layout
+- [x] Uploading a second receipt while a draft is already open → draft list shows both; each resumes independently
+- [x] Receipt with a single line item → posts normally (no "empty lines" error)
+- [x] Line amount of $0.00 or blank → blocked with "Amount must be greater than zero" at post time
+- [x] Very long description (200+ chars) → truncated gracefully; does not break the layout

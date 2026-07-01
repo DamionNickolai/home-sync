@@ -352,5 +352,222 @@ class DisbursementAutomationTests(unittest.TestCase):
         self.assertFalse(insert_payload["is_personal_spend"])
 
 
+class SyncDisbursementPlanTests(unittest.TestCase):
+    """Tests for sync_disbursement_plan: freeze, rollover, stale detection."""
+
+    def _schedule_rows(self, obl=100.0, allow=50.0):
+        return [
+            {
+                "payment_date": "2026-07-15",
+                "stream_id": "stream-1",
+                "recipient_username": "Angelle",
+                "obligation": obl,
+                "allowance": allow,
+            }
+        ]
+
+    def test_historical_month_is_noop(self):
+        with patch.object(database, "_transfer_rows_from_disbursement_schedule", return_value=[]), \
+             patch.object(database, "get_member_transfers", return_value=[]):
+            result = database.sync_disbursement_plan("home-1", "2025-01")
+        self.assertEqual(result["action"], "historical-noop")
+        self.assertEqual(result["inserted"], 0)
+
+    def test_current_month_with_existing_rows_is_frozen(self):
+        existing = [{
+            "payment_date": "2026-06-25",
+            "recipient_username": "Angelle",
+            "funding_income_stream_id": "stream-1",
+            "obligation_amount": 100.0,
+            "allowance_amount": 50.0,
+            "status": "planned",
+            "id": "t1",
+        }]
+        schedule = [{
+            "payment_date": "2026-06-25",
+            "stream_id": "stream-1",
+            "recipient_username": "Angelle",
+            "obligation": 100.0,
+            "allowance": 50.0,
+        }]
+        tz = __import__("zoneinfo").ZoneInfo("America/Chicago")
+        cur = __import__("datetime").datetime.now(tz).strftime("%Y-%m")
+        with patch.object(database, "_transfer_rows_from_disbursement_schedule", return_value=schedule), \
+             patch.object(database, "get_member_transfers", return_value=existing):
+            result = database.sync_disbursement_plan("home-1", cur)
+        self.assertEqual(result["action"], "frozen")
+        self.assertEqual(result["inserted"], 0)
+        self.assertEqual(result["updated"], 0)
+        self.assertFalse(result["stale"])
+
+    def test_current_month_frozen_detects_stale_amounts(self):
+        existing = [{
+            "payment_date": "2026-06-25",
+            "recipient_username": "Angelle",
+            "funding_income_stream_id": "stream-1",
+            "obligation_amount": 100.0,
+            "allowance_amount": 50.0,
+            "status": "planned",
+            "id": "t1",
+        }]
+        schedule = [{
+            "payment_date": "2026-06-25",
+            "stream_id": "stream-1",
+            "recipient_username": "Angelle",
+            "obligation": 120.0,
+            "allowance": 60.0,
+        }]
+        tz = __import__("zoneinfo").ZoneInfo("America/Chicago")
+        cur = __import__("datetime").datetime.now(tz).strftime("%Y-%m")
+        table = MagicMock()
+        with patch.object(database, "_transfer_rows_from_disbursement_schedule", return_value=schedule), \
+             patch.object(database, "get_member_transfers", return_value=existing), \
+             patch.object(database, "_upsert_disbursement_reconciliation", return_value=True) as upsert_rec, \
+             patch.object(database, "get_disbursement_reconciliation", return_value=None):
+            result = database.sync_disbursement_plan("home-1", cur)
+        self.assertEqual(result["action"], "frozen")
+        self.assertTrue(result["stale"])
+        upsert_rec.assert_called_once_with("home-1", cur, plan_stale=True)
+
+    def test_next_month_rollover_inserts_new_slots(self):
+        tz = __import__("zoneinfo").ZoneInfo("America/Chicago")
+        now = __import__("datetime").datetime.now(tz)
+        m = now.month
+        y = now.year
+        next_y, next_m = (y + 1, 1) if m == 12 else (y, m + 1)
+        next_month = f"{next_y}-{next_m:02d}"
+        schedule = self._schedule_rows()
+        table = MagicMock()
+        table.insert.return_value.execute.return_value.data = [{"id": "new-t"}]
+        with patch.object(database, "_transfer_rows_from_disbursement_schedule", return_value=schedule), \
+             patch.object(database, "get_member_transfers", return_value=[]), \
+             patch.object(database, "get_member_transfers_table", return_value="transfers_dev"), \
+             patch.object(database, "_upsert_disbursement_reconciliation", return_value=True) as upsert_rec, \
+             patch.object(database, "get_disbursement_reconciliation", return_value=None), \
+             patch.object(database, "supabase") as supabase_mock:
+            supabase_mock.table.return_value = table
+            result = database.sync_disbursement_plan("home-1", next_month)
+        self.assertEqual(result["inserted"], 1)
+        self.assertEqual(result["action"], "first-insert")
+        self.assertTrue(result["new_month"])
+        upsert_rec.assert_called_once()
+
+    def test_next_month_rollover_updates_planned_row_amounts(self):
+        tz = __import__("zoneinfo").ZoneInfo("America/Chicago")
+        now = __import__("datetime").datetime.now(tz)
+        m = now.month
+        y = now.year
+        next_y, next_m = (y + 1, 1) if m == 12 else (y, m + 1)
+        next_month = f"{next_y}-{next_m:02d}"
+        existing = [{
+            "payment_date": f"{next_month}-15",
+            "recipient_username": "Angelle",
+            "funding_income_stream_id": "stream-1",
+            "obligation_amount": 80.0,
+            "allowance_amount": 40.0,
+            "status": "planned",
+            "id": "t-old",
+        }]
+        schedule = [{
+            "payment_date": f"{next_month}-15",
+            "stream_id": "stream-1",
+            "recipient_username": "Angelle",
+            "obligation": 100.0,
+            "allowance": 50.0,
+        }]
+        table = MagicMock()
+        with patch.object(database, "_transfer_rows_from_disbursement_schedule", return_value=schedule), \
+             patch.object(database, "get_member_transfers", return_value=existing), \
+             patch.object(database, "get_member_transfers_table", return_value="transfers_dev"), \
+             patch.object(database, "_upsert_disbursement_reconciliation", return_value=True), \
+             patch.object(database, "get_disbursement_reconciliation", return_value=None), \
+             patch.object(database, "supabase") as supabase_mock:
+            supabase_mock.table.return_value = table
+            result = database.sync_disbursement_plan("home-1", next_month)
+        self.assertEqual(result["updated"], 1)
+        self.assertEqual(result["inserted"], 0)
+
+    def test_next_month_rollover_deletes_orphan_planned_slots(self):
+        tz = __import__("zoneinfo").ZoneInfo("America/Chicago")
+        now = __import__("datetime").datetime.now(tz)
+        m = now.month
+        y = now.year
+        next_y, next_m = (y + 1, 1) if m == 12 else (y, m + 1)
+        next_month = f"{next_y}-{next_m:02d}"
+        # Existing row no longer in computed schedule
+        existing = [{
+            "payment_date": f"{next_month}-01",
+            "recipient_username": "Jason",
+            "funding_income_stream_id": "stream-99",
+            "obligation_amount": 50.0,
+            "allowance_amount": 25.0,
+            "status": "planned",
+            "id": "t-orphan",
+        }]
+        schedule = []  # no slots computed
+        table = MagicMock()
+        with patch.object(database, "_transfer_rows_from_disbursement_schedule", return_value=schedule), \
+             patch.object(database, "get_member_transfers", return_value=existing), \
+             patch.object(database, "get_member_transfers_table", return_value="transfers_dev"), \
+             patch.object(database, "_upsert_disbursement_reconciliation", return_value=True), \
+             patch.object(database, "get_disbursement_reconciliation", return_value=None), \
+             patch.object(database, "supabase") as supabase_mock:
+            supabase_mock.table.return_value = table
+            result = database.sync_disbursement_plan("home-1", next_month)
+        self.assertEqual(result["deleted"], 1)
+
+    def test_completed_rows_are_never_deleted_during_rollover(self):
+        tz = __import__("zoneinfo").ZoneInfo("America/Chicago")
+        now = __import__("datetime").datetime.now(tz)
+        m = now.month
+        y = now.year
+        next_y, next_m = (y + 1, 1) if m == 12 else (y, m + 1)
+        next_month = f"{next_y}-{next_m:02d}"
+        existing = [{
+            "payment_date": f"{next_month}-05",
+            "recipient_username": "Jason",
+            "funding_income_stream_id": "stream-1",
+            "obligation_amount": 50.0,
+            "allowance_amount": 25.0,
+            "status": "completed",  # must not be touched
+            "id": "t-done",
+        }]
+        schedule = []  # not in schedule
+        table = MagicMock()
+        with patch.object(database, "_transfer_rows_from_disbursement_schedule", return_value=schedule), \
+             patch.object(database, "get_member_transfers", return_value=existing), \
+             patch.object(database, "get_member_transfers_table", return_value="transfers_dev"), \
+             patch.object(database, "_upsert_disbursement_reconciliation", return_value=True), \
+             patch.object(database, "get_disbursement_reconciliation", return_value=None), \
+             patch.object(database, "supabase") as supabase_mock:
+            supabase_mock.table.return_value = table
+            result = database.sync_disbursement_plan("home-1", next_month)
+        self.assertEqual(result["deleted"], 0)
+        table.delete.assert_not_called()
+
+
+class DisbursementReadinessTests(unittest.TestCase):
+    def test_readiness_missing_income_streams(self):
+        with patch.object(database, "get_household_income_stream_options", return_value=[]), \
+             patch.object(database, "compute_household_obligations", return_value={"lines": []}), \
+             patch.object(database, "compute_household_disbursement_plan", return_value={"member_bundled_amounts": {}}):
+            result = database.get_disbursement_readiness("home-1")
+        self.assertFalse(result["ready"])
+        self.assertFalse(result["has_income_streams"])
+
+    def test_readiness_complete(self):
+        with patch.object(database, "get_household_income_stream_options", return_value=[{"stream_id": "s1"}]), \
+             patch.object(database, "compute_household_obligations", return_value={
+                 "lines": [{"member_username": "Angelle", "category_id": "c1", "projected_amount": 100.0}]
+             }), \
+             patch.object(database, "compute_household_disbursement_plan", return_value={
+                 "member_bundled_amounts": {"Angelle": {"total_amount": 100.0}}
+             }), \
+             patch.object(database, "get_member_funding_streams", return_value=["s1"]):
+            result = database.get_disbursement_readiness("home-1")
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["members_missing_streams"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -6,6 +6,7 @@ from household_obligations import (
     build_parent_summaries,
     compute_allowance_coverage,
     compute_supplement_gap,
+    is_assignable_household_category,
     reconcile_displacement,
     resolve_obligation_lines,
 )
@@ -130,6 +131,34 @@ class HouseholdObligationMathTests(unittest.TestCase):
         summaries = build_parent_summaries(lines, parent_map)
         food = next(s for s in summaries if s["parent_category_name"] == "Food")
         self.assertEqual(len(food["unassigned_subs"]), 2)
+
+    def test_taxes_category_not_assignable_for_obligations(self):
+        taxes_row = {
+            "id": "cat-tax",
+            "category_name": "Taxes",
+            "sub_category_name": "General",
+            "target_budget": 500.0,
+            "is_personal": False,
+        }
+        self.assertFalse(is_assignable_household_category(taxes_row))
+
+        parent_map, override_map = build_assignment_maps(
+            [
+                {
+                    "assignment_level": "parent",
+                    "parent_category_name": "Taxes",
+                    "member_username": "wife",
+                    "is_active": True,
+                }
+            ]
+        )
+        lines = resolve_obligation_lines(
+            self.categories + [taxes_row], parent_map, override_map
+        )
+        tax_lines = [line for line in lines if line.get("parent_category_name") == "Taxes"]
+        self.assertEqual(tax_lines, [])
+        summaries = build_parent_summaries(lines, parent_map)
+        self.assertNotIn("Taxes", [s["parent_category_name"] for s in summaries])
 
 
 if __name__ == "__main__":

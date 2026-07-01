@@ -10,6 +10,11 @@ from household_disbursements import (
     disbursement_allowance_surplus_flags,
     disbursement_review_flags,
     filter_disbursement_eligible_usernames,
+    split_amount_across_slots,
+    member_monthly_plan_stale,
+    aggregate_member_monthly_amounts,
+    per_slot_split_drift_lines,
+    transfer_slot_amounts_match,
     sum_transfer_allowance_total,
     summarize_monthly_disbursement,
     typical_paycheck_count_for_streams,
@@ -34,6 +39,53 @@ class HouseholdDisbursementTests(unittest.TestCase):
         shares = compute_surplus_shares(pool, ["Jason", "Angelle"])
         self.assertAlmostEqual(shares["Jason"], 300.0)
         self.assertAlmostEqual(shares["Angelle"], 300.0)
+        self.assertAlmostEqual(sum(shares.values()), pool, places=2)
+
+    def test_surplus_shares_distribute_remainder_cents(self):
+        pool = 600.01
+        shares = compute_surplus_shares(pool, ["Jason", "Angelle"])
+        self.assertAlmostEqual(sum(shares.values()), pool, places=2)
+
+    def test_split_amount_across_slots_sums_exactly(self):
+        parts = split_amount_across_slots(100.01, 3)
+        self.assertEqual(len(parts), 3)
+        self.assertAlmostEqual(sum(parts), 100.01, places=2)
+
+    def test_transfer_slot_amounts_match_within_tolerance(self):
+        saved = (33.33, 100.00)
+        computed = (33.34, 100.00)
+        self.assertTrue(transfer_slot_amounts_match(saved, computed))
+        self.assertFalse(transfer_slot_amounts_match(saved, (33.50, 100.00)))
+
+    def test_member_monthly_plan_not_stale_when_only_per_paycheck_split_differs(self):
+        """Same monthly member totals with different per-slot splits should not be stale."""
+        saved = {
+            ("2026-06-10", "Jason", "s1"): (0.0, 150.0),
+            ("2026-06-24", "Jason", "s2"): (0.0, 150.0),
+            ("2026-06-25", "Jason", "s3"): (0.0, 50.0),
+            ("2026-06-25", "Jason", "s4"): (0.0, 50.0),
+        }
+        computed = {
+            ("2026-06-10", "Jason", "s1"): (0.0, 100.0),
+            ("2026-06-24", "Jason", "s2"): (0.0, 100.0),
+            ("2026-06-25", "Jason", "s3"): (0.0, 100.0),
+            ("2026-06-25", "Jason", "s4"): (0.0, 100.0),
+        }
+        self.assertFalse(member_monthly_plan_stale(saved, computed))
+        self.assertEqual(len(per_slot_split_drift_lines(saved, computed)), 4)
+
+    def test_paycheck_schedule_monthly_totals_match_bundles(self):
+        pay_dates = [date(2026, 6, 6), date(2026, 6, 20), date(2026, 6, 27)]
+        needs = {"Angelle": 100.01}
+        shares = {"Jason": 200.02, "Angelle": 200.02}
+        schedule = build_paycheck_disbursement_schedule(pay_dates, needs, shares)
+        bundles = compute_member_bundled_amounts(needs, shares)
+
+        for member, bundle in bundles.items():
+            scheduled_obl = sum(s["payouts"][member]["obligation"] for s in schedule)
+            scheduled_allow = sum(s["payouts"][member]["allowance"] for s in schedule)
+            self.assertAlmostEqual(scheduled_obl, bundle["obligation_amount"], places=2)
+            self.assertAlmostEqual(scheduled_allow, bundle["allowance_amount"], places=2)
 
     def test_surplus_pool_zero_when_obligations_exceed_income(self):
         pool = compute_surplus_pool(1000.0, 1500.0)
@@ -190,6 +242,14 @@ class MemberTransferRulesTests(unittest.TestCase):
             current_surplus_pool=600.0,
             planned_allowance_total=600.0,
             recommended_allowance_total=600.0,
+        )
+        self.assertEqual(flags, [])
+
+    def test_allowance_surplus_flags_tolerate_small_rounding_drift(self):
+        flags = disbursement_allowance_surplus_flags(
+            current_surplus_pool=600.00,
+            planned_allowance_total=600.03,
+            recommended_allowance_total=600.00,
         )
         self.assertEqual(flags, [])
 
