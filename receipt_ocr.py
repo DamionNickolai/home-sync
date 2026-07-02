@@ -30,6 +30,7 @@ Schema:
   "merchant": "<store name or null>",
   "date": "<YYYY-MM-DD or null>",
   "total": <number or null>,
+  "tax": <number or null>,
   "lines": [
     {"description": "<item name>", "amount": <number or null>},
     ...
@@ -37,8 +38,9 @@ Schema:
 }
 
 Rules:
-- Include every distinct line item that has a price.
-- Omit subtotal, tax, and total rows — capture only items.
+- Include every distinct product or service line item that has a price (use pre-tax item amounts when shown).
+- Extract total sales tax into "tax". If the receipt shows multiple tax lines, sum them into "tax".
+- Omit subtotal and total rows from "lines" — do not list tax as a line item.
 - Use null when a value cannot be determined.
 - Do not include any text outside the JSON object.
 """
@@ -305,6 +307,7 @@ def _parse_response(raw: str) -> dict | None:
         "merchant": _str_or_none(data.get("merchant")),
         "date": _parse_date(data.get("date")),
         "total": _float_or_none(data.get("total")),
+        "tax": _float_or_none(data.get("tax")),
         "lines": [],
     }
     for ln in data.get("lines") or []:

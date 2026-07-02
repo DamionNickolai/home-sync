@@ -7,6 +7,11 @@ import html
 from zoneinfo import ZoneInfo
 from datetime import datetime, date
 
+from household_disbursements import (
+    aggregate_member_bundles_from_transfers,
+    build_paycheck_schedule_from_transfers,
+    sum_transfer_monthly_total,
+)
 from database import (
     get_project_budgets,
     update_project_budget_item,
@@ -102,6 +107,7 @@ from database import (
     repair_disbursement_allowance_incomes,
     auto_materialize_disbursement_plan,
     sync_disbursement_plan,
+    transfer_row_occurrence_key,
     get_disbursement_reconciliation,
     get_disbursement_plan_drift,
     acknowledge_disbursement_plan,
@@ -170,7 +176,7 @@ def _arm_disbursement_reset_autocomplete_hold(household_id) -> None:
 
 
 # Bump when allowance income repair logic changes so existing sessions re-run once.
-DISBURSEMENT_INCOME_REPAIR_VERSION = 5
+DISBURSEMENT_INCOME_REPAIR_VERSION = 6
 
 
 def maybe_run_disbursement_income_repair(household_id, selected_month=None) -> None:
@@ -256,7 +262,7 @@ def maybe_run_household_automation(household_id, selected_month=None, *, rerun_s
         changed = changed or bool(expense_rolled or income_rolled)
 
     # Disbursement sync (current month stale-check + next month full sync)
-    disburse_guard = f"disburse_materialized_{household_id}_{month_year}"
+    disburse_guard = f"disburse_materialized_v3_{household_id}_{month_year}"
     if not st.session_state.get(disburse_guard):
         n = _run_disbursement_automation_server_side(household_id, month_year)
         st.session_state[disburse_guard] = True
@@ -1120,6 +1126,18 @@ def _render_annual_income_metrics(annual_totals: dict) -> None:
     ], desktop_columns=4)
 
 
+def _income_row_status_badge(row) -> str:
+    """Return a Planned / Received label for a Cash Flow income row."""
+    pay_date_str = str(row.get("payment_date") or "")[:10]
+    if not pay_date_str:
+        return ""
+    try:
+        pay_date = date.fromisoformat(pay_date_str)
+    except ValueError:
+        return ""
+    return "Received" if pay_date <= date.today() else "Planned"
+
+
 def _render_income_streams_list(incomes_df, *, is_personal=False, annual_totals=None):
     if incomes_df is None or incomes_df.empty:
         st.info("No income logged for this month.")
@@ -1129,9 +1147,9 @@ def _render_income_streams_list(incomes_df, *, is_personal=False, annual_totals=
         return
 
     if is_personal:
-        headers = ["Source", "Net (Per Payment)", "Gross (Per Payment)", "Frequency", "Payment Date"]
+        headers = ["Source", "Net (Per Payment)", "Gross (Per Payment)", "Frequency", "Payment Date", "Status"]
     else:
-        headers = ["Source", "Earner", "Net (Per Payment)", "Gross (Per Payment)", "Frequency", "Payment Date"]
+        headers = ["Source", "Earner", "Net (Per Payment)", "Gross (Per Payment)", "Frequency", "Payment Date", "Status"]
 
     table_rows = []
     for _, row in incomes_df.iterrows():
@@ -1144,6 +1162,7 @@ def _render_income_streams_list(incomes_df, *, is_personal=False, annual_totals=
             _format_ledger_amount(row.get("gross_amount", 0)),
             income_pay_frequency_label(row.get("pay_frequency")),
             _format_payment_date(row.get("payment_date")),
+            _income_row_status_badge(row),
         ])
         table_rows.append({"cells": cells})
 
@@ -1783,6 +1802,26 @@ def _render_disbursement_flash() -> None:
         st.warning(message)
 
 
+def _disbursement_saved_plan_view(saved_transfers, stream_options, computed_plan):
+    """Use saved transfer rows for the monthly plan display when they exist."""
+    if saved_transfers:
+        labels = {
+            str(opt.get("stream_id") or ""): opt.get("label") or ""
+            for opt in (stream_options or [])
+        }
+        return (
+            aggregate_member_bundles_from_transfers(saved_transfers),
+            build_paycheck_schedule_from_transfers(saved_transfers, labels),
+            sum_transfer_monthly_total(saved_transfers),
+        )
+    summary = computed_plan.get("monthly_summary") or {}
+    return (
+        computed_plan.get("member_bundled_amounts") or {},
+        computed_plan.get("paycheck_schedule") or [],
+        summary.get("monthly_disbursement_total", 0),
+    )
+
+
 def _build_disbursement_editor_rows(
     paycheck_schedule: list,
     saved_transfers: list,
@@ -1793,6 +1832,39 @@ def _build_disbursement_editor_rows(
         str(opt.get("stream_id") or ""): opt.get("label") or ""
         for opt in (stream_options or [])
     }
+    if saved_transfers:
+        editor_rows: list[dict] = []
+        for entry in build_paycheck_schedule_from_transfers(saved_transfers, stream_label_by_id):
+            pay_date_str = str(entry.get("payment_date", ""))[:10]
+            stream_id = str(entry.get("stream_id") or "")
+            stream_label = entry.get("stream_label") or stream_label_by_id.get(stream_id, stream_id)
+            for member in sorted(entry.get("payouts") or {}):
+                parts = entry["payouts"][member]
+                saved = next(
+                    (
+                        r for r in saved_transfers
+                        if str(r.get("payment_date") or "")[:10] == pay_date_str
+                        and r.get("recipient_username") == member
+                        and str(r.get("funding_income_stream_id") or "") == stream_id
+                    ),
+                    None,
+                )
+                obl = round(float(saved.get("obligation_amount") if saved else parts.get("obligation", 0) or 0), 2)
+                allow = round(float(saved.get("allowance_amount") if saved else parts.get("allowance", 0) or 0), 2)
+                editor_rows.append({
+                    "Pay Date": pay_date_str,
+                    "Stream": stream_label,
+                    "Member": member,
+                    "Obligation ($)": obl,
+                    "Allowance ($)": allow,
+                    "Status": ((saved or {}).get("status") or "planned").title(),
+                    "_stream_id": stream_id,
+                    "_plan_obligation": obl,
+                    "_plan_allowance": allow,
+                })
+        editor_rows.sort(key=lambda r: (r["Pay Date"], r["Stream"], r["Member"]))
+        return editor_rows
+
     saved_by_key = {
         (r["payment_date"][:10], r["recipient_username"], str(r.get("funding_income_stream_id") or "")): r
         for r in saved_transfers
@@ -1859,17 +1931,21 @@ def _render_disbursement_plan_tab(household_id, selected_month):
     plan = compute_household_disbursement_plan(household_id, selected_month)
     summary = plan.get("monthly_summary") or {}
     review_flags = plan.get("review_flags") or []
-    bundled = plan.get("member_bundled_amounts") or {}
-    per_member_stream_info = plan.get("per_member_stream_info") or {}
-    paycheck_schedule = plan.get("paycheck_schedule") or []
     stream_options = get_household_income_stream_options(household_id)
     saved_transfers = get_member_transfers(household_id, selected_month)
+    bundled, paycheck_schedule, monthly_transfer_total = _disbursement_saved_plan_view(
+        saved_transfers, stream_options, plan
+    )
+    per_member_stream_info = plan.get("per_member_stream_info") or {}
     drift = get_disbursement_plan_drift(household_id, selected_month)
     rec = get_disbursement_reconciliation(household_id, selected_month)
     plan_is_stale = bool(drift.get("stale"))
+    using_saved_plan = bool(saved_transfers)
 
     # ── Section 1: Audit banners ──────────────────────────────────────
-    audit_flags = get_disbursement_automation_audit_flags(household_id, selected_month)
+    audit_flags = get_disbursement_automation_audit_flags(
+        household_id, selected_month, surface="tab"
+    )
     for flag in audit_flags:
         kind = flag.get("kind")
         msg = flag.get("message", "")
@@ -1882,6 +1958,8 @@ def _render_disbursement_plan_tab(household_id, selected_month):
                 if st.button("Plan looks good", key="ack_disbursement_plan_btn", type="primary"):
                     acknowledge_disbursement_plan(household_id, selected_month)
                     rerun_fragment_with_reason("plan_acknowledged")
+        elif kind == "plan_accepted":
+            st.success(msg)
         elif kind == "plan_stale":
             st.warning(msg)
         elif sev == "error":
@@ -1890,6 +1968,16 @@ def _render_disbursement_plan_tab(household_id, selected_month):
             st.info(msg)
         else:
             st.warning(msg)
+
+    if using_saved_plan and not (rec and rec.get("reviewed")):
+        snapshot = rec.get("plan_snapshot") if rec else {}
+        if not isinstance(snapshot, dict):
+            snapshot = {}
+        if snapshot.get("copied_from_month"):
+            st.caption(
+                f"Transfer amounts copied from {snapshot['copied_from_month']}. "
+                "Adjust below if needed, then click **Plan looks good**."
+            )
 
     if plan_is_stale and drift.get("has_saved_rows"):
         st.warning(
@@ -1912,8 +2000,14 @@ def _render_disbursement_plan_tab(household_id, selected_month):
         split_preview = drift.get("slot_split_lines") or []
         if split_preview:
             st.caption("\n".join(f"• {line}" for line in split_preview[:5]))
+    elif drift.get("computed_diff_available") and is_admin and not (rec and rec.get("reviewed")):
+        st.caption(
+            "Live-computed amounts differ from saved transfers (expected when carrying forward "
+            "last month's plan). Use **Advanced → Reset plan** only if you want this month's "
+            "amounts recalculated from current income."
+        )
 
-    if review_flags:
+    if review_flags and not using_saved_plan:
         st.warning(
             "**Extra paycheck month — review recommended**\n\n"
             + "\n".join(f"• {f['message']}" for f in review_flags)
@@ -1921,8 +2015,10 @@ def _render_disbursement_plan_tab(household_id, selected_month):
             "Adjust in the Advanced section below if needed."
         )
 
-    # Reconciliation last-reviewed line
-    if rec and rec.get("reviewed"):
+    # Reconciliation last-reviewed line (only when not already shown via plan_accepted banner)
+    if rec and rec.get("reviewed") and not any(
+        f.get("kind") == "plan_accepted" for f in audit_flags
+    ):
         reviewed_by = rec.get("reviewed_by") or ""
         reviewed_at = str(rec.get("reviewed_at") or "")[:10]
         st.caption(f"Last reviewed {reviewed_at} · by {reviewed_by}")
@@ -1942,7 +2038,7 @@ def _render_disbursement_plan_tab(household_id, selected_month):
                 "value": f"${plan.get('surplus_pool', 0):,.2f}",
                 "help": "Income left after all assigned obligation targets.",
             },
-            {"label": "Monthly transfers", "value": f"${summary.get('monthly_disbursement_total', 0):,.2f}"},
+            {"label": "Monthly transfers", "value": f"${monthly_transfer_total:,.2f}"},
         ],
         desktop_columns=4,
     )
@@ -2030,17 +2126,18 @@ def _render_disbursement_plan_tab(household_id, selected_month):
             for opt in (stream_options or [])
         }
 
-        summary_parts = []
-        for member in sorted(per_member_stream_info):
-            info = per_member_stream_info[member]
-            if info.get("stream_ids"):
-                streams_display = info.get("display") or ", ".join(info["stream_ids"])
-                count = info.get("paycheck_count", 0)
-                summary_parts.append(
-                    f"**{member}**: {streams_display} · {count} paycheck(s) this month"
-                )
-        if summary_parts:
-            st.markdown("  \n".join(summary_parts))
+        if not using_saved_plan:
+            summary_parts = []
+            for member in sorted(per_member_stream_info):
+                info = per_member_stream_info[member]
+                if info.get("stream_ids"):
+                    streams_display = info.get("display") or ", ".join(info["stream_ids"])
+                    count = info.get("paycheck_count", 0)
+                    summary_parts.append(
+                        f"**{member}**: {streams_display} · {count} paycheck(s) this month"
+                    )
+            if summary_parts:
+                st.markdown("  \n".join(summary_parts))
 
         saved_by_key = {
             (r["payment_date"][:10], r["recipient_username"], str(r.get("funding_income_stream_id") or "")): r
@@ -2066,14 +2163,17 @@ def _render_disbursement_plan_tab(household_id, selected_month):
             for member in sorted(payouts):
                 t = transfer_index.get((pay_date_str, member, stream_id_str))
                 parts = payouts[member]
-                status = t["status"] if t else "—"
-                badge = "✅ Transferred" if status == "completed" else ("🕐 Planned" if status == "planned" else "—")
+                status = t["status"] if t else "planned"
+                badge = "✅ Transferred" if status == "completed" else "🕐 Planned"
+                obl_amt = t["obligation_amount"] if t else parts.get("obligation", 0)
+                allow_amt = t["allowance_amount"] if t else parts.get("allowance", 0)
+                total_amt = t["total_amount"] if t else parts.get("total", 0)
                 status_rows.append({
                     "cells": [
                         member,
-                        _format_ledger_amount(t["obligation_amount"] if t else parts.get("obligation", 0)),
-                        _format_ledger_amount(t["allowance_amount"] if t else parts.get("allowance", 0)),
-                        _format_ledger_amount(t["total_amount"] if t else parts.get("total", 0)),
+                        _format_ledger_amount(obl_amt),
+                        _format_ledger_amount(allow_amt),
+                        _format_ledger_amount(total_amt),
                         badge,
                     ]
                 })
@@ -2083,23 +2183,7 @@ def _render_disbursement_plan_tab(household_id, selected_month):
                 right_align_from=1,
                 variant="income",
             )
-
-            # Mark transferred early (always available to admins; not hidden in Advanced)
-            if is_admin:
-                for member in sorted(payouts):
-                    t = transfer_index.get((pay_date_str, member, stream_id_str))
-                    if t and t.get("status") == "planned":
-                        btn_key = f"mark_transferred_{t['id']}"
-                        if st.button(
-                            f"Mark transferred — {member} on {_format_payment_date(pay_date_str)}",
-                            key=btn_key,
-                        ):
-                            if complete_member_transfer(str(t["id"])):
-                                st.success(f"Marked as transferred for {member}.")
-                                rerun_fragment_with_reason("complete_transfer")
-                            else:
-                                st.error("Could not mark transfer as completed.")
-    elif members_without_stream:
+    elif members_without_stream and not using_saved_plan:
         st.caption(
             f"No funding streams set for: {', '.join(members_without_stream)}. "
             "Select streams above to generate a paycheck schedule."
@@ -2273,14 +2357,155 @@ def _render_disbursement_plan_tab(household_id, selected_month):
                 rerun_fragment_with_reason("plan_transfers")
 
 
+def _render_disbursement_compare_tab(household_id, selected_month):
+    """Side-by-side summary and transfer diff: selected_month vs prior month."""
+    year, month = map(int, selected_month.split("-"))
+    if month == 1:
+        prev_year, prev_month = year - 1, 12
+    else:
+        prev_year, prev_month = year, month - 1
+    prev_month_str = f"{prev_year}-{prev_month:02d}"
+
+    curr_plan = compute_household_disbursement_plan(household_id, selected_month)
+    prev_plan = compute_household_disbursement_plan(household_id, prev_month_str)
+    curr_summary = curr_plan.get("monthly_summary") or {}
+    prev_summary = prev_plan.get("monthly_summary") or {}
+    curr_transfers = get_member_transfers(household_id, selected_month)
+    prev_transfers = get_member_transfers(household_id, prev_month_str)
+
+    st.markdown(f"#### {prev_month_str} vs {selected_month}")
+
+    def _fmt(val):
+        try:
+            return f"${float(val):,.2f}"
+        except (TypeError, ValueError):
+            return "—"
+
+    # Summary side-by-side
+    summary_rows = [
+        ("Household income",
+         _fmt(prev_plan.get("total_regular_income", 0)),
+         _fmt(curr_plan.get("total_regular_income", 0))),
+        ("Assigned obligations",
+         _fmt(prev_plan.get("total_assigned_obligations", 0)),
+         _fmt(curr_plan.get("total_assigned_obligations", 0))),
+        ("Surplus pool",
+         _fmt(prev_plan.get("surplus_pool", 0)),
+         _fmt(curr_plan.get("surplus_pool", 0))),
+        ("Monthly transfers",
+         _fmt(prev_summary.get("monthly_disbursement_total", 0)),
+         _fmt(curr_summary.get("monthly_disbursement_total", 0))),
+    ]
+    _render_html_scroll_table(
+        ["Metric", prev_month_str, selected_month],
+        [{"cells": list(r)} for r in summary_rows],
+        right_align_from=1,
+        variant="ledger",
+    )
+
+    # Per-member bundles
+    curr_bundled = curr_plan.get("member_bundled_amounts") or {}
+    prev_bundled = prev_plan.get("member_bundled_amounts") or {}
+    all_members = sorted(set(curr_bundled) | set(prev_bundled))
+    if all_members:
+        st.markdown("**Per-member monthly amounts**")
+        member_rows = []
+        for member in all_members:
+            prev_b = prev_bundled.get(member) or {}
+            curr_b = curr_bundled.get(member) or {}
+            member_rows.append({
+                "cells": [
+                    member,
+                    _fmt(prev_b.get("obligation_amount", 0)),
+                    _fmt(prev_b.get("allowance_amount", 0)),
+                    _fmt(curr_b.get("obligation_amount", 0)),
+                    _fmt(curr_b.get("allowance_amount", 0)),
+                ],
+            })
+        _render_html_scroll_table(
+            ["Member", f"{prev_month_str} Oblig.", f"{prev_month_str} Allow.", f"{selected_month} Oblig.", f"{selected_month} Allow."],
+            member_rows,
+            right_align_from=1,
+            variant="ledger",
+        )
+
+    # Transfer diff table — match by paycheck occurrence (stream schedule), not day-of-month
+    st.markdown("**Transfer comparison**")
+
+    prev_by_key = {transfer_row_occurrence_key(r, prev_month_str): r for r in prev_transfers}
+    curr_by_key = {transfer_row_occurrence_key(r, selected_month): r for r in curr_transfers}
+    all_keys = sorted(set(prev_by_key) | set(curr_by_key))
+
+    if not all_keys:
+        st.caption("No transfer rows found for either month.")
+    else:
+        diff_rows = []
+        for key in all_keys:
+            prev_r = prev_by_key.get(key)
+            curr_r = curr_by_key.get(key)
+            prev_obl = float(prev_r.get("obligation_amount") or 0) if prev_r else 0
+            prev_all = float(prev_r.get("allowance_amount") or 0) if prev_r else 0
+            curr_obl = float(curr_r.get("obligation_amount") or 0) if curr_r else 0
+            curr_all = float(curr_r.get("allowance_amount") or 0) if curr_r else 0
+            changed = abs(prev_obl - curr_obl) > 0.005 or abs(prev_all - curr_all) > 0.005
+            tag = ""
+            if prev_r is None:
+                tag = "New"
+            elif curr_r is None:
+                tag = "Removed"
+            elif changed:
+                tag = "Changed"
+            member = (prev_r or curr_r or {}).get("recipient_username", "")
+            prev_date = _format_payment_date((prev_r or {}).get("payment_date"))
+            curr_date = _format_payment_date((curr_r or {}).get("payment_date"))
+            diff_rows.append({
+                "cells": [
+                    member,
+                    prev_date,
+                    _fmt(prev_obl),
+                    _fmt(prev_all),
+                    curr_date,
+                    _fmt(curr_obl),
+                    _fmt(curr_all),
+                    tag,
+                ],
+            })
+        _render_html_scroll_table(
+            [
+                "Member",
+                f"{prev_month_str} date",
+                f"{prev_month_str} Oblig.",
+                f"{prev_month_str} Allow.",
+                f"{selected_month} date",
+                f"{selected_month} Oblig.",
+                f"{selected_month} Allow.",
+                "Diff",
+            ],
+            diff_rows,
+            right_align_from=2,
+            variant="ledger",
+        )
+
+    st.caption(
+        f"Estimated = full month plan. Amounts reflect saved transfer rows (completed or planned). "
+        f"Use the Disbursement plan tab to update {selected_month} amounts."
+    )
+
+
 def _render_obligations_and_disbursements_panel(household_id, selected_month, member_options):
     """Master Ledger: category assignments and household disbursement planning."""
     with st.expander("Obligations & Disbursements", expanded=False):
-        tab_assignments, tab_plan = st.tabs(["Category assignments", "Disbursement plan"])
+        tab_assignments, tab_plan, tab_compare = st.tabs([
+            "Category assignments",
+            "Disbursement plan",
+            "Compare to prior month",
+        ])
         with tab_assignments:
             _render_obligation_assignments_tab(household_id, selected_month, member_options)
         with tab_plan:
             _render_disbursement_plan_tab(household_id, selected_month)
+        with tab_compare:
+            _render_disbursement_compare_tab(household_id, selected_month)
 
 
 def _render_family_member_budgets(household_id, selected_month, household_users):
@@ -3133,7 +3358,7 @@ def render_disbursement_surplus_alert_if_needed() -> None:
         return
 
     month_year = datetime.now(ZoneInfo("America/Chicago")).strftime("%Y-%m")
-    flags = get_disbursement_automation_audit_flags(household_id, month_year)
+    flags = get_disbursement_automation_audit_flags(household_id, month_year, surface="app")
     if _can_access_monthly_module():
         pass  # admins see all flags below
     else:
@@ -3146,6 +3371,8 @@ def render_disbursement_surplus_alert_if_needed() -> None:
             continue
         if severity == "error":
             st.error(message)
+        elif severity == "success":
+            st.success(message)
         else:
             st.warning(message)
 
@@ -3610,8 +3837,9 @@ def _render_budget_fragment(show_back_to_hub=False):
         expenses_df = get_monthly_expenses(household_id, selected_month, include_private_members=True)
         routing_df = get_cash_flow_routing(household_id)
 
-        total_take_home = sum_income_for_month(incomes_actual_df, selected_month)
-        annual_income_totals = compute_annual_income_totals(incomes_actual_df)
+        # Est. Monthly Take-Home = full month plan (future paychecks are now materialized)
+        total_take_home = sum_income_for_month(incomes_df, selected_month)
+        annual_income_totals = compute_annual_income_totals(incomes_df)
         
         hh_expenses_df = (
             expenses_df[expenses_df["is_personal_spend"] == False]
@@ -3900,8 +4128,9 @@ def _render_budget_fragment(show_back_to_hub=False):
         
         personal_incomes_df = get_personal_ledger_incomes(household_id, selected_month, username)
         personal_incomes_actual_df = _filter_incomes_for_actual_totals(personal_incomes_df, selected_month)
-        total_personal_income = sum_income_for_month(personal_incomes_actual_df, selected_month)
-        personal_annual_income_totals = compute_annual_income_totals(personal_incomes_actual_df)
+        # Est. Monthly Income = full month plan; actuals used only for category breakdown
+        total_personal_income = sum_income_for_month(personal_incomes_df, selected_month)
+        personal_annual_income_totals = compute_annual_income_totals(personal_incomes_df)
         
         my_actual_df = _filter_expenses_for_actual_totals(my_ledger_expenses_df, selected_month)
         total_personal_spend = my_actual_df["amount"].sum() if not my_actual_df.empty else 0.0

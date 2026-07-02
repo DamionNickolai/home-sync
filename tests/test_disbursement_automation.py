@@ -119,6 +119,8 @@ class DisbursementAutomationTests(unittest.TestCase):
                 "owner_username": "Jason",
                 "stream_id": None,
                 "source_expense_id": None,
+                "take_home_amount": database.encrypt_data(300.0),
+                "source_member_transfer_id": database.member_transfer_income_link_key("t1", database.ALLOWANCE_INCOME_SOURCE_NAME),
             },
             {
                 "id": "inc-legacy",
@@ -126,6 +128,8 @@ class DisbursementAutomationTests(unittest.TestCase):
                 "owner_username": "Jason",
                 "stream_id": "stream-1",
                 "source_expense_id": "exp-old",
+                "take_home_amount": database.encrypt_data(300.0),
+                "source_member_transfer_id": None,
             },
             {
                 "id": "inc-unlinked-transfer",
@@ -133,6 +137,8 @@ class DisbursementAutomationTests(unittest.TestCase):
                 "owner_username": "Jason",
                 "stream_id": None,
                 "source_expense_id": None,
+                "take_home_amount": database.encrypt_data(300.0),
+                "source_member_transfer_id": None,
             },
         ]
         expense_table = MagicMock()
@@ -191,6 +197,41 @@ class DisbursementAutomationTests(unittest.TestCase):
         self.assertEqual(upsert_mock.call_count, 2)
         self.assertEqual(upsert_mock.call_args_list[1].kwargs["transfer_id"], "t2")
         transfer_table.update.assert_called_once()
+
+    def test_reconcile_materializes_planned_allowance_transfers(self):
+        """Planned transfers get projected Allowance income rows before completion."""
+        transfers = [
+            {
+                "id": "t1",
+                "status": "planned",
+                "recipient_username": "Angelle",
+                "payment_date": "2026-07-08",
+                "allowance_amount": 120.0,
+                "funding_income_stream_id": "s1",
+                "personal_allowance_income_id": None,
+            },
+            {
+                "id": "t2",
+                "status": "planned",
+                "recipient_username": "Angelle",
+                "payment_date": "2026-07-22",
+                "allowance_amount": 130.0,
+                "funding_income_stream_id": "s1",
+                "personal_allowance_income_id": None,
+            },
+        ]
+        transfer_table = MagicMock()
+        with patch.object(database, "get_member_transfers", return_value=transfers), \
+             patch.object(database, "get_member_transfers_table", return_value="transfers_dev"), \
+             patch.object(database, "_find_income_id_by_member_transfer_link", return_value=None), \
+             patch.object(database, "_upsert_personal_transfer_income", side_effect=["inc-1", "inc-2"]) as upsert_mock, \
+             patch.object(database, "supabase") as supabase_mock:
+            supabase_mock.table.return_value = transfer_table
+            fixed = database._reconcile_transfer_allowance_incomes("home-1", "2026-07")
+        self.assertEqual(upsert_mock.call_count, 2)
+        self.assertEqual(fixed, 2)
+        self.assertEqual(upsert_mock.call_args_list[0].kwargs["amount"], 120.0)
+        self.assertEqual(upsert_mock.call_args_list[1].kwargs["amount"], 130.0)
 
     def test_dedupe_keeps_spare_unlinked_for_same_day_paychecks(self):
         transfers = [
@@ -452,7 +493,13 @@ class SyncDisbursementPlanTests(unittest.TestCase):
         self.assertTrue(result["new_month"])
         upsert_rec.assert_called_once()
 
-    def test_next_month_rollover_updates_planned_row_amounts(self):
+    def test_next_month_rollover_preserves_existing_planned_row_amounts(self):
+        """Planned amounts on existing rows must NOT be overwritten by the computed schedule.
+
+        As of the July month-flip fix, amounts are frozen once written (either
+        copied from prior month or first-inserted from the schedule). The computed
+        schedule is used only to insert missing slots and remove orphan planned rows.
+        """
         tz = __import__("zoneinfo").ZoneInfo("America/Chicago")
         now = __import__("datetime").datetime.now(tz)
         m = now.month
@@ -472,8 +519,8 @@ class SyncDisbursementPlanTests(unittest.TestCase):
             "payment_date": f"{next_month}-15",
             "stream_id": "stream-1",
             "recipient_username": "Angelle",
-            "obligation": 100.0,
-            "allowance": 50.0,
+            "obligation": 100.0,  # different from saved
+            "allowance": 50.0,    # different from saved
         }]
         table = MagicMock()
         with patch.object(database, "_transfer_rows_from_disbursement_schedule", return_value=schedule), \
@@ -484,8 +531,10 @@ class SyncDisbursementPlanTests(unittest.TestCase):
              patch.object(database, "supabase") as supabase_mock:
             supabase_mock.table.return_value = table
             result = database.sync_disbursement_plan("home-1", next_month)
-        self.assertEqual(result["updated"], 1)
+        # Existing planned row must NOT be updated — amounts are preserved
+        self.assertEqual(result["updated"], 0)
         self.assertEqual(result["inserted"], 0)
+        table.update.assert_not_called()
 
     def test_next_month_rollover_deletes_orphan_planned_slots(self):
         tz = __import__("zoneinfo").ZoneInfo("America/Chicago")
@@ -544,6 +593,185 @@ class SyncDisbursementPlanTests(unittest.TestCase):
             result = database.sync_disbursement_plan("home-1", next_month)
         self.assertEqual(result["deleted"], 0)
         table.delete.assert_not_called()
+
+
+class IncomeMaterilaizationTests(unittest.TestCase):
+    """Tests for the full-month income materialization gate change."""
+
+    def _make_stream(self):
+        return {"id": "stream-1", "display_name": "Jason Salary", "owner_username": "jason",
+                "is_personal_income": False}
+
+    def _make_version(self, freq="biweekly"):
+        return {"id": "v1", "take_home_amount": 3000.0, "gross_amount": 4000.0,
+                "pay_frequency": freq, "is_windfall": False, "is_taxable": True}
+
+    def test_future_paycheck_in_current_month_is_materialized(self):
+        """A paycheck date in the future but within the month_year should write a row."""
+        from datetime import date
+        import database
+        # Use a payment_date that is two weeks from today but still in the same month
+        today = date.today()
+        import calendar
+        _, last = calendar.monthrange(today.year, today.month)
+        future_day = min(today.day + 14, last)
+        future_date = date(today.year, today.month, future_day)
+        month_year = today.strftime("%Y-%m")
+
+        table_mock = MagicMock()
+        table_mock.update.return_value = table_mock
+        table_mock.insert.return_value = table_mock
+        table_mock.eq.return_value = table_mock
+        table_mock.execute.return_value = MagicMock(data=[])
+
+        with patch.object(database, "get_budget_table", return_value="household_incomes_dev"), \
+             patch.object(database, "_fetch_income_occurrence_row", return_value=None), \
+             patch.object(database, "supabase") as supabase_mock:
+            supabase_mock.table.return_value = table_mock
+            result = database._materialize_income_occurrence(
+                stream=self._make_stream(),
+                version=self._make_version(),
+                month_year=month_year,
+                payment_date=future_date,
+                household_id="home-1",
+                existing=None,
+            )
+        # Should have attempted an insert, not returned False early
+        self.assertTrue(result)
+        table_mock.insert.assert_called_once()
+
+    def test_payment_date_before_month_start_is_skipped(self):
+        """A payment_date before the month_year start is skipped (historical guard)."""
+        from datetime import date
+        import database
+        month_year = "2026-07"
+        june_date = date(2026, 6, 25)  # Before July
+
+        with patch.object(database, "get_budget_table", return_value="household_incomes_dev"):
+            result = database._materialize_income_occurrence(
+                stream=self._make_stream(),
+                version=self._make_version(),
+                month_year=month_year,
+                payment_date=june_date,
+                household_id="home-1",
+                existing=None,
+            )
+        self.assertFalse(result)
+
+
+class CopyTransferPlanTests(unittest.TestCase):
+    """Tests for copy_transfer_plan_from_month."""
+
+    def _planned_row(self, day, member, obl, allow_, stream_id="stream-1"):
+        return {
+            "id": f"t-{day}-{member}",
+            "payment_date": f"2026-06-{day:02d}",
+            "recipient_username": member,
+            "funding_income_stream_id": stream_id,
+            "obligation_amount": obl,
+            "allowance_amount": allow_,
+            "total_amount": obl + allow_,
+            "status": "planned",
+        }
+
+    def test_copy_preserves_amounts_and_remaps_dates(self):
+        source_rows = [
+            self._planned_row(10, "Jason", 500.0, 150.0),
+            self._planned_row(24, "Angelle", 400.0, 200.0),
+        ]
+        table_mock = MagicMock()
+        table_mock.insert.return_value = table_mock
+        table_mock.update.return_value = table_mock
+        table_mock.eq.return_value = table_mock
+        table_mock.execute.return_value = MagicMock(data=[])
+
+        def pay_dates(stream_id, month_year):
+            if month_year == "2026-06":
+                return [date(2026, 6, 10), date(2026, 6, 24)], "bi_weekly"
+            if month_year == "2026-07":
+                return [date(2026, 7, 8), date(2026, 7, 22)], "bi_weekly"
+            return [], "monthly"
+
+        with patch.object(database, "get_member_transfers", side_effect=lambda hid, m: source_rows if m == "2026-06" else []), \
+             patch.object(database, "get_member_transfers_table", return_value="transfers_dev"), \
+             patch.object(database, "_can_edit_monthly_budget_server_side", return_value=True), \
+             patch.object(database, "_stream_pay_dates_for_month", side_effect=pay_dates), \
+             patch.object(database, "encrypt_data", side_effect=lambda x: x), \
+             patch.object(database, "supabase") as supabase_mock:
+            supabase_mock.table.return_value = table_mock
+            result = database.copy_transfer_plan_from_month("home-1", "2026-06", "2026-07")
+
+        self.assertEqual(result["copied"], 2)
+        self.assertEqual(result["skipped"], 0)
+        insert_calls = [call[0][0] for call in table_mock.insert.call_args_list]
+        dates = sorted(c["payment_date"] for c in insert_calls)
+        self.assertEqual(dates, ["2026-07-08", "2026-07-22"])
+
+    def test_remap_biweekly_occurrence_not_day_of_month(self):
+        def pay_dates(stream_id, month_year):
+            if month_year == "2026-06":
+                return [date(2026, 6, 10), date(2026, 6, 24)], "bi_weekly"
+            if month_year == "2026-07":
+                return [date(2026, 7, 8), date(2026, 7, 22)], "bi_weekly"
+            return [], "monthly"
+
+        with patch.object(database, "_stream_pay_dates_for_month", side_effect=pay_dates):
+            first = database.remap_transfer_payment_date_between_months(
+                "stream-1", date(2026, 6, 10), "2026-06", "2026-07"
+            )
+            second = database.remap_transfer_payment_date_between_months(
+                "stream-1", date(2026, 6, 24), "2026-06", "2026-07"
+            )
+        self.assertEqual(first, "2026-07-08")
+        self.assertEqual(second, "2026-07-22")
+
+    def test_copy_skips_completed_target_rows(self):
+        source_rows = [self._planned_row(10, "Jason", 500.0, 150.0)]
+        completed_target = [{
+            "id": "t-done", "payment_date": "2026-07-10",
+            "recipient_username": "Jason",
+            "funding_income_stream_id": "stream-1",
+            "obligation_amount": 500.0, "allowance_amount": 150.0,
+            "status": "completed",
+        }]
+
+        with patch.object(database, "get_member_transfers", side_effect=lambda hid, m: source_rows if m == "2026-06" else completed_target), \
+             patch.object(database, "get_member_transfers_table", return_value="transfers_dev"), \
+             patch.object(database, "_can_edit_monthly_budget_server_side", return_value=True), \
+             patch.object(database, "encrypt_data", side_effect=lambda x: x), \
+             patch.object(database, "supabase") as supabase_mock:
+            result = database.copy_transfer_plan_from_month("home-1", "2026-06", "2026-07")
+
+        self.assertEqual(result["copied"], 0)
+        self.assertEqual(result["skipped"], 1)
+        supabase_mock.table.return_value.insert.assert_not_called()
+
+    def test_sync_prefers_prior_month_copy_on_first_insert(self):
+        """sync_disbursement_plan should copy from prior month when no rows exist yet."""
+        tz = __import__("zoneinfo").ZoneInfo("America/Chicago")
+        now = __import__("datetime").datetime.now(tz)
+        month_year = now.strftime("%Y-%m")
+
+        schedule = [{
+            "payment_date": f"{month_year}-10",
+            "recipient_username": "Jason",
+            "stream_id": "stream-1",
+            "obligation": 500.0,
+            "allowance": 150.0,
+        }]
+
+        with patch.object(database, "_transfer_rows_from_disbursement_schedule", return_value=schedule), \
+             patch.object(database, "get_member_transfers", return_value=[]), \
+             patch.object(database, "get_member_transfers_table", return_value="transfers_dev"), \
+             patch.object(database, "_upsert_disbursement_reconciliation", return_value=True), \
+             patch.object(database, "get_disbursement_reconciliation", return_value=None), \
+             patch.object(database, "_can_edit_monthly_budget_server_side", return_value=True), \
+             patch.object(database, "copy_transfer_plan_from_month", return_value={"copied": 2, "skipped": 0}) as copy_mock:
+            result = database.sync_disbursement_plan("home-1", month_year)
+
+        copy_mock.assert_called_once()
+        self.assertEqual(result["action"], "first-insert-from-prior-month")
+        self.assertEqual(result["inserted"], 2)
 
 
 class DisbursementReadinessTests(unittest.TestCase):

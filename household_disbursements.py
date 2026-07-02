@@ -144,6 +144,65 @@ def sum_transfer_allowance_total(transfers: list[dict]) -> float:
     return round(total, 2)
 
 
+def sum_transfer_monthly_total(transfers: list[dict]) -> float:
+    """Monthly obligation + allowance total from saved member transfer rows."""
+    total = 0.0
+    for row in transfers or []:
+        total += round(float(row.get("obligation_amount") or 0), 2)
+        total += round(float(row.get("allowance_amount") or 0), 2)
+    return round(total, 2)
+
+
+def aggregate_member_bundles_from_transfers(transfers: list[dict]) -> dict[str, dict]:
+    """Build member_bundled_amounts-shaped totals from saved transfer rows."""
+    by_member: dict[str, dict] = {}
+    for row in transfers or []:
+        member = row.get("recipient_username")
+        if not member:
+            continue
+        obl = round(float(row.get("obligation_amount") or 0), 2)
+        allow = round(float(row.get("allowance_amount") or 0), 2)
+        parts = by_member.setdefault(
+            member,
+            {"obligation_amount": 0.0, "allowance_amount": 0.0, "total_amount": 0.0},
+        )
+        parts["obligation_amount"] = round(parts["obligation_amount"] + obl, 2)
+        parts["allowance_amount"] = round(parts["allowance_amount"] + allow, 2)
+        parts["total_amount"] = round(parts["total_amount"] + obl + allow, 2)
+    return by_member
+
+
+def build_paycheck_schedule_from_transfers(
+    transfers: list[dict],
+    stream_labels: dict[str, str] | None = None,
+) -> list[dict]:
+    """Group saved transfer rows into paycheck_schedule shape for UI rendering."""
+    labels = stream_labels or {}
+    slots: dict[tuple, dict] = {}
+    for row in transfers or []:
+        pay_date = str(row.get("payment_date") or "")[:10]
+        member = row.get("recipient_username")
+        if not pay_date or not member:
+            continue
+        stream_id = str(row.get("funding_income_stream_id") or "")
+        key = (pay_date, stream_id)
+        if key not in slots:
+            slots[key] = {
+                "payment_date": pay_date,
+                "stream_id": stream_id or None,
+                "stream_label": labels.get(stream_id, stream_id or "—"),
+                "payouts": {},
+            }
+        obl = round(float(row.get("obligation_amount") or 0), 2)
+        allow = round(float(row.get("allowance_amount") or 0), 2)
+        slots[key]["payouts"][member] = {
+            "obligation": obl,
+            "allowance": allow,
+            "total": round(obl + allow, 2),
+        }
+    return sorted(slots.values(), key=lambda entry: (entry["payment_date"], entry.get("stream_label") or ""))
+
+
 def disbursement_allowance_surplus_flags(
     *,
     current_surplus_pool: float,

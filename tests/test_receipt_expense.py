@@ -224,14 +224,20 @@ class TestOcrParser(unittest.TestCase):
         self._parse = _parse_response
 
     def test_valid_json(self):
-        raw = """{"merchant":"Walmart","date":"2026-06-15","total":47.32,
+        raw = """{"merchant":"Walmart","date":"2026-06-15","total":47.32,"tax":3.54,
                   "lines":[{"description":"Milk","amount":3.49},
                             {"description":"Bread","amount":2.79}]}"""
         result = self._parse(raw)
         self.assertEqual(result["merchant"], "Walmart")
         self.assertAlmostEqual(result["total"], 47.32)
+        self.assertAlmostEqual(result["tax"], 3.54)
         self.assertEqual(len(result["lines"]), 2)
         self.assertAlmostEqual(result["lines"][0]["amount"], 3.49)
+
+    def test_tax_defaults_none_when_absent(self):
+        raw = '{"merchant":"Store","date":null,"total":10.00,"lines":[{"description":"Item","amount":10.00}]}'
+        result = self._parse(raw)
+        self.assertIsNone(result["tax"])
 
     def test_strips_markdown_fences(self):
         raw = "```json\n{\"merchant\":null,\"date\":null,\"total\":null,\"lines\":[]}\n```"
@@ -285,6 +291,30 @@ class TestOcrParser(unittest.TestCase):
             config = _resolve_ocr_config()
         self.assertIsNotNone(config)
         self.assertEqual(config.provider, "openai")
+
+
+# ---------------------------------------------------------------------------
+# Mobile native camera capture decoding
+# ---------------------------------------------------------------------------
+
+class TestMobileCaptureDecode(unittest.TestCase):
+    def test_decodes_data_url(self):
+        import base64
+        from mobile_receipt_capture import mobile_capture_to_bytes
+
+        raw = b"fake-image-bytes"
+        b64 = base64.b64encode(raw).decode("ascii")
+        payload = {
+            "data": f"data:image/jpeg;base64,{b64}",
+            "name": "receipt.jpg",
+            "type": "image/jpeg",
+        }
+        decoded = mobile_capture_to_bytes(payload)
+        self.assertIsNotNone(decoded)
+        file_bytes, mime_type, file_name = decoded
+        self.assertEqual(file_bytes, raw)
+        self.assertEqual(mime_type, "image/jpeg")
+        self.assertEqual(file_name, "receipt.jpg")
 
 
 # ---------------------------------------------------------------------------

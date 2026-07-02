@@ -23,6 +23,7 @@ from ui_helpers import rerun_with_reason
 QUICK_EXPENSE_PAGE_KEY = "show_quick_expense_page"
 _INCLUDE_OBLIGATIONS_KEY = "quick_expense_include_obligations"
 _MODE_KEY = "quick_expense_mode"
+_QUICK_EXPENSE_FLASH_KEY = "quick_expense_flash"
 
 _MODE_QUICK = "Quick Entry"
 _MODE_SCAN = "Scan Receipt"
@@ -42,6 +43,16 @@ def open_quick_expense_page() -> None:
 
 def close_quick_expense_page() -> None:
     st.session_state.pop(QUICK_EXPENSE_PAGE_KEY, None)
+
+
+def _set_quick_expense_flash(message: str) -> None:
+    st.session_state[_QUICK_EXPENSE_FLASH_KEY] = message
+
+
+def _render_quick_expense_flash() -> None:
+    message = st.session_state.pop(_QUICK_EXPENSE_FLASH_KEY, None)
+    if message:
+        st.success(message)
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +100,7 @@ def render_quick_expense_page() -> None:
         rerun_with_reason("quick_expense_back")
 
     st.subheader("➕ Quick Expense")
+    _render_quick_expense_flash()
 
     if not household_id or not auth_user_id or not username:
         st.error("Session data missing — please sign in again.")
@@ -198,7 +210,7 @@ def _render_quick_entry(household_id: str, auth_user_id: str, username: str) -> 
                     is_household_admin=False,
                 )
                 if ok:
-                    st.success(msg)
+                    _set_quick_expense_flash(msg)
                     rerun_with_reason("quick_expense_saved")
                 else:
                     st.error("Failed to save expense. Check your permissions and try again.")

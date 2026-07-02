@@ -352,14 +352,6 @@ def compute_annual_income_totals(incomes_df) -> dict:
         "annual_non_taxable": annual_nontaxable,
     }
 
-@st.cache_resource
-def init_connection() -> Client:
-    url = st.secrets["SUPABASE_URL"]
-    key = st.secrets["SUPABASE_SERVICE_KEY"]
-    return create_client(url, key)
-
-supabase = init_connection()
-
 _TRANSIENT_DB_ERROR_MARKERS = (
     "10054",
     "10035",
@@ -377,6 +369,15 @@ _TRANSIENT_DB_ERROR_MARKERS = (
 def _is_transient_db_error(exc: BaseException) -> bool:
     msg = str(exc).lower()
     return any(marker in msg for marker in _TRANSIENT_DB_ERROR_MARKERS)
+
+
+@st.cache_resource
+def init_connection() -> Client:
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_SERVICE_KEY"]
+    return create_client(url, key)
+
+supabase = init_connection()
 
 
 def _refresh_supabase_client() -> Client:
@@ -1290,9 +1291,19 @@ def _materialize_income_occurrence(
     version (idempotent re-materialization). ``force=True`` rewrites the row even
     when the version id is unchanged, which is required after an in-place version
     edit (same effective_from, new amount).
+
+    Future paychecks are written to the ledger so Cash Flow shows the full month
+    plan immediately. Historical months (payment_date before the start of the
+    current calendar month) are still skipped to avoid backfill noise.
     """
-    today = datetime.now().date()
-    if payment_date > today:
+    tz = ZoneInfo("America/Chicago")
+    today = datetime.now(tz).date()
+    # Allow future paychecks within the current or next calendar month;
+    # skip only if the payment_date is before the month being materialized
+    # (i.e. only guard against truly historical cross-month edge cases).
+    month_start_str = month_year + "-01"
+    month_start = date.fromisoformat(month_start_str)
+    if payment_date < month_start:
         return False
 
     incomes_table = get_budget_table("household_incomes")
@@ -2715,13 +2726,19 @@ def get_budget_categories(household_id, is_personal=False, username=None):
 def get_household_incomes(household_id, month_year, is_personal_income=False, username=None): # 🟢 ADD ARGS HERE
     target_table = get_budget_table("household_incomes")
     try:
-        # 🟢 ADD THE .eq() FILTERS TO THE QUERY
-        query = supabase.table(target_table).select("*").eq("household_id", household_id).eq("month_year", month_year).eq("is_personal_income", is_personal_income)
-        
-        if is_personal_income and username:
-            query = query.eq("owner_username", username)
-            
-        response = query.execute()
+        def build_query(client):
+            query = (
+                client.table(target_table)
+                .select("*")
+                .eq("household_id", household_id)
+                .eq("month_year", month_year)
+                .eq("is_personal_income", is_personal_income)
+            )
+            if is_personal_income and username:
+                query = query.eq("owner_username", username)
+            return query
+
+        response = supabase_execute(build_query)
         if response.data:
             for row in response.data:
                 if row.get("source_name"):
@@ -5795,7 +5812,6 @@ def _rollover_recurring_incomes_legacy(household_id, selected_month) -> bool:
                 )
 
         injected_any = False
-        today = datetime.now().date()
         processed_signatures = set()
 
         for row in rows_to_roll:
@@ -5821,9 +5837,6 @@ def _rollover_recurring_incomes_legacy(household_id, selected_month) -> bool:
             _, last_day_of_new_month = calendar.monthrange(year, month)
             new_day = min(target_day, last_day_of_new_month)
             new_payment_date = date(year, month, new_day)
-
-            if new_payment_date > today:
-                continue
 
             payload = {
                 "household_id": household_id,
@@ -6075,14 +6088,16 @@ def _income_row_stream_id(row) -> str:
 def _fetch_household_income_stream_owners(household_id) -> dict[str, str]:
     """Map stream_id -> owner_username for active household income streams."""
     try:
-        response = (
-            supabase.table(get_income_streams_table())
-            .select("id, owner_username")
-            .eq("household_id", household_id)
-            .eq("is_personal_income", False)
-            .eq("is_active", True)
-            .execute()
-        )
+        def build_query(client):
+            return (
+                client.table(get_income_streams_table())
+                .select("id, owner_username")
+                .eq("household_id", household_id)
+                .eq("is_personal_income", False)
+                .eq("is_active", True)
+            )
+
+        response = supabase_execute(build_query)
         return {
             str(row["id"]): row.get("owner_username")
             for row in (response.data or [])
@@ -6478,6 +6493,65 @@ def _stream_pay_dates_for_month(stream_id: str, month_year: str) -> tuple[list[d
     except Exception as e:
         print(f"Error getting pay dates for stream {stream_id}: {e}")
         return [], "monthly"
+
+
+def _transfer_occurrence_index(
+    stream_id: str,
+    payment_date: date,
+    month_year: str,
+) -> int | None:
+    """Index of payment_date within the stream's scheduled pay dates for the month."""
+    if not stream_id:
+        return None
+    pay_dates, _ = _stream_pay_dates_for_month(stream_id, month_year)
+    if not pay_dates:
+        return None
+    try:
+        return pay_dates.index(payment_date)
+    except ValueError:
+        return None
+
+
+def remap_transfer_payment_date_between_months(
+    stream_id: str | None,
+    source_payment_date: date,
+    source_month: str,
+    target_month: str,
+) -> str | None:
+    """Map a source-month transfer pay date to the matching occurrence in target_month.
+
+    Uses the funding stream's income schedule (same engine as Cash Flow), matching
+    paycheck *occurrence index* across months — not the calendar day-of-month.
+    Falls back to day-of-month only when no stream_id is linked.
+    """
+    sid = str(stream_id or "").strip()
+    if sid:
+        idx = _transfer_occurrence_index(sid, source_payment_date, source_month)
+        if idx is not None:
+            target_dates, _ = _stream_pay_dates_for_month(sid, target_month)
+            if idx < len(target_dates):
+                return target_dates[idx].isoformat()
+            return None
+    tgt_year, tgt_month = map(int, target_month.split("-"))
+    _, last_day = calendar.monthrange(tgt_year, tgt_month)
+    tgt_day = min(source_payment_date.day, last_day)
+    return date(tgt_year, tgt_month, tgt_day).isoformat()
+
+
+def transfer_row_occurrence_key(row: dict, month_year: str) -> tuple:
+    """Cross-month match key: (member, stream_id, occurrence_index|day fallback)."""
+    member = str(row.get("recipient_username") or "")
+    stream_id = str(row.get("funding_income_stream_id") or "")
+    pay_date_str = str(row.get("payment_date") or "")[:10]
+    try:
+        pay_date = date.fromisoformat(pay_date_str)
+    except ValueError:
+        return (member, stream_id, pay_date_str)
+    if stream_id:
+        idx = _transfer_occurrence_index(stream_id, pay_date, month_year)
+        if idx is not None:
+            return (member, stream_id, idx)
+    return (member, stream_id, f"day-{pay_date.day:02d}")
 
 
 def _member_combined_pay_dates(household_id: str, username: str, month_year: str) -> tuple[list[tuple], list[dict]]:
@@ -6972,8 +7046,7 @@ def _prune_legacy_allowance_superseded_by_transfers(household_id: str, month_yea
     covered_recipients = {
         _username_key(t["recipient_username"])
         for t in transfers
-        if t.get("status") == "completed"
-        and round(float(t.get("allowance_amount") or 0), 2) > 0
+        if round(float(t.get("allowance_amount") or 0), 2) > 0
     }
     if not covered_recipients:
         return 0
@@ -6982,6 +7055,12 @@ def _prune_legacy_allowance_superseded_by_transfers(household_id: str, month_yea
         str(t["personal_allowance_income_id"])
         for t in transfers
         if t.get("personal_allowance_income_id")
+    }
+    linked_link_keys = {
+        member_transfer_income_link_key(str(t["id"]), ALLOWANCE_INCOME_SOURCE_NAME)
+        for t in transfers
+        if t.get("id")
+        and round(float(t.get("allowance_amount") or 0), 2) > 0
     }
 
     expenses_table = get_budget_table("expenses")
@@ -7002,7 +7081,10 @@ def _prune_legacy_allowance_superseded_by_transfers(household_id: str, month_yea
         }
         income_rows = (
             supabase.table(incomes_table)
-            .select("id, source_name, owner_username, stream_id, source_expense_id")
+            .select(
+                "id, source_name, owner_username, stream_id, source_expense_id, "
+                "take_home_amount, source_member_transfer_id"
+            )
             .eq("household_id", household_id)
             .eq("month_year", month_year)
             .eq("is_personal_income", True)
@@ -7017,32 +7099,43 @@ def _prune_legacy_allowance_superseded_by_transfers(household_id: str, month_yea
         income_id = str(row["id"])
         if income_id in linked_income_ids:
             continue
+        link_key = str(row.get("source_member_transfer_id") or "")
+        if link_key and link_key in linked_link_keys:
+            continue
         source = decrypt_text(row.get("source_name")) if row.get("source_name") else ""
         if source != ALLOWANCE_INCOME_SOURCE_NAME:
             continue
         if _username_key(row.get("owner_username")) not in covered_recipients:
             continue
+        amount = (
+            decrypt_float(row.get("take_home_amount"))
+            if row.get("take_home_amount") is not None
+            else 0.0
+        )
         src_exp = str(row.get("source_expense_id") or "").strip()
         stream_id = row.get("stream_id")
         is_legacy = bool(stream_id) or (bool(src_exp) and src_exp not in transfer_auto_ids)
-        if not is_legacy:
-            continue
-        if _delete_personal_transfer_income(income_id):
-            removed += 1
+        is_zero = round(float(amount), 2) <= 0
+        if is_legacy or is_zero:
+            if _delete_personal_transfer_income(income_id):
+                removed += 1
     return removed
 
 
 def _reconcile_transfer_allowance_incomes(household_id: str, month_year: str) -> int:
-    """Give every completed allowance transfer its own valid personal income row."""
+    """Ensure every allowance transfer (planned or completed) has a personal income row.
+
+    Materializes projected Allowance income for the full month so the personal ledger
+    and Cash Flow match the household disbursement plan before transfers complete.
+    """
     if not household_id or not month_year:
         return 0
 
     transfers = get_member_transfers(household_id, month_year)
-    completed = sorted(
+    allowance_transfers = sorted(
         [
             t for t in transfers
-            if t.get("status") == "completed"
-            and round(float(t.get("allowance_amount") or 0), 2) > 0
+            if round(float(t.get("allowance_amount") or 0), 2) > 0
         ],
         key=lambda t: (
             str(t.get("payment_date") or ""),
@@ -7050,15 +7143,14 @@ def _reconcile_transfer_allowance_incomes(household_id: str, month_year: str) ->
             str(t.get("id") or ""),
         ),
     )
-    if not completed:
+    if not allowance_transfers:
         return 0
 
-    incomes_table = get_budget_table("household_incomes")
     table = get_member_transfers_table()
     now_ts = datetime.now(ZoneInfo("America/Chicago")).isoformat()
     fixed = 0
 
-    for transfer in completed:
+    for transfer in allowance_transfers:
         transfer_id = str(transfer.get("id") or "")
         recipient = transfer["recipient_username"]
         pay_date_str = str(transfer.get("payment_date") or "")[:10]
@@ -7559,15 +7651,34 @@ def _count_duplicate_allowance_incomes(household_id: str, month_year: str) -> in
     return extras + missing_links + shared_links
 
 
-def get_disbursement_automation_audit_flags(household_id, month_year) -> list[dict]:
-    """Audit flags for hands-off disbursement automation (surplus, overdue, duplicates)."""
+def get_disbursement_automation_audit_flags(
+    household_id,
+    month_year,
+    *,
+    surface: str = "all",
+) -> list[dict]:
+    """Audit flags for hands-off disbursement automation (surplus, overdue, duplicates).
+
+    surface:
+      - ``app``: top-level banners only; hides plan-validation noise after review.
+      - ``tab``: disbursement plan tab (includes acceptance banner when reviewed).
+      - ``all``: legacy behavior (same filtering as ``tab``).
+    """
     if not household_id or not month_year:
         return []
 
     flags: list[dict] = []
+    review_related_kinds = {
+        "plan_stale",
+        "plan_pending_review",
+        "allowance_exceeds_surplus",
+        "allowance_stale_vs_recommended",
+        "overdue_transfers",
+    }
 
     # Reconciliation-based flags (migration 042)
     rec = get_disbursement_reconciliation(household_id, month_year)
+    reviewed = bool(rec and rec.get("reviewed"))
     drift_live = get_disbursement_plan_drift(household_id, month_year)
     if drift_live.get("stale"):
         flags.append({
@@ -7575,21 +7686,34 @@ def get_disbursement_automation_audit_flags(household_id, month_year) -> list[di
             "severity": "warning",
             "message": "Disbursement plan may be out of date. Changes will take effect next month.",
         })
-    if rec:
-        if not rec.get("reviewed") and int(rec.get("transfer_count") or 0) > 0:
-            try:
-                yr, mo = month_year.split("-")
-                month_label = datetime(int(yr), int(mo), 1).strftime("%B")
-            except Exception:
-                month_label = month_year
-            flags.append({
-                "kind": "plan_pending_review",
-                "severity": "info",
-                "message": (
-                    f"{month_label}'s disbursement plan is ready. "
-                    "Review the updated schedule and confirm to dismiss this notice."
-                ),
-            })
+    if rec and not reviewed and (
+        int(rec.get("transfer_count") or 0) > 0 or get_member_transfers(household_id, month_year)
+    ):
+        try:
+            yr, mo = month_year.split("-")
+            month_label = datetime(int(yr), int(mo), 1).strftime("%B")
+        except Exception:
+            month_label = month_year
+        flags.append({
+            "kind": "plan_pending_review",
+            "severity": "info",
+            "message": (
+                f"{month_label}'s disbursement plan is ready. "
+                "Review the updated schedule and confirm to dismiss this notice."
+            ),
+        })
+
+    if reviewed and surface in ("tab", "all"):
+        reviewed_by = rec.get("reviewed_by") or "admin"
+        reviewed_at = str(rec.get("reviewed_at") or "")[:10]
+        flags.insert(0, {
+            "kind": "plan_accepted",
+            "severity": "success",
+            "message": (
+                f"Plan accepted as-is on {reviewed_at} by {reviewed_by}. "
+                "Saved transfers run automatically for the rest of this month."
+            ),
+        })
 
     flags.extend(get_disbursement_allowance_surplus_flags(household_id, month_year))
 
@@ -7646,6 +7770,14 @@ def get_disbursement_automation_audit_flags(household_id, month_year) -> list[di
                 "linked household Allowance expenses."
             ),
         })
+
+    if surface == "app" and reviewed:
+        flags = [f for f in flags if f.get("kind") not in review_related_kinds]
+    elif surface in ("tab", "all") and reviewed:
+        flags = [
+            f for f in flags
+            if f.get("kind") not in review_related_kinds or f.get("kind") == "plan_accepted"
+        ]
 
     return flags
 
@@ -8193,7 +8325,22 @@ def upsert_planned_transfers_from_schedule(
         except Exception as e:
             print(f"Error inserting planned transfer ({pay_date_str}, {member}, {stream_id}): {e}")
 
+    if override_rows is not None and (inserted + updated) > 0:
+        _mark_disbursement_plan_admin_customized(household_id, month_year)
+
     return inserted + updated
+
+
+def _mark_disbursement_plan_admin_customized(household_id, month_year) -> None:
+    rec = get_disbursement_reconciliation(household_id, month_year)
+    snapshot = _disbursement_plan_snapshot(rec)
+    snapshot.update({"month_year": month_year, "admin_customized": True})
+    _upsert_disbursement_reconciliation(
+        household_id,
+        month_year,
+        plan_snapshot=snapshot,
+        plan_stale=False,
+    )
 
 
 def reset_disbursement_plan_transfers(household_id, month_year) -> dict:
@@ -8225,7 +8372,17 @@ def reset_disbursement_plan_transfers(household_id, month_year) -> dict:
 
     orphan_stats = cleanup_orphan_disbursement_artifacts(household_id, month_year)
     inserted = upsert_planned_transfers_from_schedule(household_id, month_year, force=True)
-    _upsert_disbursement_reconciliation(household_id, month_year, plan_stale=False)
+    _upsert_disbursement_reconciliation(
+        household_id,
+        month_year,
+        plan_stale=False,
+        reviewed=False,
+        plan_snapshot={
+            "month_year": month_year,
+            "computed_rows": inserted,
+            "admin_customized": True,
+        },
+    )
 
     return {
         "cleared": cleared,
@@ -8310,6 +8467,286 @@ def acknowledge_disbursement_plan(household_id, month_year, actor_username: str 
         reviewed_at=now_ts,
         plan_stale=False,
     )
+
+
+# ---------------------------------------------------------------------------
+# Prior-month transfer plan copy
+# ---------------------------------------------------------------------------
+
+def _prev_month_year(month_year: str) -> str:
+    """Return YYYY-MM for the calendar month before month_year."""
+    year, month = map(int, month_year.split("-"))
+    if month == 1:
+        return f"{year - 1}-12"
+    return f"{year}-{month - 1:02d}"
+
+
+def _disbursement_plan_snapshot(rec: dict | None) -> dict:
+    raw = (rec or {}).get("plan_snapshot")
+    return raw if isinstance(raw, dict) else {}
+
+
+def _disbursement_plan_copied_from_prior(rec: dict | None) -> bool:
+    return bool(_disbursement_plan_snapshot(rec).get("copied_from_month"))
+
+
+def _disbursement_plan_suppresses_computed_drift(household_id, month_year) -> bool:
+    """Saved transfer rows intentionally differ from live-computed schedule."""
+    rec = get_disbursement_reconciliation(household_id, month_year)
+    if rec and rec.get("reviewed"):
+        return True
+    if _disbursement_plan_copied_from_prior(rec):
+        return True
+    if rec and int(rec.get("transfer_count") or 0) > 0:
+        # Unreviewed month with saved rows defaults to prior-month copy workflow.
+        return True
+    return False
+
+
+def _expected_prior_month_copy_keys(
+    household_id: str,
+    source_month: str,
+    target_month: str,
+) -> set[tuple[str, str, str]]:
+    """Target-month transfer keys implied by copying source_month rows."""
+    keys: set[tuple[str, str, str]] = set()
+    for row in get_member_transfers(household_id, source_month):
+        obl = round(float(row.get("obligation_amount") or 0), 2)
+        allow = round(float(row.get("allowance_amount") or 0), 2)
+        if obl <= 0 and allow <= 0:
+            continue
+        src_date_str = str(row.get("payment_date") or "")[:10]
+        try:
+            src_date = date.fromisoformat(src_date_str)
+        except ValueError:
+            continue
+        tgt_date_str = remap_transfer_payment_date_between_months(
+            row.get("funding_income_stream_id"),
+            src_date,
+            source_month,
+            target_month,
+        )
+        if not tgt_date_str:
+            continue
+        keys.add((
+            tgt_date_str,
+            row["recipient_username"],
+            str(row.get("funding_income_stream_id") or ""),
+        ))
+    return keys
+
+
+def _saved_plan_matches_prior_month_copy(household_id: str, month_year: str) -> bool:
+    """True when saved rows match a prior-month copy (keys + amounts)."""
+    prev_month = _prev_month_year(month_year)
+    expected_keys = _expected_prior_month_copy_keys(household_id, prev_month, month_year)
+    if not expected_keys:
+        return True
+
+    expected_amounts: dict[tuple[str, str, str], tuple[float, float]] = {}
+    for row in get_member_transfers(household_id, prev_month):
+        obl = round(float(row.get("obligation_amount") or 0), 2)
+        allow = round(float(row.get("allowance_amount") or 0), 2)
+        if obl <= 0 and allow <= 0:
+            continue
+        src_date_str = str(row.get("payment_date") or "")[:10]
+        try:
+            src_date = date.fromisoformat(src_date_str)
+        except ValueError:
+            continue
+        tgt_date_str = remap_transfer_payment_date_between_months(
+            row.get("funding_income_stream_id"),
+            src_date,
+            prev_month,
+            month_year,
+        )
+        if not tgt_date_str:
+            continue
+        key = (tgt_date_str, row["recipient_username"], str(row.get("funding_income_stream_id") or ""))
+        expected_amounts[key] = (obl, allow)
+
+    saved_rows = get_member_transfers(household_id, month_year)
+    saved_map = {
+        (
+            str(r["payment_date"])[:10],
+            r["recipient_username"],
+            str(r.get("funding_income_stream_id") or ""),
+        ): (
+            round(float(r.get("obligation_amount") or 0), 2),
+            round(float(r.get("allowance_amount") or 0), 2),
+        )
+        for r in saved_rows
+    }
+    if set(saved_map) != expected_keys:
+        return False
+    return all(saved_map.get(key) == expected_amounts.get(key) for key in expected_keys)
+
+
+def replace_planned_transfers_from_prior_month(
+    household_id: str,
+    month_year: str,
+    *,
+    automation: bool = False,
+) -> dict:
+    """Replace planned rows with a fresh copy from the prior calendar month."""
+    result = {"copied": 0, "skipped": 0, "deleted": 0}
+    if not household_id or not month_year:
+        return result
+    if not automation and not _can_edit_monthly_budget_server_side():
+        result["skipped"] = -1
+        return result
+
+    prev_month = _prev_month_year(month_year)
+    expected_keys = _expected_prior_month_copy_keys(household_id, prev_month, month_year)
+    if not expected_keys:
+        return result
+
+    table = get_member_transfers_table()
+    target_rows = get_member_transfers(household_id, month_year)
+    for row in target_rows:
+        if row.get("status") == "completed":
+            continue
+        key = (
+            str(row["payment_date"])[:10],
+            row["recipient_username"],
+            str(row.get("funding_income_stream_id") or ""),
+        )
+        if key in expected_keys:
+            continue
+        try:
+            supabase.table(table).delete().eq("id", str(row["id"])).execute()
+            result["deleted"] += 1
+        except Exception as e:
+            print(f"Error removing orphan planned transfer {row.get('id')}: {e}")
+
+    copy_result = copy_transfer_plan_from_month(
+        household_id,
+        prev_month,
+        month_year,
+        automation=automation,
+    )
+    result["copied"] = copy_result.get("copied", 0)
+    result["skipped"] = copy_result.get("skipped", 0)
+    return result
+    """Return YYYY-MM for the calendar month before month_year."""
+    year, month = map(int, month_year.split("-"))
+    if month == 1:
+        return f"{year - 1}-12"
+    return f"{year}-{month - 1:02d}"
+
+
+def copy_transfer_plan_from_month(
+    household_id: str,
+    source_month: str,
+    target_month: str,
+    *,
+    automation: bool = False,
+) -> dict:
+    """Copy planned transfer rows from source_month into target_month.
+
+    Payment dates follow each funding stream's income schedule in the target month
+    (same paycheck occurrence index as the source row — e.g. bi-weekly Jun 10/24 →
+    Jul 8/22). Rows without a linked stream fall back to same day-of-month.
+    Completed rows in the target are never touched.  Returns {copied, skipped}.
+    """
+    result = {"copied": 0, "skipped": 0}
+    if not household_id or not source_month or not target_month or source_month == target_month:
+        return result
+    if not automation and not _can_edit_monthly_budget_server_side():
+        result["skipped"] = -1
+        return result
+
+    source_rows = get_member_transfers(household_id, source_month)
+    if not source_rows:
+        return result
+
+    target_rows = get_member_transfers(household_id, target_month)
+    completed_target_keys = {
+        (str(r["payment_date"])[:10], r["recipient_username"], str(r.get("funding_income_stream_id") or ""))
+        for r in target_rows
+        if r.get("status") == "completed"
+    }
+    planned_target_keys = {
+        (str(r["payment_date"])[:10], r["recipient_username"], str(r.get("funding_income_stream_id") or ""))
+        for r in target_rows
+        if r.get("status") == "planned"
+    }
+
+    table = get_member_transfers_table()
+
+    for row in source_rows:
+        obl = round(float(row.get("obligation_amount") or 0), 2)
+        allow = round(float(row.get("allowance_amount") or 0), 2)
+        if obl <= 0 and allow <= 0:
+            result["skipped"] += 1
+            continue
+
+        src_date_str = str(row.get("payment_date") or "")[:10]
+        try:
+            src_date = date.fromisoformat(src_date_str)
+        except ValueError:
+            result["skipped"] += 1
+            continue
+
+        stream_id = str(row.get("funding_income_stream_id") or "")
+        tgt_date_str = remap_transfer_payment_date_between_months(
+            stream_id or None,
+            src_date,
+            source_month,
+            target_month,
+        )
+        if not tgt_date_str:
+            result["skipped"] += 1
+            continue
+        member = row["recipient_username"]
+        key = (tgt_date_str, member, stream_id)
+
+        if key in completed_target_keys:
+            result["skipped"] += 1
+            continue
+
+        total = round(obl + allow, 2)
+        payload = {
+            "household_id": household_id,
+            "month_year": target_month,
+            "payment_date": tgt_date_str,
+            "recipient_username": member,
+            "funding_income_stream_id": stream_id if stream_id else None,
+            "allowance_amount": encrypt_data(allow),
+            "obligation_amount": encrypt_data(obl),
+            "total_amount": encrypt_data(total),
+            "status": "planned",
+        }
+
+        if key in planned_target_keys:
+            # Update existing planned row to match source amounts
+            target_row = next(
+                r for r in target_rows
+                if str(r["payment_date"])[:10] == tgt_date_str
+                and r["recipient_username"] == member
+                and str(r.get("funding_income_stream_id") or "") == stream_id
+                and r.get("status") == "planned"
+            )
+            try:
+                supabase.table(table).update({
+                    "obligation_amount": encrypt_data(obl),
+                    "allowance_amount": encrypt_data(allow),
+                    "total_amount": encrypt_data(total),
+                    "updated_at": datetime.now(ZoneInfo("America/Chicago")).isoformat(),
+                }).eq("id", str(target_row["id"])).execute()
+                result["copied"] += 1
+            except Exception as e:
+                print(f"Error updating transfer copy {key}: {e}")
+                result["skipped"] += 1
+        else:
+            try:
+                supabase.table(table).insert(payload).execute()
+                result["copied"] += 1
+            except Exception as e:
+                print(f"Error inserting transfer copy {key}: {e}")
+                result["skipped"] += 1
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -8411,15 +8848,18 @@ def get_disbursement_plan_drift(household_id, month_year) -> dict:
     else:
         diff_lines = []
     slot_split_lines = per_slot_split_drift_lines(saved_map, computed_map)
+    suppress_stale = _disbursement_plan_suppresses_computed_drift(household_id, month_year)
 
     return {
-        "stale": stale,
-        "slot_split_drift": bool(slot_split_lines),
+        "stale": False if suppress_stale else stale,
+        "computed_diff_available": stale,
+        "slot_split_drift": False if suppress_stale else bool(slot_split_lines),
         "has_saved_rows": True,
         "saved_count": len(existing_rows),
         "computed_count": len(rows_to_insert),
-        "diff_lines": diff_lines,
-        "slot_split_lines": slot_split_lines,
+        "diff_lines": [] if suppress_stale else diff_lines,
+        "slot_split_lines": [] if suppress_stale else slot_split_lines,
+        "computed_diff_lines": diff_lines if stale else [],
     }
 
 
@@ -8474,8 +8914,43 @@ def sync_disbursement_plan(household_id, month_year) -> dict:
     has_existing = bool(existing_by_key)
 
     if is_current and has_existing:
-        # Current month is frozen — only detect drift
-        stale = _compute_plan_stale(rows_to_insert, existing_by_key)
+        # Current month is frozen — when unreviewed, align planned rows with prior month
+        # unless an admin has already customized this month's saved transfers.
+        rec = get_disbursement_reconciliation(household_id, month_year)
+        snapshot = _disbursement_plan_snapshot(rec)
+        unreviewed = rec is None or not rec.get("reviewed")
+        if unreviewed and not snapshot.get("admin_customized"):
+            if not _saved_plan_matches_prior_month_copy(household_id, month_year):
+                prev_month = _prev_month_year(month_year)
+                replace_result = replace_planned_transfers_from_prior_month(
+                    household_id,
+                    month_year,
+                    automation=True,
+                )
+                if replace_result.get("copied", 0) > 0 or replace_result.get("deleted", 0) > 0:
+                    _upsert_disbursement_reconciliation(
+                        household_id,
+                        month_year,
+                        plan_stale=False,
+                        plan_snapshot={
+                            **snapshot,
+                            "month_year": month_year,
+                            "copied_from_month": prev_month,
+                            "copied_rows": replace_result.get("copied", 0),
+                            "auto_replaced": True,
+                        },
+                    )
+                    return {
+                        **empty,
+                        "action": "auto-replaced-from-prior",
+                        "stale": False,
+                        "deleted": replace_result.get("deleted", 0),
+                        "inserted": replace_result.get("copied", 0),
+                    }
+
+        stale = False if _disbursement_plan_suppresses_computed_drift(household_id, month_year) else _compute_plan_stale(
+            rows_to_insert, existing_by_key
+        )
         _upsert_disbursement_reconciliation(household_id, month_year, plan_stale=stale)
         return {**empty, "action": "frozen", "stale": stale}
 
@@ -8486,13 +8961,47 @@ def sync_disbursement_plan(household_id, month_year) -> dict:
     updated = 0
     deleted = 0
 
+    # On first insert for any month, prefer copying from prior month so amounts
+    # remain stable across month boundaries.  Fall back to computed schedule only
+    # when the prior month has no transfer rows.
+    if is_new_month:
+        prev_month = _prev_month_year(month_year)
+        copy_result = copy_transfer_plan_from_month(
+            household_id, prev_month, month_year, automation=True
+        )
+        if copy_result.get("copied", 0) > 0:
+            inserted = copy_result["copied"]
+            _upsert_disbursement_reconciliation(
+                household_id,
+                month_year,
+                transfer_count=inserted,
+                plan_snapshot={
+                    "month_year": month_year,
+                    "copied_from_month": prev_month,
+                    "copied_rows": inserted,
+                },
+                reviewed=False,
+                plan_stale=False,
+            )
+            return {
+                "inserted": inserted,
+                "updated": 0,
+                "deleted": 0,
+                "stale": False,
+                "action": "first-insert-from-prior-month",
+                "new_month": True,
+            }
+        # Prior month empty — fall through to computed schedule insert below
+
     computed_keys = {
         (str(r["payment_date"])[:10], r["recipient_username"], str(r.get("stream_id") or ""))
         for r in rows_to_insert
     }
 
     if is_next:
-        # Remove planned rows that are no longer in the computed schedule
+        # Remove planned rows that are no longer in the computed schedule (new slots
+        # or member changes), but do NOT update amounts on existing planned rows —
+        # amounts are preserved from the prior-month copy until admin resets.
         for key, existing in list(existing_by_key.items()):
             if key in computed_keys or existing.get("status") == "completed":
                 continue
@@ -8514,22 +9023,9 @@ def sync_disbursement_plan(household_id, month_year) -> dict:
 
         existing = existing_by_key.get(key)
         if existing:
-            if existing.get("status") == "completed":
-                continue
-            existing_obl = round(float(existing.get("obligation_amount") or 0), 2)
-            existing_allow = round(float(existing.get("allowance_amount") or 0), 2)
-            if existing_obl == obl and existing_allow == allow:
-                continue
-            try:
-                supabase.table(table).update({
-                    "obligation_amount": encrypt_data(obl),
-                    "allowance_amount": encrypt_data(allow),
-                    "total_amount": encrypt_data(total),
-                    "updated_at": datetime.now(ZoneInfo("America/Chicago")).isoformat(),
-                }).eq("id", str(existing["id"])).execute()
-                updated += 1
-            except Exception as e:
-                print(f"Error updating planned transfer {key}: {e}")
+            # Preserve existing planned amounts — do not overwrite from computed schedule.
+            # Admin uses "Update transfer plan" / "Reset plan" to apply new amounts.
+            continue
         else:
             try:
                 supabase.table(table).insert({
@@ -8547,7 +9043,7 @@ def sync_disbursement_plan(household_id, month_year) -> dict:
             except Exception as e:
                 print(f"Error inserting transfer slot {key}: {e}")
 
-    # Write reconciliation record when a new month is first built
+    # Write reconciliation record when a new month is first built via computed schedule
     if is_new_month and rows_to_insert:
         _upsert_disbursement_reconciliation(
             household_id,

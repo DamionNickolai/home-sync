@@ -38,12 +38,27 @@ from database import (
     _can_edit_projects_server_side,
     _is_budget_privileged,
 )
+from mobile_receipt_capture import mobile_capture_to_bytes, mobile_receipt_capture
 from receipt_ocr import ReceiptOcrError, extract_receipt_data_or_raise, render_pdf_preview_png
 
 # Session-state keys
 _ACTIVE_RECEIPT_KEY = "scan_receipt_active_id"
 _LINES_KEY = "scan_receipt_lines"
 _ALLOW_UNCATEGORIZED_KEY = "scan_receipt_allow_uncategorized"
+_MOBILE_CAPTURE_KEY = "scan_receipt_mobile_capture"
+_FILE_KEY = "scan_receipt_file"
+_DATE_KEY = "scan_receipt_date"
+_SUBMIT_KEY = "scan_receipt_submit"
+
+
+def _on_receipt_file_selected() -> None:
+    """Refresh UI after mobile gallery/file picker returns."""
+    st.rerun()
+
+
+def _on_mobile_capture() -> None:
+    """Refresh UI after native camera capture completes."""
+    st.rerun()
 
 LEDGER_OPTIONS = ["personal", "hh_obligation", "hh_shared", "project"]
 LEDGER_LABELS = {
@@ -122,21 +137,66 @@ def _render_draft_list(household_id: str, username: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _render_upload_form(household_id: str, auth_user_id: str, username: str) -> None:
-    with st.form("scan_receipt_upload_form", clear_on_submit=False):
-        uploaded_file = st.file_uploader(
-            "Receipt image or PDF",
-            type=["jpg", "jpeg", "png", "webp", "pdf"],
-            help="Max ~20 MB. Images work best for OCR.",
-        )
-        receipt_date = st.date_input("Receipt date", value=date.today())
-        submitted = st.form_submit_button("📷 Upload & Extract", type="primary", width="stretch")
+    # Keep pickers outside st.form — mobile camera/gallery pickers fail inside forms.
+    st.markdown(
+        """
+        <style>
+        .receipt-mobile-tip { display: none; margin: 0 0 0.75rem 0; padding: 0.65rem 0.85rem;
+            border-radius: 0.5rem; background: rgba(49, 51, 63, 0.45);
+            font-size: 0.9rem; line-height: 1.4; }
+        @media (max-width: 768px) {
+            .receipt-mobile-tip { display: block; }
+        }
+        </style>
+        <div class="receipt-mobile-tip">
+        Tap <strong>Take photo</strong> to open your phone camera directly.
+        After you confirm the shot, wait for the preview to appear, then tap
+        <strong>Upload &amp; Extract</strong>. Use <strong>Receipt image or PDF</strong>
+        below for gallery picks or PDF files.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    if not submitted or uploaded_file is None:
+    receipt_date = st.date_input("Receipt date", value=date.today(), key=_DATE_KEY)
+
+    # Native camera on mobile only (hidden on desktop — no webcam, no large preview pane).
+    mobile_capture = mobile_receipt_capture(
+        key=_MOBILE_CAPTURE_KEY,
+        on_change=_on_mobile_capture,
+    )
+
+    uploaded_file = st.file_uploader(
+        "Receipt image or PDF",
+        type=["jpg", "jpeg", "png", "webp", "heic", "heif", "pdf"],
+        help="Mobile: use Take photo for the camera, or browse here for gallery/PDF.",
+        key=_FILE_KEY,
+        on_change=_on_receipt_file_selected,
+    )
+
+    source = _resolve_receipt_source(uploaded_file, mobile_capture)
+    if source is not None:
+        file_bytes, mime_type, file_name = source
+        size_kb = len(file_bytes) // 1024
+        if mime_type.startswith("image/"):
+            st.image(file_bytes, caption=f"{file_name} ({size_kb} KB)", width=220)
+        else:
+            st.caption(f"Ready to extract: **{file_name}** ({size_kb} KB)")
+
+    submitted = st.button(
+        "📷 Upload & Extract",
+        type="primary",
+        width="stretch",
+        key=_SUBMIT_KEY,
+    )
+
+    if not submitted:
+        return
+    if source is None:
+        st.warning("Take a photo or choose a receipt image/PDF first.")
         return
 
-    file_bytes = uploaded_file.read()
-    mime_type = uploaded_file.type or "application/octet-stream"
-    file_name = uploaded_file.name
+    file_bytes, mime_type, file_name = source
 
     # Create the DB row first (get an ID for the storage path)
     receipt_id = create_receipt_upload(household_id, file_name, mime_type)
@@ -175,6 +235,18 @@ def _render_upload_form(household_id: str, auth_user_id: str, username: str) -> 
                     "project_budget_id": None,
                     "status": "draft",
                 })
+            tax_amount = result.get("tax")
+            if tax_amount is not None and tax_amount > 0:
+                taxes_cat_id = ensure_personal_taxes_category(household_id, username)
+                lines.append({
+                    "line_index": len(lines),
+                    "description": "Sales tax",
+                    "line_amount": float(tax_amount),
+                    "ledger_target": "personal",
+                    "category_id": taxes_cat_id,
+                    "project_budget_id": None,
+                    "status": "draft",
+                })
         except ReceiptOcrError as exc:
             ocr_message = str(exc)
             print(f"OCR failed for receipt {receipt_id}: {exc}")
@@ -204,6 +276,8 @@ def _render_upload_form(household_id: str, auth_user_id: str, username: str) -> 
 
     upsert_receipt_line_items(receipt_id, lines)
 
+    st.session_state.pop(_MOBILE_CAPTURE_KEY, None)
+    st.session_state.pop(_FILE_KEY, None)
     st.session_state[_ACTIVE_RECEIPT_KEY] = receipt_id
     st.session_state[_LINES_KEY] = lines
     st.rerun()
@@ -648,6 +722,32 @@ def _allowed_ledger_targets(household_id: str, username: str) -> list[str]:
 # ---------------------------------------------------------------------------
 # Misc
 # ---------------------------------------------------------------------------
+
+def _resolve_receipt_source(
+    uploaded_file,
+    mobile_capture: dict | None,
+) -> tuple[bytes, str, str] | None:
+    """Prefer an explicit gallery/PDF pick over a prior mobile camera capture."""
+    if uploaded_file is not None:
+        return _read_receipt_upload(uploaded_file)
+    if mobile_capture:
+        return mobile_capture_to_bytes(mobile_capture)
+    return None
+
+
+def _read_receipt_upload(uploaded) -> tuple[bytes, str, str]:
+    """Return bytes, mime type, and filename from a Streamlit UploadedFile."""
+    file_name = getattr(uploaded, "name", None) or "receipt.jpg"
+    mime_type = uploaded.type or "application/octet-stream"
+    if mime_type == "application/octet-stream":
+        lower = file_name.lower()
+        if lower.endswith(".pdf"):
+            mime_type = "application/pdf"
+        elif lower.endswith((".heic", ".heif")):
+            mime_type = "image/heic"
+    file_bytes = uploaded.getvalue()
+    return file_bytes, mime_type, file_name
+
 
 def _blank_line(index: int) -> dict:
     return {
