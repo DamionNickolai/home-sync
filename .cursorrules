@@ -1,0 +1,70 @@
+import os
+
+# --- Document 1 Content ---
+doc1_content = """# HomeSync OS - Master Architecture & Migration Summary
+
+## The Infrastructure Shift
+The goal is absolute reliability, zero latency, and top-tier security for your household.
+* Hardware (Local Mini PC): Moving off the cloud to a local server ensures your app stays fast and online, completely independent of external internet outages.
+* Ecosystem Integration: Co-locating HomeSync alongside Home Assistant allows local, lightning-fast API calls to control your solar, cameras, and IoT devices from a single dashboard.
+* Network Security (Tailscale): You will use Tailscale (built on WireGuard) to create an invisible, encrypted tunnel to your phone. It requires zero open router ports and provides MagicDNS (e.g., typing `homesync` anywhere in the world connects you instantly).
+
+## The Framework Migration (Streamlit to Reflex)
+Streamlit’s top-to-bottom script execution is causing your current bugs and lag. Reflex will turn HomeSync into a true event-driven web application (React frontend, FastAPI backend).
+* Mobile-First Native UI: The clunky tabs will be replaced with a fixed bottom navigation bar (Home, Finance, Projects, Settings), floating "Quick Action" buttons, and smooth sliding Bottom Sheets instead of inline forms.
+* Backlog Sandbox: You will learn Reflex on your local PC in a new Git branch (`feature/reflex-migration`) by porting the Developer Dashboard first.
+* Responsive Kanban Board: The Backlog will be built as a Kanban board (To-Do, In Progress, Done) for your PC, which gracefully stacks into a swipeable list on mobile.
+
+## Streamlit "Survival Mode" (Immediate Fixes)
+To keep your current app usable while you build the Reflex version, these specific constraints will be applied to Streamlit:
+* Universal Quick Logger: A single, top-level component to log expenses across all modules (Household, Personal, Groceries) dynamically, rather than hiding forms inside nested tabs.
+* Callback Architecture: Relying exclusively on `on_click` callbacks to process data *before* the UI redraws, curing the double-click bug without using `st.rerun()` (which protects your persistent login loop).
+* Form Batching & Caching: Forcing all inputs into strict `st.form` blocks and utilizing `@st.cache_data` for dropdown lists to stop the UI from reloading on every keystroke.
+"""
+
+# --- Document 2 Content ---
+doc2_content = """# HomeSync OS - Hybrid Zero-Trust Migration Plan
+
+## The Objective
+Full encryption is mathematically bottlenecking the app by forcing the CPU to decrypt thousands of rows just to calculate a monthly budget. The hybrid model offloads the heavy math to the PostgreSQL database while preserving total privacy for your sensitive context.
+
+## Data Stratification Strategy
+* Raw Metrics (Plain Text): Dollar Amounts, Dates, Broad Categories (e.g., Groceries, Home Improvement)
+* Sensitive Context (Encrypted Ciphertext): Vendors, Specific Details, Wish List Items, Health/Heart Rate Data
+
+## Phase 1: The One-Off Data Migration Script
+Because your live database is currently full of encrypted strings, we cannot simply change the app code overnight. We will write a standalone Python script to safely convert the historical data.
+* The script will connect directly to Supabase.
+* It will download every historical expense row and decrypt the `amount` and `date` fields locally on your machine.
+* It will upload those decrypted values into brand new database columns (e.g., `amount_raw` and `date_logged_raw`), leaving your original encrypted columns perfectly intact as a failsafe.
+
+## Phase 2: Codebase Refactor
+Once the database has the plain-text columns populated, we will update your database controller.
+* We will strip the encryption/decryption wrappers off of the math and date variables.
+* The app will be redirected to read from and write to the new `amount_raw` and `date_logged_raw` columns going forward.
+
+## Phase 3: Database Math Offloading
+This is the performance breakthrough. Instead of Python downloading 500 rows into a Pandas DataFrame to calculate a total, we will rewrite the database queries.
+* The app will send a single aggregate query (e.g., `SELECT SUM(amount_raw) WHERE category = 'Groceries'`).
+* PostgreSQL will calculate the total in milliseconds and return a single number to the UI.
+* Python CPU strain is eliminated, resulting in instant dashboard loading times.
+"""
+
+def generate_files():
+    """Creates the markdown documentation files in the current directory."""
+    doc1_filename = "homesync_architecture.md"
+    doc2_filename = "homesync_encryption_plan.md"
+
+    # Write Document 1
+    with open(doc1_filename, "w", encoding="utf-8") as f1:
+        f1.write(doc1_content)
+    
+    # Write Document 2
+    with open(doc2_filename, "w", encoding="utf-8") as f2:
+        f2.write(doc2_content)
+        
+    print(f"✅ Successfully created: {doc1_filename}")
+    print(f"✅ Successfully created: {doc2_filename}")
+
+if __name__ == "__main__":
+    generate_files()

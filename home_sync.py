@@ -40,7 +40,7 @@ from ui_helpers import (
 from utils import calculate_next_version
 from supabase import create_client, Client
 
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.0"
 GET_FIT_BASELINE_VERSION = "2.1.0"
 FALLBACK_TIMEZONE = "America/Chicago"
 
